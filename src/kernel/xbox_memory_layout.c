@@ -56,6 +56,80 @@ static void *g_contig_memory = NULL;
 #define XBOX_NV2A_BASE 0xFD000000u
 #define XBOX_NV2A_SIZE (16u * 1024u * 1024u)
 static void *g_nv2a_memory = NULL;
+static HANDLE g_nv2a_ack_thread = NULL;
+static volatile LONG g_nv2a_ack_stop = 0;
+
+/*
+ * NV2A busy-bit acknowledgement.
+ *
+ * D3D8 talks to the GPU through set-a-bit / wait-for-hardware-to-clear-it
+ * handshakes. Against plain RAM the bit is set and nothing ever clears it, so
+ * the title spins forever. Halo hangs in the push-buffer kick at 0x001EF930:
+ *
+ *     mov  [eax+0x100410], edx     ; set 0x10000
+ *   L: test [eax+0x100410], 0x10000
+ *     jne  L                       ; wait for the GPU
+ *
+ * Clearing those bits from a thread is not a hack around the handshake, it is
+ * the handshake: on hardware the GPU clears them asynchronously, which is
+ * exactly what this does. Work that would have been submitted is being done by
+ * the D3D11 layer instead, so acknowledging immediately is honest.
+ *
+ * Only registers listed here are touched. Blanket-zeroing the aperture would
+ * also wipe registers holding real state.
+ *
+ * ponytail: table-driven, extend as more handshakes turn up. A spin on a bit
+ * that is not listed still hangs -- run the title and the watchdog sample will
+ * name the register.
+ */
+static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
+    { 0x100410, 0x00010000u },  /* PFB flush kick, Halo 0x001EF930 */
+};
+
+/*
+ * Not handled here: the PFIFO DMA_PUT/DMA_GET wait at Halo 0x001F3948, which
+ * spins until the GPU's DMA_GET catches up with the CPU's DMA_PUT.
+ *
+ *   L: call BusyLoop
+ *      ecx = [[dev+0x2304] + 0x44]   ; DMA_GET
+ *      edx = [dev]                   ; DMA_PUT
+ *      test (edx ^ ecx), 0xfffffff
+ *      jne L
+ *
+ * Mirroring PUT into GET at a fixed aperture offset was tried and removed: on
+ * inspection [dev+0x2304] holds 0x0080F7FF, which is not an aperture pointer
+ * at all, so there is no register there to acknowledge. The field is written
+ * once, at 0x001F38C1, from a stack local in D3D's 1286-byte device init --
+ * that local is what is actually wrong, and guessing an offset here only
+ * papers over it.
+ */
+
+static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            if (*r & NV2A_ACK[i].busy_mask) {
+                *r &= ~NV2A_ACK[i].busy_mask;
+            }
+        }
+        Sleep(0);  /* yield; the waiter is spinning on another core */
+    }
+    return 0;
+}
+
+static void xbox_Nv2aAckStart(void)
+{
+    g_nv2a_ack_stop = 0;
+    g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
+                                     g_nv2a_memory, 0, NULL);
+    if (g_nv2a_ack_thread) {
+        fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
+                sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
+    }
+}
 
 /* Separate allocation for Xbox kernel address space (0x80010000+).
  * Some RenderWare code reads the kernel PE header to detect features. */
@@ -473,6 +547,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+    if (g_nv2a_memory) {
+        xbox_Nv2aAckStart();
+    }
+
     /*
      * Allocate a page at Xbox kernel address space (0x80010000).
      *
@@ -561,6 +639,12 @@ void xbox_MemoryLayoutShutdown(void)
     if (g_kernel_memory) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
+    }
+    if (g_nv2a_ack_thread) {
+        InterlockedExchange(&g_nv2a_ack_stop, 1);
+        WaitForSingleObject(g_nv2a_ack_thread, 1000);
+        CloseHandle(g_nv2a_ack_thread);
+        g_nv2a_ack_thread = NULL;
     }
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
