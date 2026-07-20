@@ -348,7 +348,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) _fn(); \
-    else { g_esp += 4; eax = 0; } \
+    else { recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
 
 /**
@@ -371,7 +371,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) _fn(); \
-    else { g_esp = (saved_esp); eax = 0; } \
+    else { recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
 
 /**

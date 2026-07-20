@@ -445,6 +445,44 @@ static void bridge_NtFreeVirtualMemory(void)
  * that can be accessed via MEM32(). Native HeapAlloc returns 64-bit
  * pointers that get truncated and produce garbage Xbox VAs.
  */
+/* ExQueryNonVolatileSetting(ValueIndex, Type, Value, ValueLength, ResultLength)
+ *
+ * Titles read region, language and AV settings from EEPROM through this very
+ * early in boot. Ordinal 24 was previously routed to bridge_ExQueryPoolBlockSize,
+ * so the call returned a pool size where the game expected a settings blob. */
+static void bridge_ExQueryNonVolatileSetting(void)
+{
+    uint32_t value_index  = STACK_ARG(0);
+    uint32_t type_va      = STACK_ARG(1);
+    uint32_t value_va     = STACK_ARG(2);
+    uint32_t value_length = STACK_ARG(3);
+    uint32_t result_va    = STACK_ARG(4);
+
+    NTSTATUS st = xbox_ExQueryNonVolatileSetting(
+        value_index,
+        type_va   ? (PULONG)&BRIDGE_MEM32(type_va)   : NULL,
+        value_va  ? (PVOID)((uintptr_t)value_va + g_xbox_mem_offset) : NULL,
+        value_length,
+        result_va ? (PULONG)&BRIDGE_MEM32(result_va) : NULL);
+
+    g_eax = (uint32_t)st;
+}
+
+/* HalReturnToFirmware(Routine) - the title asking to reboot or quit.
+ *
+ * It never returns on hardware. Returning here would let the game run on past
+ * a decision to quit, which reads as a hang rather than an exit. */
+static void bridge_HalReturnToFirmware(void)
+{
+    uint32_t routine = STACK_ARG(0);
+
+    fprintf(stderr, "  [KERNEL] HalReturnToFirmware: routine=%u - title is exiting\n",
+            routine);
+    fflush(stderr);
+
+    xbox_HalReturnToFirmware(routine);
+}
+
 static void bridge_ExAllocatePool(void)
 {
     uint32_t size = STACK_ARG(0);
@@ -1308,14 +1346,15 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
 
     /* ── Unknown stubs ── */
     case   8: return  0;  /* Unknown_8(void) */
-    case  23: return  0;  /* Unknown_23(void) */
+    case  23: return  4;  /* ExQueryPoolBlockSize(1) */
     case  42: return  0;  /* Unknown_42(void) */
 
     /* ── Pool Allocator ── */
-    case  15: return  4;  /* ExAllocatePool(1) */
+    case  14: return  4;  /* ExAllocatePool(1) */
+    case  15: return  8;  /* ExAllocatePoolWithTag(2) */
     case  16: return  8;  /* ExAllocatePoolWithTag(2) */
     /* case  17: DATA export - ExEventObjectType */
-    case  24: return  4;  /* ExQueryPoolBlockSize(1) */
+    case  24: return 20;  /* ExQueryNonVolatileSetting(5) */
 
     /* ── HAL ── */
     case  40: return  4;  /* HalClearSoftwareInterrupt(1) */
@@ -1323,7 +1362,8 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  44: return  8;  /* HalGetInterruptVector(2) */
     case  46: return  8;  /* HalReadSMCTrayState(2) */
     case  47: return 24;  /* HalReadWritePCISpace(6) */
-    case  49: return  4;  /* HalRequestSoftwareInterrupt(1) */
+    case  48: return  4;  /* HalRequestSoftwareInterrupt(1) */
+    case  49: return  4;  /* HalReturnToFirmware(1) */
     case 358: return  0;  /* HalIsResetOrShutdownPending(void) */
 
     /* ── I/O Manager ── */
@@ -1514,9 +1554,10 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 199: return bridge_NtFreeVirtualMemory;
 
     /* Pool */
-    case  15: return bridge_ExAllocatePool;
-    case  16: return bridge_ExAllocatePoolWithTag;
-    case  24: return bridge_ExQueryPoolBlockSize;
+    case  14: return bridge_ExAllocatePool;
+    case  15: return bridge_ExAllocatePoolWithTag;
+    case  23: return bridge_ExQueryPoolBlockSize;
+    case  24: return bridge_ExQueryNonVolatileSetting;
 
     /* IRQL */
     case 160: return bridge_KfRaiseIrql;
@@ -1546,14 +1587,15 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 238: return bridge_NtYieldExecution;
 
     /* Hardware */
-    case  47: return bridge_HalReadSMCTrayState;
+    case   9: return bridge_HalReadSMCTrayState;
+    case  49: return bridge_HalReturnToFirmware;
 
     /* Display */
     case   3: return bridge_AvSetDisplayMode;
 
     /* I/O */
-    case  63: return bridge_IoCreateSymbolicLink;
-    case  67: return bridge_IoCreateFile;
+    case  66: return bridge_IoCreateFile;
+    case  67: return bridge_IoCreateSymbolicLink;
     case 188: return bridge_NtCreateDirectoryObject;
     case 246: return bridge_ObReferenceObjectByHandle;
 
