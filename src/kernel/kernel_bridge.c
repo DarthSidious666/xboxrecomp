@@ -1791,6 +1791,9 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 static bridge_func_t g_slot_bridges[XBOX_KERNEL_THUNK_TABLE_SIZE];
 static int g_slot_arg_bytes[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
+/* Xbox VA to sample around each bridge call; 0 = off. See dispatch. */
+uint32_t g_kernel_watch_va = 0;
+
 /* Current dispatching slot */
 static int g_kernel_dispatch_slot = -1;
 
@@ -1836,6 +1839,20 @@ static void kernel_thunk_dispatch(void)
      * so we must manually consume the dummy return address. */
     g_esp += 4;
 
+    /* Name the bridge that corrupts a watched dword.
+     *
+     * A bridge hands Xbox pointers to real Win32 calls, so a bad one has
+     * Windows write into Xbox memory -- the resulting wild write has a stack
+     * inside ntdll with no recompiled frame to blame, and a watchpoint just
+     * says "something changed". Sampling either side of the call names the
+     * ordinal directly, which is the one fact those tools cannot give.
+     *
+     * Set g_kernel_watch_va to arm; zero (the default) costs one compare. */
+    uint32_t _watch_before = 0;
+    if (g_kernel_watch_va) {
+        _watch_before = BRIDGE_MEM32(g_kernel_watch_va);
+    }
+
     if (bridge) {
         bridge();
     } else {
@@ -1858,6 +1875,17 @@ static void kernel_thunk_dispatch(void)
      * and N bytes of arguments. We already popped the dummy return address
      * above; now pop the args. */
     g_esp += g_slot_arg_bytes[slot];
+
+    if (g_kernel_watch_va) {
+        uint32_t _after = BRIDGE_MEM32(g_kernel_watch_va);
+        if (_after != _watch_before) {
+            fprintf(stderr,
+                    "  [KWATCH] ordinal %u changed Xbox VA 0x%08X: "
+                    "%08X -> %08X\n",
+                    ordinal, g_kernel_watch_va, _watch_before, _after);
+            fflush(stderr);
+        }
+    }
 
     if (g_kernel_call_count <= 200) {
         fprintf(stderr, "  [KERNEL] → returned 0x%08X\n", g_eax);
