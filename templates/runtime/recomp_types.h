@@ -407,10 +407,12 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * jmp [reg] instead of call [reg].
  */
 #define RECOMP_ITAIL(xbox_va) do { \
-    recomp_func_t _fn = recomp_lookup_manual((uint32_t)(xbox_va)); \
-    if (!_fn) _fn = recomp_lookup((uint32_t)(xbox_va)); \
-    if (!_fn) _fn = recomp_lookup_kernel((uint32_t)(xbox_va)); \
-    if (_fn) _fn(); \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { _fn(); } \
+    else { recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
 
 /* ================================================================
