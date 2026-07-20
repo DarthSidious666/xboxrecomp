@@ -767,6 +767,7 @@ class Lifter:
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
+        self.publishes_ebp = False  # Set per-function: has a real frame
         # Every direct call target we emit a name for, as {addr: name}. The
         # batch translator diffs this against the functions it actually defined
         # so it can stub out the remainder (see translate_batch_split).
@@ -1292,7 +1293,19 @@ class Lifter:
         # The callee's 'ret' will pop it back off.
         if insn.call_target:
             name = self._call_target_name(insn.call_target)
-            lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
+            lines = []
+            # Re-publish this function's frame before every call, not just once
+            # at `mov ebp, esp`. g_ebp is "the last frame established anywhere",
+            # so a callee that sets up its own frame overwrites it and leaves it
+            # stale on return. A frameless helper called afterwards then
+            # inherits the wrong frame -- in Halo, sub_001E1BA0 called one
+            # function, returned, then called the frameless sub_001DEC07, which
+            # inherited a long-dead frame of ~0xA6 and wrote [ebp-0xa2] and
+            # [ebp-0xa0] onto Xbox VA 4 and 6: exactly the fs:[4] corruption.
+            if self.publishes_ebp:
+                lines.append("g_ebp = ebp; /* frame stays current across calls */")
+            lines.append(
+                f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */")
             # The SEH helpers exchange the frame pointer with their caller
             # through g_seh_ebp, because ebp is a C local rather than a global.
             #

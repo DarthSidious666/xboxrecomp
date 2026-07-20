@@ -346,6 +346,7 @@ class FunctionTranslator:
         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
         # idiom MSVC emits for odd trailing elements.
         self.lifter.needs_cf = has_carry
+        self.lifter.publishes_ebp = self._func_has_prologue(instructions)
 
         # Add _fpu_cmp for FPU compare instructions (both old and new style)
         has_fpu_cmp = any(insn.mnemonic in ("fcompi", "fcomip", "fucomi",
