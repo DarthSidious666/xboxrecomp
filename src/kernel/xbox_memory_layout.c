@@ -84,11 +84,45 @@ static volatile LONG g_nv2a_ack_stop = 0;
  */
 static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
     { 0x100410, 0x00010000u },  /* PFB flush kick, Halo 0x001EF930 */
+
+    /* Interrupt status registers. These are write-1-to-clear on hardware, so
+     * an ISR "clearing" one writes the pending bit back -- against plain RAM
+     * that sets it instead, the interrupt stays pending forever, and the
+     * service routine re-enters until the stack is gone. Halo dies exactly
+     * that way: CMiniport::ServiceGrInterrupt writes 0x1000 to PGRAPH_INTR to
+     * acknowledge, reads it back still pending, and recurses into a native
+     * stack overflow.
+     *
+     * Holding them at zero is correct rather than convenient: nothing here
+     * ever raises a GPU interrupt, so "none pending" is the truth. */
+    { 0x000100, 0xFFFFFFFFu },  /* PMC_INTR_0    */
+    { 0x001100, 0xFFFFFFFFu },  /* PBUS_INTR_0   */
+    { 0x002100, 0xFFFFFFFFu },  /* PFIFO_INTR_0  */
+    { 0x400100, 0xFFFFFFFFu },  /* PGRAPH_INTR   */
+    { 0x600100, 0xFFFFFFFFu },  /* PCRTC_INTR_0  */
 };
 
 /*
- * Not handled here: the PFIFO DMA_PUT/DMA_GET wait at Halo 0x001F3948, which
- * spins until the GPU's DMA_GET catches up with the CPU's DMA_PUT.
+ * Bits that must always read as SET. The mirror image of the table above:
+ * where an interrupt-pending bit is false because nothing raises interrupts,
+ * a queue-empty bit is true because nothing is queued.
+ *
+ * Halo's CMiniport::TilingUpdateIdle spins until the PFIFO caches report
+ * empty (0x001F5CD1). Zeroed RAM says "not empty" forever, so tile setup
+ * during CDevice::InitializeFrameBuffers never completes.
+ *
+ * Note 0x003220 is deliberately absent -- that one exits on the bit being
+ * CLEAR, which zeroed memory already gives.
+ */
+static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
+    { 0x002400, 0x00000010u },  /* PFIFO_RUNOUT_STATUS  LOW_MARK (empty) */
+    { 0x003214, 0x00000010u },  /* PFIFO_CACHE1_STATUS  LOW_MARK (empty) */
+};
+
+/*
+ * PFIFO channel DMA pointers. Software writes DMA_PUT and spins until the GPU
+ * advances DMA_GET to match -- "you have consumed everything I submitted".
+ * Halo's wait is at 0x001F3948:
  *
  *   L: call BusyLoop
  *      ecx = [[dev+0x2304] + 0x44]   ; DMA_GET
@@ -96,13 +130,20 @@ static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
  *      test (edx ^ ecx), 0xfffffff
  *      jne L
  *
- * Mirroring PUT into GET at a fixed aperture offset was tried and removed: on
- * inspection [dev+0x2304] holds 0x0080F7FF, which is not an aperture pointer
- * at all, so there is no register there to acknowledge. The field is written
- * once, at 0x001F38C1, from a stack local in D3D's 1286-byte device init --
- * that local is what is actually wrong, and guessing an offset here only
- * papers over it.
+ * [dev+0x2304] is 0xFD800000, so the channel's USER area sits at aperture
+ * offset 0x800000 and the two pointers are at +0x40 / +0x44. Copying PUT to
+ * GET is the acknowledgement; the commands are not executed from the push
+ * buffer here -- the D3D11 layer draws -- so reporting them consumed is the
+ * truthful answer.
+ *
+ * This was written once, removed, and restored. It was removed because
+ * [dev+0x2304] read as 0x0080F7FF, i.e. no register to acknowledge -- but that
+ * garbage was a downstream symptom of ordinal 47 having no stdcall arg size,
+ * which walked esp 8 bytes off and made D3D initialise the DMA channel with
+ * `this` = 1. With that fixed the pointer is correct and so is this.
  */
+#define NV2A_USER_DMA_PUT 0x800040u
+#define NV2A_USER_DMA_GET 0x800044u
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
@@ -113,6 +154,22 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
+            }
+        }
+        for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
+            if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
+                *r |= NV2A_IDLE[i].idle_mask;
+            }
+        }
+        {
+            volatile uint32_t *put =
+                (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            volatile uint32_t *get =
+                (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
+            if (*get != *put) {
+                *get = *put;
             }
         }
         Sleep(0);  /* yield; the waiter is spinning on another core */

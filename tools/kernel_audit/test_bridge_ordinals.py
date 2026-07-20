@@ -109,6 +109,41 @@ def test_arg_size_comments_match_their_ordinal():
     print("ok  arg_size_comments_match_their_ordinal")
 
 
+def test_every_routed_ordinal_has_an_arg_size():
+    """A bridged ordinal with no arg entry falls through to `default: return 0`.
+
+    The comment-matching test above cannot see this: there is no entry, so
+    there is no comment to disagree with. Adding a bridge and forgetting the
+    arg size is one edit, and it leaks the whole argument list on every call.
+
+    Ordinal 47 (HalRegisterShutdownNotification, 2 args) was added this way.
+    D3D's CMiniport::InitHardware calls it once, so esp came back 8 bytes low
+    and the epilogue's pop edi/esi/ebx each read one slot too far down: `this`
+    for the next call became 1, the DMA channel was initialised against
+    garbage, and the title hung in a push-buffer wait several calls later with
+    nothing to connect it back to a missing stdcall size.
+
+    An ordinal that genuinely takes no arguments needs an explicit `return 0;`
+    entry, so that "zero" is a decision on the record rather than a fallthrough.
+    """
+    exports = load_exports()
+    with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
+        src = fh.read()
+    m = re.search(r"stdcall_args_for_ordinal.*?\n\}", src, re.S)
+    assert m, "could not locate stdcall_args_for_ordinal"
+    sized = {int(o) for o in
+             re.findall(r"case\s+(\d+):\s*return\s+\d+;", m.group(0))}
+
+    missing = [
+        f"ordinal {o} routes to bridge_{n} but has no arg-size entry "
+        f"({exports.get(o, '?')})"
+        for o, n in load_routes() if o not in sized
+    ]
+    assert not missing, ("bridged ordinals fall through to `default: return 0` "
+                         "and leak their args:\n  " + "\n  ".join(missing))
+    print(f"ok  every_routed_ordinal_has_an_arg_size ({len(sized)} sized)")
+
+
 def test_arg_sizes_are_dword_multiples():
     """stdcall cleanup pops whole dwords; an odd size corrupts the stack."""
     with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
@@ -128,5 +163,6 @@ if __name__ == "__main__":
     test_every_route_matches_its_ordinal()
     test_no_duplicate_ordinals()
     test_arg_size_comments_match_their_ordinal()
+    test_every_routed_ordinal_has_an_arg_size()
     test_arg_sizes_are_dword_multiples()
     print("\nall passed")

@@ -1475,6 +1475,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  39: return  8;  /* HalDisableSystemInterrupt (2) */
     case  42: return  0;  /* HalDiskSerialNumber - data export */
     case  44: return  8;  /* HalGetInterruptVector (2) */
+    case  47: return  8;  /* HalRegisterShutdownNotification (2) */
     case  46: return 24;  /* HalReadWritePCISpace (6) */
     case  48: return  4;  /* HalRequestSoftwareInterrupt (1) */
     case  49: return  4;  /* HalReturnToFirmware (1) */
@@ -1534,6 +1535,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 182: return 12;  /* MmSetAddressProtect (3) */
     case 184: return 20;  /* NtAllocateVirtualMemory (5) */
     case 187: return  4;  /* NtClose (1) */
+    case 188: return  8;  /* NtCreateDirectoryObject (2) */
     case 189: return 16;  /* NtCreateEvent (4) */
     case 190: return 36;  /* NtCreateFile (9) */
     case 193: return 16;  /* NtCreateSemaphore (4) */
