@@ -230,10 +230,18 @@ class FunctionTranslator:
         if has_tail_jump:
             used_regs.add("ebp")
 
-        # Ensure ebp tracked if function calls __SEH_prolog or __SEH_epilog
-        # (lifter emits ebp = g_seh_ebp readback after these calls).
-        SEH_FUNCS = {0x00244784, 0x002447BF}
-        if any(insn.call_target in SEH_FUNCS for insn in instructions):
+        # Ensure ebp is declared if the function talks to the SEH helpers: the
+        # lifter emits a publish before and a read-back after those calls, both
+        # of which name ebp even in a function that otherwise never touches it.
+        #
+        # These addresses are per-title and detected at startup. They used to be
+        # hardcoded to one game's CRT here, so for every other title the forcing
+        # silently never fired and the generated C failed to compile with
+        # "'ebp': undeclared identifier".
+        seh_funcs = {a for a in (self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG)
+                     if a is not None}
+        if seh_funcs and any(insn.call_target in seh_funcs
+                             for insn in instructions):
             used_regs.add("ebp")
 
         # Build call targets list
