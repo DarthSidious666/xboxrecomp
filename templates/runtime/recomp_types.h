@@ -133,6 +133,8 @@ void recomp_icall_fail_log(uint32_t va);
  */
 void recomp_trace_enter(const char *name, uint32_t va);
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
+void recomp_trace_exit(const char *name, uint32_t va);
+#define RECOMP_TRACE_EXIT(name, va) recomp_trace_exit((name), (va))
 
 
 /* ================================================================

@@ -284,6 +284,10 @@ class FunctionTranslator:
         if start in self.trace_functions:
             lines.append(
                 f'    RECOMP_TRACE_ENTER("{name}", 0x{start:08X});')
+        # Entry tracing shows what went in; it cannot show what came back, and
+        # "this function returns with esi wrong" is exactly the question that
+        # kept coming up. The lifter emits the matching exit trace at each ret.
+        self.lifter.trace_exit_name = name if start in self.trace_functions else None
 
         # ebp is the only callee-saved register declared as a local.
         # ebx, esi, edi are global via #define macros (g_ebx, g_esi, g_edi)

@@ -768,6 +768,7 @@ class Lifter:
         self.func_end = 0
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
         self.publishes_ebp = False  # Set per-function: has a real frame
+        self.trace_exit_name = None  # Set per-function when traced
         # Every direct call target we emit a name for, as {addr: name}. The
         # batch translator diffs this against the functions it actually defined
         # so it can stub out the remainder (see translate_batch_split).
@@ -1339,6 +1340,14 @@ class Lifter:
         prefix = ""
         if self.func_start in (self.SEH_PROLOG, self.SEH_EPILOG):
             prefix = "g_seh_ebp = ebp; "
+        # Exit trace, for functions that return with a register the caller
+        # relied on holding something else. Entry tracing alone cannot show
+        # that: it tells you what went in, never what came back. Emitted at the
+        # ret, after the epilogue's pops, so the values are what the caller
+        # actually receives.
+        if self.trace_exit_name:
+            prefix = (f'RECOMP_TRACE_EXIT("{self.trace_exit_name}", '
+                      f'0x{self.func_start:08X}); ') + prefix
         if len(ops) >= 1 and ops[0].type == "imm":
             n = ops[0].imm
             return [f"{prefix}esp += {4 + n}; return; /* ret {n} */"]
