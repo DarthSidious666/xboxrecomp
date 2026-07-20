@@ -694,6 +694,35 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     return TRUE;
 }
 
+/*
+ * Make every RAM mirror read-only, for finding writes that reach low memory
+ * through an alias.
+ *
+ * Xbox RAM is visible at 28 virtual addresses that alias the same pages, so a
+ * store to 0x04000004 changes Xbox VA 4 without ever touching VA 4. Both a
+ * page-protection watchpoint and a DR0 hardware watchpoint on VA 4 therefore
+ * report nothing while the memory demonstrably changes -- which is exactly
+ * what happened chasing Halo's fs:[4] corruption.
+ *
+ * Debug aid, not part of normal startup: a title that legitimately writes
+ * through a mirror will fault here too, and the fault address names the alias
+ * and the code.
+ */
+void xbox_ProtectMirrorsForDebug(void)
+{
+    int n = 0;
+    for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
+        DWORD old;
+        if (g_mirror_views[m] &&
+            VirtualProtect(g_mirror_views[m], g_memory_size,
+                           PAGE_READONLY, &old)) {
+            n++;
+        }
+    }
+    fprintf(stderr, "  Mirrors: %d/%d made read-only (debug)\n",
+            n, XBOX_NUM_MIRRORS);
+}
+
 void xbox_MemoryLayoutShutdown(void)
 {
     if (g_kernel_memory) {

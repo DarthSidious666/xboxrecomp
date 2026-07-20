@@ -93,6 +93,7 @@ void *xbox_GetMemoryBase(void);
  * Returns 0 if memory is mapped at original Xbox addresses (ideal case).
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
+void xbox_ProtectMirrorsForDebug(void);
 
 /* ================================================================
  * Xbox stack for recompiled code
