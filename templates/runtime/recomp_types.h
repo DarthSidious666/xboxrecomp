@@ -140,6 +140,8 @@ void recomp_trace_enter(const char *name, uint32_t va);
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
 void recomp_trace_exit(const char *name, uint32_t va);
 #define RECOMP_TRACE_EXIT(name, va) recomp_trace_exit((name), (va))
+void recomp_trace_esp(const char *name, const char *tag);
+#define RECOMP_TRACE_ESP(name, tag) recomp_trace_esp((name), (tag))
 
 
 /* ================================================================

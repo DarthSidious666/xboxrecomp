@@ -1035,6 +1035,14 @@ class Lifter:
             # Segment register pop → discard from stack
             if r in ("fs", "gs", "cs", "ds", "es", "ss"):
                 return [f"{{ uint32_t _tmp; POP32(esp, _tmp); }} /* pop {r} - segment register */"]
+            # Sample esp at each pop in a traced function. An epilogue that ends
+            # `mov esp, ebp` restores esp unconditionally, so any drift inside
+            # the function is erased before a return-time trace can see it --
+            # yet the pops run *before* that restore, so drift is exactly what
+            # breaks them. This is the only point the drift is observable.
+            if self.trace_exit_name:
+                return [f'RECOMP_TRACE_ESP("{self.trace_exit_name}", "pop {r}");',
+                        f"POP32(esp, {r});"]
             return [f"POP32(esp, {r});"]
         else:
             return [f"{{ uint32_t _tmp; POP32(esp, _tmp); {_fmt_operand_write(ops[0], '_tmp')} }}"]
