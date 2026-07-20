@@ -339,8 +339,19 @@ class FunctionDetector:
             if end > max_addr:
                 max_addr = end
 
-            # Track internal forward jumps to extend function bounds
-            if insn.is_cond_jump and insn.jump_target is not None:
+            # Track internal forward jumps to extend function bounds.
+            #
+            # Unconditional jumps count too, not just conditional ones. A body
+            # ending in "jmp <forward>" - the tail of an if/else, or a jump
+            # over an interleaved block - otherwise hit the break below with
+            # max_addr still short of the target, truncating the function
+            # mid-body. Everything past the cut then looked like separate code,
+            # and the function's own jump targets became calls to empty stubs.
+            #
+            # `upper` is already clamped to the next known function start, so a
+            # target inside these bounds is internal rather than a tail call.
+            # is_jump and is_cond_jump are mutually exclusive; is_branch is both.
+            if insn.is_branch and insn.jump_target is not None:
                 target = insn.jump_target
                 if start <= target < upper and target > max_addr:
                     # This jump goes forward within bounds, extend
