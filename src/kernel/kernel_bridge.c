@@ -1075,6 +1075,41 @@ static NTSTATUS bridge_create_file_impl(
     return st;
 }
 
+/* ── RtlInitAnsiString (ordinal 289) ──────────────────────
+ * VOID RtlInitAnsiString(PANSI_STRING Destination, PCSZ Source)
+ *
+ * Fills an ANSI_STRING { USHORT Length; USHORT MaximumLength; PCHAR Buffer; }.
+ * Unbridged this returned 0 and wrote nothing, so every path a title built
+ * this way arrived at NtCreateFile as a null Buffer and failed with
+ * STATUS_OBJECT_PATH_NOT_FOUND -- which looks like a missing file rather than
+ * a missing bridge. Halo builds its map paths exactly this way.
+ */
+static void bridge_RtlInitAnsiString(void)
+{
+    uint32_t dest_va = STACK_ARG(0);
+    uint32_t src_va  = STACK_ARG(1);
+
+    if (!dest_va) {
+        g_eax = 0;
+        return;
+    }
+    if (src_va) {
+        const char *src = (const char *)XBOX_TO_NATIVE(src_va);
+        size_t len = strlen(src);
+        if (len > 0xFFFE) {
+            len = 0xFFFE;
+        }
+        BRIDGE_MEM16(dest_va + 0) = (uint16_t)len;
+        BRIDGE_MEM16(dest_va + 2) = (uint16_t)(len + 1);
+        BRIDGE_MEM32(dest_va + 4) = src_va;
+    } else {
+        BRIDGE_MEM16(dest_va + 0) = 0;
+        BRIDGE_MEM16(dest_va + 2) = 0;
+        BRIDGE_MEM32(dest_va + 4) = 0;
+    }
+    g_eax = 0;
+}
+
 /* ── NtCreateFile (ordinal 190, 9 args = 36 bytes) ─────── */
 static void bridge_NtCreateFile(void)
 {
@@ -1651,6 +1686,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* File/Handle */
     case 187: return bridge_NtClose;
     case 190: return bridge_NtCreateFile;
+    case 289: return bridge_RtlInitAnsiString;
     case 195: return bridge_NtDeleteFile;
     case 196: return bridge_NtDeviceIoControlFile;
     case 198: return bridge_NtFlushBuffersFile;
