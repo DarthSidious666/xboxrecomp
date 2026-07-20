@@ -177,16 +177,30 @@ void recomp_trace_enter(const char *name, uint32_t va);
 #define CMP_BE(a, b)  ((uint32_t)(a) <= (uint32_t)(b))   /* below or equal */
 #define CMP_A(a, b)   ((uint32_t)(a) >  (uint32_t)(b))   /* above */
 
-/* Signed comparison conditions */
-#define CMP_L(a, b)   ((int32_t)(a) <  (int32_t)(b))     /* less (SF!=OF) */
-#define CMP_GE(a, b)  ((int32_t)(a) >= (int32_t)(b))     /* greater or equal */
-#define CMP_LE(a, b)  ((int32_t)(a) <= (int32_t)(b))     /* less or equal */
-#define CMP_G(a, b)   ((int32_t)(a) >  (int32_t)(b))     /* greater */
+/* Signed comparison conditions
+ *
+ * Operand width matters here. The lifter renders a 16-bit operand as
+ * LO16(reg) (a uint16_t) and an 8-bit one as LO8(reg); both zero-extend, so
+ * casting straight to int32_t turns a negative 16-bit value into a large
+ * positive one and every signed 8/16-bit comparison quietly behaves as
+ * unsigned. "test ax,ax; jl" could never take its branch, and
+ * "cmp ax, count; jle" treated -1 as 65535.
+ *
+ * SXV recovers the sign from the expression's own width. sizeof is not
+ * evaluated and the ternary conditions fold at compile time, so a volatile
+ * MEM16/MEM8 operand is still read exactly once.
+ */
+#define SXV(x)  (sizeof(x) == 1 ? (int32_t)(int8_t)(x)                  : sizeof(x) == 2 ? (int32_t)(int16_t)(x)                                  : (int32_t)(x))
+
+#define CMP_L(a, b)   (SXV(a) <  SXV(b))                 /* less (SF!=OF) */
+#define CMP_GE(a, b)  (SXV(a) >= SXV(b))                 /* greater or equal */
+#define CMP_LE(a, b)  (SXV(a) <= SXV(b))                 /* less or equal */
+#define CMP_G(a, b)   (SXV(a) >  SXV(b))                 /* greater */
 
 /* TEST-based conditions (AND without storing result) */
 #define TEST_Z(a, b)  (((uint32_t)(a) & (uint32_t)(b)) == 0)  /* ZF=1 */
 #define TEST_NZ(a, b) (((uint32_t)(a) & (uint32_t)(b)) != 0)  /* ZF=0 */
-#define TEST_S(a, b)  ((int32_t)((uint32_t)(a) & (uint32_t)(b)) < 0) /* SF=1 */
+#define TEST_S(a, b)  ((SXV(a) & SXV(b)) < 0)  /* SF=1, width-aware */
 
 /* ================================================================
  * Arithmetic with carry/overflow detection
