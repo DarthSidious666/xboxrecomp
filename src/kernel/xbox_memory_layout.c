@@ -201,6 +201,9 @@ uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
 uint32_t g_seh_ebp = 0;
+/* Last frame established by `mov ebp, esp`. Read by frameless functions
+ * that address their caller's frame through ebp. */
+uint32_t g_ebp = 0;
 
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};

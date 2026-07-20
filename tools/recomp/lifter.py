@@ -955,7 +955,17 @@ class Lifter:
         if nops := len(ops) < 2:
             return [f"/* mov: bad operands */"]
         src = _fmt_operand_read(ops[1])
-        return [_fmt_operand_write(ops[0], src)]
+        out = [_fmt_operand_write(ops[0], src)]
+        # `mov ebp, esp` establishes this function's frame. Publish it, because
+        # ebp is a per-function local and a callee with no prologue of its own
+        # reads its caller's frame through ebp -- MSVC emits those routinely for
+        # shared tails (Halo's CRT float formatting is one). Without the
+        # publish, such a callee starts from an uninitialised ebp and its
+        # [ebp-N] stores land wherever that garbage points.
+        if (ops[0].type == "reg" and ops[0].reg == "ebp" and
+                ops[1].type == "reg" and ops[1].reg == "esp"):
+            out.append("g_ebp = ebp; /* publish frame for frameless callees */")
+        return out
 
     def _lift_movzx(self, insn, ops):
         if len(ops) < 2:

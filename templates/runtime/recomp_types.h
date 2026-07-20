@@ -100,6 +100,7 @@ extern uint32_t g_ebx, g_esi, g_edi;
  * Similarly, __SEH_epilog reads g_seh_ebp at entry and writes it at exit.
  */
 extern uint32_t g_seh_ebp;
+extern uint32_t g_ebp;
 
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)

@@ -296,6 +296,25 @@ class FunctionTranslator:
         if reg_decls:
             lines.append(f"    uint32_t {', '.join(reg_decls)};")
 
+        # A function with no `push ebp; mov ebp, esp` prologue that still reads
+        # ebp is addressing its *caller's* frame. MSVC emits these for shared
+        # tails and helpers; Halo's CRT float formatting (sub_001DEC07) opens
+        # with `cmp byte ptr [edx+0xe], 5` and goes straight to [ebp-0xa4].
+        #
+        # ebp is a per-function local, so without this it starts as garbage and
+        # every [ebp-N] store lands wherever that points. In Halo that was the
+        # fake TIB at Xbox VA 0: `mov [ebp-0xa2], bx` destroyed fs:[4], and the
+        # next TLS lookup faulted, thousands of calls away from the cause.
+        #
+        # Inherit it instead. Frame-establishing functions publish g_ebp when
+        # they execute `mov ebp, esp` (see the lifter), so the value is the
+        # nearest enclosing frame -- which is exactly what the hardware ebp
+        # would still hold. Deliberately not the same as making ebp global:
+        # that also changes save/restore, and a callee that fails to restore
+        # then corrupts its caller (tried; esp underflowed inside XapiStartup).
+        if "ebp" in used_regs and not self._func_has_prologue(instructions):
+            lines.append("    ebp = g_ebp;  /* frameless: caller's frame */")
+
         # Add _flags variable if function has conditional instructions
         has_conditionals = any(
             insn.is_cond_jump or insn.mnemonic.startswith("set")
