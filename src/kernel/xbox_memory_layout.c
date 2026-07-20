@@ -46,6 +46,10 @@ static HANDLE g_mapping_handle = NULL;
 
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
+/* Contiguous / physical memory window (see MemoryLayoutInit). */
+#define XBOX_CONTIG_BASE 0x80000000u
+#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
+static void *g_contig_memory = NULL;
 
 /* Separate allocation for Xbox kernel address space (0x80010000+).
  * Some RenderWare code reads the kernel PE header to detect features. */
@@ -390,6 +394,42 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
+     * Contiguous / physical memory window at 0x80000000.
+     *
+     * MmAllocateContiguousMemory hands back addresses in this window: physical
+     * page P is visible at 0x80000000 + P. Titles that pin buffers at fixed
+     * physical addresses then use the whole range, so it has to be backed for
+     * its full length - Halo pins 3.4 MB at 0x61000 and 22 MB at 0x3A6000, and
+     * with only the fake kernel page mapped here a write walked off the end of
+     * it a few pages in.
+     *
+     * Deliberately NOT a view of the 64 MB RAM mapping. On hardware this window
+     * aliases physical RAM, but we load the XBE image into the low addresses of
+     * that same region, so aliasing would put a title's pinned pools on top of
+     * its own code. Separate storage costs an extra mapping and behaves
+     * correctly; nothing here depends on the aliasing.
+     *
+     * Reserved before the kernel page below, which lives inside it.
+     */
+    {
+        uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
+        g_contig_memory = VirtualAlloc(
+            (LPVOID)contig_native,
+            XBOX_CONTIG_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE
+        );
+        if (g_contig_memory) {
+            fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X\n",
+                    XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE);
+        } else {
+            fprintf(stderr, "  WARNING: contiguous window at 0x%08X failed "
+                    "(error %lu); pinned physical allocations will fault\n",
+                    XBOX_CONTIG_BASE, GetLastError());
+        }
+    }
+
+    /*
      * Allocate a page at Xbox kernel address space (0x80010000).
      *
      * RenderWare's Xbox driver code (xbcache.c) reads MEM32(0x8001003C)
@@ -403,12 +443,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         #define XBOX_KERNEL_BASE 0x80010000u
         #define KERNEL_PAGE_SIZE 4096
         uintptr_t kernel_native = XBOX_KERNEL_BASE + g_memory_offset;
-        g_kernel_memory = VirtualAlloc(
-            (LPVOID)kernel_native,
-            KERNEL_PAGE_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
+        /* Already committed if the contiguous window above succeeded -
+         * 0x80010000 sits inside it - so just use that storage. */
+        g_kernel_memory = g_contig_memory
+            ? (void *)kernel_native
+            : VirtualAlloc((LPVOID)kernel_native, KERNEL_PAGE_SIZE,
+                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (g_kernel_memory) {
             /* Zero-fill then set e_lfanew = 0x80 (offset to PE header).
              * With the rest zeroed, NumberOfSections = 0 and the INIT

@@ -304,6 +304,19 @@ class FunctionTranslator:
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
 
+        # Flag snapshot temporaries: a cmp/test records its operands here,
+        # zero- and sign-extended to the compare's own width, so the branch
+        # tests what the compare actually saw. Declared whenever a cmp/test
+        # exists - the consuming jcc can be in a later basic block, or absent.
+        if any(insn.mnemonic in ("cmp", "test") for insn in instructions):
+            lines.append("    uint32_t _fa = 0, _fb = 0;")
+            lines.append("    int32_t _fas = 0, _fbs = 0;")
+            lines.append("    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;")
+            # Flag snapshot: a cmp/test that is not fused with its jcc records
+            # its operands here, zero- and sign-extended to the compare's own
+            # width, so the branch tests what the compare saw.
+
+
         # Add _cf for carry-dependent instructions (sbb, adc)
         has_carry = any(insn.mnemonic in ("sbb", "adc")
                         for insn in instructions)

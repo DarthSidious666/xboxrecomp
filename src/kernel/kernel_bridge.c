@@ -359,9 +359,17 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
      */
     if (low && high >= low && (high - low + 1) <= size + 0x1000) {
         xbox_va = XBOX_PHYSICAL_MIRROR_BASE + low;
+
+        /* The console hands out zeroed pages here, and titles rely on it:
+         * pool headers and free-list roots are assumed clear, so whatever the
+         * backing view happened to contain shows up later as structures that
+         * are "allocated" but full of garbage. */
+        memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
+
         if (g_kernel_call_count <= 100) {
             fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
-                    "pinned phys 0x%08X -> Xbox VA 0x%08X\n", size, low, xbox_va);
+                    "pinned phys 0x%08X -> Xbox VA 0x%08X (zeroed)\n",
+                    size, low, xbox_va);
             fflush(stderr);
         }
         g_eax = xbox_va;

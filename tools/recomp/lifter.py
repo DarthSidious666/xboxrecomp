@@ -283,7 +283,15 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
     cmp_macro, test_macro, desc = cond_info
 
-    if len(flag_ops) >= 2:
+    # A cmp/test that is not fused with its jcc snapshots its operands into
+    # _fa/_fb (zero-extended) and _fas/_fbs (sign-extended) at the point the
+    # comparison happens. Use those rather than re-reading registers that may
+    # since have changed.
+    SIGNED = {"CMP_L", "CMP_LE", "CMP_G", "CMP_GE", "TEST_S"}
+    if flag_setter in ("cmp", "test") and len(flag_ops) >= 2:
+        signed = (cmp_macro in SIGNED) or (test_macro in SIGNED)
+        lhs, rhs = ("_fas", "_fbs") if signed else ("_fa", "_fb")
+    elif len(flag_ops) >= 2:
         lhs = _fmt_operand_read(flag_ops[0])
         rhs = _fmt_operand_read(flag_ops[1])
     elif len(flag_ops) == 1:
@@ -1143,19 +1151,48 @@ class Lifter:
 
     # ── Compare / Test (standalone) ──
 
+    # Widths for the flag snapshot below.
+    _SNAP_MASK = {1: "0xFFu", 2: "0xFFFFu", 4: "0xFFFFFFFFu"}
+    _SNAP_SX = {1: "(int8_t)", 2: "(int16_t)", 4: "(int32_t)"}
+
+    def _snapshot_flags(self, insn, ops, kind):
+        """Capture a cmp/test's operands where the comparison happens.
+
+        The flags are consumed later by a jcc, which used to re-read the
+        operands at that point. Two things go wrong with that. Anything
+        between the two can change them - "cmp [esi+ecx*2], -1 / lea esi,
+        [esi+ecx*2] / jne" re-read through the already-advanced esi and
+        tested the wrong slot. And the comparison lost its width, so a
+        16-bit "cmp word ptr [..], -1" became a compare against
+        0xFFFFFFFF, which a 16-bit -1 (0xFFFF) never equals - the branch
+        then went the same way every time.
+
+        Snapshotting fixes both: operands are read once, at the right
+        width, in both a zero- and a sign-extended form so the jcc can
+        pick whichever its condition needs.
+        """
+        size = getattr(ops[0], "size", 4) or 4
+        if size not in self._SNAP_MASK:
+            size = 4
+        mask = self._SNAP_MASK[size]
+        sx = self._SNAP_SX[size]
+        lhs = _fmt_operand_read(ops[0])
+        rhs = _fmt_operand_read(ops[1])
+        return [
+            f"_fa = (uint32_t)({lhs}) & {mask}; _fb = (uint32_t)({rhs}) & {mask};",
+            f"_fas = (int32_t){sx}(_fa); _fbs = (int32_t){sx}(_fb);"
+            f" /* {kind} {lhs}, {rhs} ({size*8}-bit) */",
+        ]
+
     def _lift_cmp(self, insn, ops):
         if len(ops) < 2:
             return ["/* cmp: bad operands */"]
-        lhs = _fmt_operand_read(ops[0])
-        rhs = _fmt_operand_read(ops[1])
-        return [f"(void)0; /* cmp {lhs}, {rhs} - flags set for next jcc */"]
+        return self._snapshot_flags(insn, ops, "cmp")
 
     def _lift_test(self, insn, ops):
         if len(ops) < 2:
             return ["/* test: bad operands */"]
-        lhs = _fmt_operand_read(ops[0])
-        rhs = _fmt_operand_read(ops[1])
-        return [f"(void)0; /* test {lhs}, {rhs} - flags set for next jcc */"]
+        return self._snapshot_flags(insn, ops, "test")
 
     # ── Control flow ──
 
