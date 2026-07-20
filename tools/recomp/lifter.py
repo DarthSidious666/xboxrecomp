@@ -1189,8 +1189,23 @@ class Lifter:
         if insn.call_target:
             name = self._call_target_name(insn.call_target)
             lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
-            # After __SEH_prolog/__SEH_epilog, read back the frame pointer.
+            # The SEH helpers exchange the frame pointer with their caller
+            # through g_seh_ebp, because ebp is a C local rather than a global.
+            #
+            # Publishing before the call is as necessary as reading back after.
+            # __SEH_prolog stores the caller's ebp into the new frame, and
+            # __SEH_epilog restores esp from it before popping ebx/esi/edi. With
+            # only the read-back, g_seh_ebp still held whatever the last *nested*
+            # SEH function left there, so the epilog unwound to the wrong frame
+            # and restored the callee-saved registers from the wrong stack slots.
+            #
+            # That corrupts ebx/esi/edi across any SEH function that calls
+            # another - which is most of them. In Halo it left esi holding a
+            # stack address where the caller had just zeroed it, so an
+            # "if (status < 0)" test against esi failed and XapiInitProcess
+            # bailed to the dashboard.
             if insn.call_target in (self.SEH_PROLOG, self.SEH_EPILOG):
+                lines.insert(0, "g_seh_ebp = ebp; /* publish frame to SEH helper */")
                 lines.append("ebp = g_seh_ebp; /* read back frame from SEH helper */")
             return lines
         elif len(ops) >= 1:
