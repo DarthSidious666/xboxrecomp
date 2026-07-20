@@ -766,6 +766,7 @@ class Lifter:
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
+        self.needs_cf = False  # Set per-function by translator (has adc/sbb)
         # Every direct call target we emit a name for, as {addr: name}. The
         # batch translator diffs this against the functions it actually defined
         # so it can stub out the remainder (see translate_batch_split).
@@ -1038,7 +1039,18 @@ class Lifter:
         if m == "xor" and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             return [_fmt_operand_write(ops[0], "0") + " /* xor self */"]
         expr = f"{dst} {c_op} {src}"
-        return [_fmt_operand_write(ops[0], expr)]
+        out = []
+        if self.needs_cf:
+            # CF must be computed from the pre-write operands.
+            if m == "add":
+                w = _operand_width(ops[0]) or 4
+                out.append(f"_cf = (int)((((uint64_t)({dst}) + (uint64_t)({src})) >> {w * 8}) & 1);")
+            elif m == "sub":
+                out.append(f"_cf = (int)((uint32_t)({dst}) < (uint32_t)({src}));")
+            else:
+                out.append("_cf = 0; /* logical op clears CF */")
+        out.append(_fmt_operand_write(ops[0], expr))
+        return out
 
     def _lift_inc_dec(self, insn, ops, m):
         if len(ops) < 1:
@@ -1057,7 +1069,12 @@ class Lifter:
         if len(ops) < 1:
             return ["/* neg: no operand */"]
         val = _fmt_operand_read(ops[0])
-        return [_fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})")]
+        out = []
+        if self.needs_cf:
+            # neg sets CF iff the operand was non-zero (neg/sbb sign-extract).
+            out.append(f"_cf = (int)(({val}) != 0);")
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})"))
+        return out
 
     def _lift_not(self, insn, ops):
         if len(ops) < 1:
@@ -1074,7 +1091,10 @@ class Lifter:
         # sbb reg, reg is a common idiom: result is 0 or 0xFFFFFFFF depending on CF
         if ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             return [_fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0") + " /* sbb self (CF extend) */"]
-        return [_fmt_operand_write(ops[0], f"{dst} - {src} - _cf") + " /* sbb */"]
+        w = (_operand_width(ops[0]) or 4) * 8
+        return ["{ uint64_t _t = (uint64_t)(%s) - (uint64_t)(%s) - (uint64_t)_cf;"
+                " _cf = (int)((_t >> %d) & 1); %s }  /* sbb */"
+                % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t"))]
 
     def _lift_adc(self, insn, ops):
         """ADC: add with carry."""
@@ -1082,7 +1102,10 @@ class Lifter:
             return ["/* adc: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         src = _fmt_operand_read(ops[1])
-        return [_fmt_operand_write(ops[0], f"{dst} + {src} + _cf") + " /* adc */"]
+        w = (_operand_width(ops[0]) or 4) * 8
+        return ["{ uint64_t _t = (uint64_t)(%s) + (uint64_t)(%s) + (uint64_t)_cf;"
+                " _cf = (int)((_t >> %d) & 1); %s }  /* adc */"
+                % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t"))]
 
     def _lift_shld(self, insn, ops):
         """SHLD: double-precision shift left."""
@@ -1153,14 +1176,25 @@ class Lifter:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
-        return [_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}")]
+        out = []
+        if self.needs_cf:
+            w = (_operand_width(ops[0]) or 4) * 8
+            # CF is the last bit shifted out; a zero count leaves CF alone.
+            bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
+            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
+        out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}"))
+        return out
 
     def _lift_sar(self, insn, ops):
         if len(ops) < 2:
             return ["/* sar: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
-        return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} >> {cnt})")]
+        out = []
+        if self.needs_cf:
+            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> (({cnt}) - 1)) & 1);")
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} >> {cnt})"))
+        return out
 
     def _lift_rotate(self, insn, ops, m):
         if len(ops) < 2:

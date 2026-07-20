@@ -322,6 +322,11 @@ class FunctionTranslator:
                         for insn in instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
+        # Only functions that consume CF pay for producing it: an adc/sbb
+        # reading a never-written _cf silently drops every carry, which
+        # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
+        # idiom MSVC emits for odd trailing elements.
+        self.lifter.needs_cf = has_carry
 
         # Add _fpu_cmp for FPU compare instructions (both old and new style)
         has_fpu_cmp = any(insn.mnemonic in ("fcompi", "fcomip", "fucomi",
