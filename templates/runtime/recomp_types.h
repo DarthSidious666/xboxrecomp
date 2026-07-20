@@ -91,6 +91,11 @@ extern ptrdiff_t g_xbox_mem_offset;
 extern uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern uint32_t g_ebx, g_esi, g_edi;
 
+/* x87 stack. Global for the same reason the integer registers are:
+ * arguments are passed in st(0)/st(1) across call boundaries. */
+extern double g_fp_stack[8];
+extern int g_fp_top;
+
 /**
  * SEH frame pointer bridge.
  *

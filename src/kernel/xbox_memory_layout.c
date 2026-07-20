@@ -201,6 +201,8 @@ uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
 uint32_t g_seh_ebp = 0;
+double g_fp_stack[8];
+int g_fp_top = 0;
 /* Last frame established by `mov ebp, esp`. Read by frameless functions
  * that address their caller's frame through ebp. */
 uint32_t g_ebp = 0;

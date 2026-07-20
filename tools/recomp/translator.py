@@ -371,15 +371,21 @@ class FunctionTranslator:
             if mmx_regs:
                 lines.append(f"    uint64_t {', '.join(mmx_regs)};")
 
-        # FPU stack (simplified)
+        # FPU stack. Global, like the integer registers.
+        #
+        # It used to be a per-function local, which silently destroyed every
+        # x87 argument passed across a call. The MSVC CRT float helpers take
+        # theirs that way -- `fld / fld / call _CIpow` -- so the callee started
+        # with an empty stack and read uninitialised slots. Halo's _ftol2
+        # returned 0x7FFFFFFF (saturated INT_MAX, its out-of-range answer) on
+        # every call, and the garbage results drove a runaway loop that
+        # overwrote the thread block.
         if has_fpu:
-            lines.append(f"    double _fp_stack[8];")
-            lines.append(f"    int _fp_top = 0;")
-            lines.append(f"    #define fp_push(v) (_fp_stack[--_fp_top & 7] = (v))")
-            lines.append(f"    #define fp_pop() (_fp_top++)")
+            lines.append(f"    #define fp_push(v) (g_fp_stack[--g_fp_top & 7] = (v))")
+            lines.append(f"    #define fp_pop() (g_fp_top++)")
             lines.append(f"    #define fp_popp() (fp_pop())")
-            lines.append(f"    #define fp_top() _fp_stack[_fp_top & 7]")
-            lines.append(f"    #define fp_st1() _fp_stack[(_fp_top + 1) & 7]")
+            lines.append(f"    #define fp_top() g_fp_stack[g_fp_top & 7]")
+            lines.append(f"    #define fp_st1() g_fp_stack[(g_fp_top + 1) & 7]")
 
         # For fpo_leaf functions that use ebp: initialize from g_seh_ebp.
         # In x86, these functions inherit EBP from their caller (typically
