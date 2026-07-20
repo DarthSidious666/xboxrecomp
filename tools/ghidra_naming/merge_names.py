@@ -131,6 +131,9 @@ iswalnum iswalpha iswdigit iswspace iswupper iswlower towlower towupper
 """.split()) | set("""
 _errno errno _iob _fileno _isnan _finite _hypot _strdup _stricmp _strnicmp
 _strlwr _strupr _itoa _ltoa _ultoa _fltused _CIsqrt _CIpow _CIlog _CIexp
+strnicmp stricmp strcmpi stricoll strlwr strupr strrev strset strnset
+itoa ltoa ultoa ecvt fcvt gcvt swab
+logb logbf scalb scalbn ilogb significand drem j0 j1 jn y0 y1 yn gamma
 _ftol _ftol2 _alldiv _aulldiv _allmul _allrem _aullrem _allshl _allshr _aullshr
 """.split())
 

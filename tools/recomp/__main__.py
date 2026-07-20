@@ -150,6 +150,10 @@ def main():
                         help="Path to abi_functions.json (overrides --abi-dir)")
     parser.add_argument("--skip-binary-check", action="store_true",
                         help="Allow disassembly recorded for a different binary")
+    parser.add_argument("--manual-functions", metavar="FILE",
+                        help="JSON list of addresses the project implements by "
+                             "hand. Their bodies are not generated, so the "
+                             "hand-written definition links instead")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -278,11 +282,27 @@ def main():
         if args.max_funcs:
             funcs = funcs[:args.max_funcs]
 
+        manual = set()
+        if args.manual_functions:
+            with open(args.manual_functions, "r", encoding="utf-8") as fh:
+                entries = json.load(fh)
+            # Accept a bare list of addresses or the {addr: name} shape the
+            # naming tools emit, so a project can point this at either.
+            if isinstance(entries, dict):
+                entries = list(entries.keys())
+            for e in entries:
+                if isinstance(e, dict):
+                    e = e.get("start") or e.get("address")
+                manual.add(int(e, 16) if isinstance(e, str) else int(e))
+            print(f"Hand-written overrides: {len(manual)} functions will not "
+                  f"be generated", file=sys.stderr)
+
         stats = translator.translate_batch_split(
             funcs,
             output_dir=gen_dir,
             chunk_size=args.split,
             verbose=args.verbose,
+            manual=manual,
         )
 
         t_translate = time.time() - t0

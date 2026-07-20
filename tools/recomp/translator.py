@@ -672,7 +672,7 @@ class BatchTranslator:
 
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
-                              prefix="recomp", verbose=False):
+                              prefix="recomp", verbose=False, manual=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -683,11 +683,20 @@ class BatchTranslator:
           ...
           output_dir/recomp_dispatch.c    - address -> function pointer table
 
+        manual: addresses the project implements by hand. Their bodies are not
+        emitted, so the hand-written definition is the one that links, but they
+        are still declared and still count as defined for stub purposes. This
+        is how a game replaces a recompiled XDK routine (a D3D8 entry point,
+        say) with one that drives the host runtime instead of the hardware.
+
         Returns dict with stats and list of generated files.
         """
         import sys
 
         os.makedirs(output_dir, exist_ok=True)
+
+        manual = set(manual or ())
+        manual_decls = {}
 
         # Translate all functions first, collecting results
         translations = []
@@ -703,6 +712,11 @@ class BatchTranslator:
             if verbose and (i % 500 == 0 or i == len(func_list) - 1):
                 print(f"  [{i+1}/{len(func_list)}] Translating {name}...",
                       file=sys.stderr)
+
+            if addr in manual:
+                # Hand-written elsewhere: declare it, emit nothing.
+                manual_decls[addr] = name
+                continue
 
             code = self.translator.translate_function(addr, func_info)
             if code:
@@ -724,12 +738,14 @@ class BatchTranslator:
         # reported and written to their own file rather than hidden among the
         # translated chunks.
         defined = {name for _, name, _ in translations}
+        defined |= set(manual_decls.values())   # hand-written, but defined
         unresolved = {
             addr: name
             for addr, name in self.translator.lifter.referenced_calls.items()
             if name not in defined
         }
         stats["unresolved_stubs"] = len(unresolved)
+        stats["manual_functions"] = len(manual_decls)
 
         # Generate header with all forward declarations
         header_path = os.path.join(output_dir, header_name)
@@ -748,6 +764,13 @@ class BatchTranslator:
         for addr, name, _ in translations:
             decl = self._make_declaration(addr, name)
             header_lines.append(f"{decl};")
+
+        if manual_decls:
+            header_lines.append("")
+            header_lines.append("/* Hand-written overrides (defined by the project) */")
+            for addr in sorted(manual_decls):
+                header_lines.append(
+                    f"void {manual_decls[addr]}(void);  /* 0x{addr:08X} */")
 
         if unresolved:
             header_lines.append("")
