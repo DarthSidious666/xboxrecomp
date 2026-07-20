@@ -149,8 +149,11 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         }
         break;
 
-    case XC_PARENTAL_CONTROL:
-        /* No parental controls */
+    case XC_P_CONTROL_GAMES:
+    case XC_P_CONTROL_MOVIES:
+        /* Unrestricted. Titles compare their XBE certificate's rating against
+         * this and refuse to run (Halo boots to the dashboard) if the console
+         * is configured more strictly, so 0 means "no restriction". */
         if (ValueLength >= sizeof(ULONG)) {
             *(PULONG)Value = 0;
             if (Type) *Type = 4;

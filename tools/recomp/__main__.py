@@ -57,6 +57,22 @@ def find_data_files(disasm_dir=None, func_id_dir=None, abi_dir=None, overrides=N
     return paths
 
 
+def _load_addrs(path):
+    """Load a JSON address list (or {addr: name} map) as a set of ints."""
+    if not path:
+        return set()
+    with open(path, "r", encoding="utf-8") as fh:
+        entries = json.load(fh)
+    if isinstance(entries, dict):
+        entries = list(entries.keys())
+    out = set()
+    for e in entries:
+        if isinstance(e, dict):
+            e = e.get("start") or e.get("address")
+        out.add(int(e, 16) if isinstance(e, str) else int(e))
+    return out
+
+
 def check_data_matches_binary(xbe_path, summary_path):
     """Refuse to lift one binary's code using another binary's disassembly.
 
@@ -154,6 +170,10 @@ def main():
                         help="JSON list of addresses the project implements by "
                              "hand. Their bodies are not generated, so the "
                              "hand-written definition links instead")
+    parser.add_argument("--trace-functions", metavar="FILE",
+                        help="JSON list of addresses to emit an entry trace "
+                             "for (RECOMP_TRACE_ENTER). For bring-up: shows "
+                             "which call in an init chain is not returning")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -206,6 +226,7 @@ def main():
         identified_json_path=data_files.get("identified"),
         abi_json_path=data_files.get("abi"),
         output_dir=args.output_dir,
+        trace_functions=_load_addrs(args.trace_functions),
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
     )

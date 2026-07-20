@@ -96,7 +96,8 @@ class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
-                 abi_db=None, seh_prolog=None, seh_epilog=None):
+                 abi_db=None, seh_prolog=None, seh_epilog=None,
+                 trace_functions=None):
         """
         xbe_data: bytes - raw XBE file contents
         func_db: dict - addr → function info from functions.json
@@ -110,6 +111,7 @@ class FunctionTranslator:
         self.label_db = label_db or {}
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
+        self.trace_functions = set(trace_functions or ())
         self.disasm = Disassembler()
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
@@ -267,6 +269,13 @@ class FunctionTranslator:
         # Function signature
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
+
+        # Optional entry trace. Bring-up is mostly "which of these ten init
+        # calls does it not come back from", and answering that by overriding
+        # a function loses the body you were trying to observe.
+        if start in self.trace_functions:
+            lines.append(
+                f'    RECOMP_TRACE_ENTER("{name}", 0x{start:08X});')
 
         # ebp is the only callee-saved register declared as a local.
         # ebx, esi, edi are global via #define macros (g_ebx, g_esi, g_edi)
@@ -467,7 +476,8 @@ class BatchTranslator:
 
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
-                 output_dir=None, seh_prolog=None, seh_epilog=None):
+                 output_dir=None, seh_prolog=None, seh_epilog=None,
+                 trace_functions=None):
         self.xbe_path = xbe_path
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(__file__), "output")
@@ -529,7 +539,8 @@ class BatchTranslator:
         self.translator = FunctionTranslator(
             self.xbe_data, self.func_db, self.label_db,
             self.classification_db, self.abi_db,
-            seh_prolog=seh_prolog, seh_epilog=seh_epilog)
+            seh_prolog=seh_prolog, seh_epilog=seh_epilog,
+            trace_functions=trace_functions)
 
     def get_functions_by_category(self, categories=None, exclude_categories=None):
         """

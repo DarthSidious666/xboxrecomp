@@ -124,6 +124,16 @@ extern volatile uint64_t g_icall_count;
  */
 void recomp_icall_fail_log(uint32_t va);
 
+/**
+ * Function entry trace, emitted only for addresses passed to
+ * tools.recomp --trace-functions. Bring-up is largely "which of these
+ * init calls does it not come back from", and answering that by
+ * overriding a function loses the body you were trying to observe.
+ */
+void recomp_trace_enter(const char *name, uint32_t va);
+#define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
+
+
 /* ================================================================
  * Memory access helpers
  * ================================================================ */
