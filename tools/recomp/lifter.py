@@ -139,6 +139,27 @@ def _fmt_mem_write(op, value_expr):
     return f"{accessor}({addr}) = {value_expr};"
 
 
+_REG_WIDTH = {
+    "al": 1, "ah": 1, "bl": 1, "bh": 1, "cl": 1, "ch": 1, "dl": 1, "dh": 1,
+    "ax": 2, "bx": 2, "cx": 2, "dx": 2, "si": 2, "di": 2, "bp": 2, "sp": 2,
+}
+
+
+def _operand_width(op):
+    """Byte width of an operand, or None when it carries no width of its own.
+
+    Memory operands know their size; registers imply it by name; immediates do
+    not have one and take it from the other operand. Getting this wrong makes a
+    narrow compare test a widened value - "cmp word ptr [x], -1" against
+    0xFFFFFFFF never matches, because a 16-bit -1 is 0xFFFF.
+    """
+    if op.type == "mem":
+        return getattr(op, "mem_size", None) or 4
+    if op.type == "reg":
+        return _REG_WIDTH.get(str(op.reg).lower(), 4)
+    return None
+
+
 def _fmt_operand_read(op):
     """Format reading any operand type."""
     if op.type == "reg":
@@ -1171,7 +1192,9 @@ class Lifter:
         width, in both a zero- and a sign-extended form so the jcc can
         pick whichever its condition needs.
         """
-        size = getattr(ops[0], "size", 4) or 4
+        size = _operand_width(ops[0])
+        if size is None:
+            size = _operand_width(ops[1])          # e.g. cmp imm, reg
         if size not in self._SNAP_MASK:
             size = 4
         mask = self._SNAP_MASK[size]
@@ -1712,10 +1735,15 @@ def lift_basic_block(lifter, bb, flag_state=None):
         match = try_match_cmp_jcc(insns, i, lifter=lifter)
         if match:
             stmt, consumed = match
-            stmts.append(stmt)
-            # Preserve the flag-setter from the cmp/test since jcc
-            # doesn't modify flags - subsequent jcc can reuse them
             flag_insn = insns[i]
+            # The fused form tests the operands inline, but the flags stay live
+            # for any later jcc, and that one reads the snapshot. Emit the
+            # snapshot here too or those temps are stale - which silently sends
+            # every reusing branch the wrong way.
+            if flag_insn.mnemonic in ("cmp", "test") and len(flag_insn.operands) >= 2:
+                stmts.extend(lifter._snapshot_flags(
+                    flag_insn, flag_insn.operands, flag_insn.mnemonic))
+            stmts.append(stmt)
             last_flag_setter = flag_insn.mnemonic
             last_flag_ops = list(flag_insn.operands)
             i += consumed
