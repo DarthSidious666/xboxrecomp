@@ -309,12 +309,35 @@ def main():
                 entries = json.load(fh)
             # Accept a bare list of addresses or the {addr: name} shape the
             # naming tools emit, so a project can point this at either.
+            #
+            # With {addr: name}, the name is binding: the hand-written C
+            # defines that symbol, so the generated declaration and every call
+            # site must use it regardless of what the function database calls
+            # the address. Otherwise re-running the naming tools silently
+            # renames the address, the manual definition no longer matches, and
+            # the only symptom is a pile of unresolved externals at link time
+            # that say nothing about naming.
+            pinned = entries if isinstance(entries, dict) else {}
             if isinstance(entries, dict):
                 entries = list(entries.keys())
             for e in entries:
                 if isinstance(e, dict):
                     e = e.get("start") or e.get("address")
                 manual.add(int(e, 16) if isinstance(e, str) else int(e))
+            for key, pinned_name in pinned.items():
+                if not pinned_name:
+                    continue
+                addr = int(key, 16) if isinstance(key, str) else int(key)
+                entry = translator.func_db.get(addr)
+                if entry is None:
+                    print(f"  warning: manual function 0x{addr:08X} is not in "
+                          f"the function database", file=sys.stderr)
+                    continue
+                if entry.get("name") != pinned_name:
+                    print(f"  pinned 0x{addr:08X}: "
+                          f"{entry.get('name')} -> {pinned_name}",
+                          file=sys.stderr)
+                entry["name"] = pinned_name
             print(f"Hand-written overrides: {len(manual)} functions will not "
                   f"be generated", file=sys.stderr)
 
