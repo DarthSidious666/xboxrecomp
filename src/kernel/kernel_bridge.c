@@ -1123,6 +1123,14 @@ static void bridge_NtCreateFile(void)
     uint32_t disposition = STACK_ARG(7);  /* CreateDisposition */
     uint32_t options     = STACK_ARG(8);  /* CreateOptions */
 
+    /* The out-parameter addresses matter as much as the result: this bridge
+     * hands them to a real Win32 call, so a bogus one has Windows itself write
+     * into Xbox memory. That is how a wild write ends up with a stack inside
+     * ntdll and no recompiled frame to blame. */
+    fprintf(stderr, "  [FILE] NtCreateFile handle_va=0x%08X oa=0x%08X ios=0x%08X\n",
+            handle_va, obj_attrs, iostatus);
+    fflush(stderr);
+
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
         file_attrs, share, disposition, options);
