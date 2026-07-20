@@ -1339,179 +1339,179 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
 {
     switch (ordinal) {
     /* ── Display / AV ── */
-    case   1: return  0;  /* AvGetSavedDataAddress(void) */
-    case   2: return 16;  /* AvSendTVEncoderOption(4) */
-    case   3: return 24;  /* AvSetDisplayMode(6) */
-    case   4: return  4;  /* AvSetSavedDataAddress(1) */
-
-    /* ── Unknown stubs ── */
-    case   8: return  0;  /* Unknown_8(void) */
-    case  23: return  4;  /* ExQueryPoolBlockSize(1) */
-    case  42: return  0;  /* Unknown_42(void) */
-
-    /* ── Pool Allocator ── */
-    case  14: return  4;  /* ExAllocatePool(1) */
-    case  15: return  8;  /* ExAllocatePoolWithTag(2) */
-    case  16: return  8;  /* ExAllocatePoolWithTag(2) */
-    /* case  17: DATA export - ExEventObjectType */
-    case  24: return 20;  /* ExQueryNonVolatileSetting(5) */
-
-    /* ── HAL ── */
-    case  40: return  4;  /* HalClearSoftwareInterrupt(1) */
-    case  41: return  8;  /* HalDisableSystemInterrupt(2) */
-    case  44: return  8;  /* HalGetInterruptVector(2) */
-    case  46: return  8;  /* HalReadSMCTrayState(2) */
-    case  47: return 24;  /* HalReadWritePCISpace(6) */
-    case  48: return  4;  /* HalRequestSoftwareInterrupt(1) */
-    case  49: return  4;  /* HalReturnToFirmware(1) */
-    case 358: return  0;  /* HalIsResetOrShutdownPending(void) */
-
-    /* ── I/O Manager ── */
-    case  62: return 36;  /* IoBuildDeviceIoControlRequest(9) */
-    /* case  65: DATA export - IoCompletionObjectType */
-    case  67: return 40;  /* IoCreateFile(10) */
-    case  69: return  4;  /* IoDeleteDevice(1) */
-    /* case  71: DATA export - IoDeviceObjectType */
-    case  74: return 12;  /* IoInitializeIrp(3) */
-    case  81: return 20;  /* IoSetIoCompletion(5) */
-    case  83: return  8;  /* IoStartNextPacket(2) */
-    case  84: return 12;  /* IoStartNextPacketByKey(3) */
-    case  85: return 16;  /* IoStartPacket(4) */
-    case  86: return 32;  /* IoSynchronousDeviceIoControlRequest(8) */
-    case  87: return 20;  /* IoSynchronousFsdRequest(5) */
-    case 359: return  4;  /* IoMarkIrpMustComplete(1) */
-
-    /* ── Kernel Synchronization ── */
-    case  95: return  8;  /* KeAlertThread(2) */
-    case  97: return  4;  /* KeBugCheck(1) */
-    case  98: return 20;  /* KeBugCheckEx(5) */
-    case  99: return  4;  /* KeCancelTimer(1) */
-    case 100: return  4;  /* KeConnectInterrupt(1) */
-    case 107: return 12;  /* KeInitializeDpc(3) */
-    case 109: return 28;  /* KeInitializeInterrupt(7) */
-    case 113: return  8;  /* KeInitializeTimerEx(2) */
-    case 119: return 12;  /* KeInsertQueueDpc(3) */
-    case 124: return  4;  /* KeQueryBasePriorityThread(1) */
-    case 126: return  0;  /* KeQueryPerformanceCounter(void) */
-    case 127: return  0;  /* KeQueryPerformanceFrequency(void) */
-    case 128: return  4;  /* KeQuerySystemTime(1) */
-    case 129: return  0;  /* KeRaiseIrqlToDpcLevel(void) */
-    case 137: return  4;  /* KeRemoveQueueDpc(1) */
-    case 139: return  4;  /* KeRestoreFloatingPointState(1) */
-    case 142: return  4;  /* KeSaveFloatingPointState(1) */
-    case 143: return  8;  /* KeSetBasePriorityThread(2) */
-    case 145: return 12;  /* KeSetEvent(3) */
-    case 149: return 16;  /* KeSetTimer(Timer+DueTime[8]+Dpc) */
-    case 150: return 20;  /* KeSetTimerEx(Timer+DueTime[8]+Period+Dpc) */
-    case 151: return  4;  /* KeStallExecutionProcessor(1) */
-    case 153: return 12;  /* KeSynchronizeExecution(3) */
-    /* case 156: DATA export - KeTickCount */
-    case 158: return 32;  /* KeWaitForMultipleObjects(8) */
-    case 159: return 20;  /* KeWaitForSingleObject(5) */
+    case   1: return  0;  /* AvGetSavedDataAddress (void) */
+    case   2: return 16;  /* AvSendTVEncoderOption (4) */
+    case   3: return 24;  /* AvSetDisplayMode (6) */
+    case   4: return  4;  /* AvSetSavedDataAddress (1) */
+    case   8: return  0;  /* DbgPrint - __cdecl varargs, caller cleans */
+    case   9: return  8;  /* HalReadSMCTrayState (2) */
+    case  14: return  4;  /* ExAllocatePool (1) */
+    case  15: return  8;  /* ExAllocatePoolWithTag (2) */
+    case  23: return  4;  /* ExQueryPoolBlockSize (1) */
+    case  24: return 20;  /* ExQueryNonVolatileSetting (5) */
+    case  38: return  4;  /* HalClearSoftwareInterrupt (1) */
+    case  39: return  8;  /* HalDisableSystemInterrupt (2) */
+    case  42: return  0;  /* HalDiskSerialNumber - data export */
+    case  44: return  8;  /* HalGetInterruptVector (2) */
+    case  46: return 24;  /* HalReadWritePCISpace (6) */
+    case  48: return  4;  /* HalRequestSoftwareInterrupt (1) */
+    case  49: return  4;  /* HalReturnToFirmware (1) */
+    case  61: return 36;  /* IoBuildDeviceIoControlRequest (9) */
+    case  66: return 40;  /* IoCreateFile (10) */
+    case  67: return  8;  /* IoCreateSymbolicLink (2) */
+    case  68: return  4;  /* IoDeleteDevice (1) */
+    case  73: return 12;  /* IoInitializeIrp (3) */
+    case  79: return 20;  /* IoSetIoCompletion (5) */
+    case  81: return  8;  /* IoStartNextPacket (2) */
+    case  82: return 12;  /* IoStartNextPacketByKey (3) */
+    case  83: return 16;  /* IoStartPacket (4) */
+    case  84: return 32;  /* IoSynchronousDeviceIoControlRequest (8) */
+    case  85: return 20;  /* IoSynchronousFsdRequest (5) */
+    case  93: return  8;  /* KeAlertThread (2) */
+    case  95: return  4;  /* KeBugCheck (1) */
+    case  96: return 20;  /* KeBugCheckEx (5) */
+    case  97: return  4;  /* KeCancelTimer (1) */
+    case  98: return  4;  /* KeConnectInterrupt (1) */
+    case  99: return 12;  /* KeDelayExecutionThread (3) */
+    case 107: return 12;  /* KeInitializeDpc (3) */
+    case 109: return 28;  /* KeInitializeInterrupt (7) */
+    case 113: return  8;  /* KeInitializeTimerEx (2) */
+    case 119: return 12;  /* KeInsertQueueDpc (3) */
+    case 124: return  4;  /* KeQueryBasePriorityThread (1) */
+    case 126: return  0;  /* KeQueryPerformanceCounter (void) */
+    case 127: return  0;  /* KeQueryPerformanceFrequency (void) */
+    case 128: return  4;  /* KeQuerySystemTime (1) */
+    case 129: return  0;  /* KeRaiseIrqlToDpcLevel (void) */
+    case 137: return  4;  /* KeRemoveQueueDpc (1) */
+    case 139: return  4;  /* KeRestoreFloatingPointState (1) */
+    case 142: return  4;  /* KeSaveFloatingPointState (1) */
+    case 143: return  8;  /* KeSetBasePriorityThread (2) */
+    case 145: return 12;  /* KeSetEvent (3) */
+    case 149: return 16;  /* KeSetTimer (Timer+DueTime[8]+Dpc) */
+    case 150: return 20;  /* KeSetTimerEx (Timer+DueTime[8]+Period+Dpc) */
+    case 151: return  4;  /* KeStallExecutionProcessor (1) */
+    case 153: return 12;  /* KeSynchronizeExecution (3) */
+    case 158: return 32;  /* KeWaitForMultipleObjects (8) */
+    case 159: return 20;  /* KeWaitForSingleObject (5) */
     case 160: return  0;  /* KfRaiseIrql (fastcall: arg in ecx) */
     case 161: return  0;  /* KfLowerIrql (fastcall: arg in ecx) */
+    case 165: return  4;  /* MmAllocateContiguousMemory (1) */
+    case 166: return 20;  /* MmAllocateContiguousMemoryEx (5) */
+    case 168: return  8;  /* MmClaimGpuInstanceMemory (2) */
+    case 169: return  8;  /* MmCreateKernelStack (2) */
+    case 170: return  8;  /* MmDeleteKernelStack (2) */
+    case 171: return  4;  /* MmFreeContiguousMemory (1) */
+    case 173: return  4;  /* MmGetPhysicalAddress (1) */
+    case 175: return 12;  /* MmLockUnlockBufferPages (3) */
+    case 176: return  8;  /* MmLockUnlockPhysicalPage (2) */
+    case 177: return 12;  /* MmMapIoSpace (3) */
+    case 178: return 12;  /* MmPersistContiguousMemory (3) */
+    case 179: return  4;  /* MmQueryAddressProtect (1) */
+    case 180: return  4;  /* MmQueryAllocationSize (1) */
+    case 181: return  4;  /* MmQueryStatistics (1) */
+    case 182: return 12;  /* MmSetAddressProtect (3) */
+    case 184: return 20;  /* NtAllocateVirtualMemory (5) */
+    case 187: return  4;  /* NtClose (1) */
+    case 189: return 16;  /* NtCreateEvent (4) */
+    case 190: return 36;  /* NtCreateFile (9) */
+    case 193: return 16;  /* NtCreateSemaphore (4) */
+    case 195: return  4;  /* NtDeleteFile (1) */
+    case 196: return 40;  /* NtDeviceIoControlFile (10) */
+    case 197: return 12;  /* NtDuplicateObject (3) */
+    case 198: return  8;  /* NtFlushBuffersFile (2) */
+    case 199: return 12;  /* NtFreeVirtualMemory (3) */
+    case 200: return 40;  /* NtFsControlFile (10) */
+    case 202: return 24;  /* NtOpenFile (6) */
+    case 203: return  8;  /* NtOpenSymbolicLinkObject (2) */
+    case 207: return 36;  /* NtQueryDirectoryFile (9) */
+    case 210: return  8;  /* NtQueryFullAttributesFile (2) */
+    case 211: return 20;  /* NtQueryInformationFile (5) */
+    case 215: return 12;  /* NtQuerySymbolicLinkObject (3) */
+    case 217: return 16;  /* NtQueryVirtualMemory (4) */
+    case 218: return 20;  /* NtQueryVolumeInformationFile (5) */
+    case 219: return 32;  /* NtReadFile (8) */
+    case 222: return 12;  /* NtReleaseSemaphore (3) */
+    case 225: return  8;  /* NtSetEvent (2) */
+    case 226: return 20;  /* NtSetInformationFile (5) */
+    case 228: return  8;  /* NtSetSystemTime (2) */
+    case 233: return 12;  /* NtWaitForSingleObject (3) */
+    case 235: return 20;  /* NtWaitForMultipleObjectsEx (5) */
+    case 236: return 32;  /* NtWriteFile (8) */
+    case 238: return  0;  /* NtYieldExecution (void) */
+    case 247: return 20;  /* ObReferenceObjectByName (5) */
+    case 250: return  0;  /* ObfDereferenceObject (fastcall: arg in ecx) */
+    case 252: return  4;  /* PhyGetLinkState (1) */
+    case 253: return  8;  /* PhyInitialize (2) */
+    case 255: return 40;  /* PsCreateSystemThreadEx (10) */
+    case 258: return  4;  /* PsTerminateSystemThread (1) */
+    case 260: return 12;  /* RtlAnsiStringToUnicodeString (3) */
+    case 269: return 12;  /* RtlCompareMemoryUlong (3) */
+    case 277: return  4;  /* RtlEnterCriticalSection (1) */
+    case 279: return 12;  /* RtlEqualString (3) */
+    case 289: return  8;  /* RtlInitAnsiString (2) */
+    case 291: return  4;  /* RtlInitializeCriticalSection (1) */
+    case 294: return  4;  /* RtlLeaveCriticalSection (1) */
+    case 301: return  4;  /* RtlNtStatusToDosError (1) */
+    case 302: return  4;  /* RtlRaiseException (1) */
+    case 304: return  8;  /* RtlTimeFieldsToTime (2) */
+    case 305: return  8;  /* RtlTimeToTimeFields (2) */
+    case 308: return 12;  /* RtlUnicodeStringToAnsiString (3) */
+    case 312: return 16;  /* RtlUnwind (4) */
+    case 333: return 12;  /* WRITE_PORT_BUFFER_USHORT (3) */
+    case 334: return 12;  /* WRITE_PORT_BUFFER_ULONG (3) */
+    case 335: return  4;  /* XcSHAInit (1) */
+    case 336: return 12;  /* XcSHAUpdate (3) */
+    case 337: return  8;  /* XcSHAFinal (2) */
+    case 338: return 12;  /* XcRC4Key (3) */
+    case 342: return 12;  /* XcPKDecPrivate (3) */
+    case 343: return  4;  /* XcPKGetKeyLen (1) */
+    case 344: return 12;  /* XcVerifyPKCS1Signature (3) */
+    case 345: return 20;  /* XcModExp (5) */
+    case 347: return 12;  /* XcKeyTable (3) */
+    case 351: return  8;  /* XcUpdateCrypto (2) */
+    case 352: return 12;  /* RtlRip (3) */
+    case 358: return  0;  /* HalIsResetOrShutdownPending (void) */
+    case 359: return  4;  /* IoMarkIrpMustComplete (1) */
+
+    /* ── Unknown stubs ── */
+
+    /* ── Pool Allocator ── */
+    /* case  17: DATA export - ExEventObjectType */
+
+    /* ── HAL ── */
+
+    /* ── I/O Manager ── */
+    /* case  65: DATA export - IoCompletionObjectType */
+    /* case  71: DATA export - IoDeviceObjectType */
+
+    /* ── Kernel Synchronization ── */
+    /* case 156: DATA export - KeTickCount */
 
     /* ── Launch Data ── */
     /* case 164: DATA export - LaunchDataPage */
 
     /* ── Memory Management ── */
-    case 165: return  4;  /* MmAllocateContiguousMemory(1) */
-    case 166: return 20;  /* MmAllocateContiguousMemoryEx(5) */
-    case 168: return  8;  /* MmClaimGpuInstanceMemory(2) */
-    case 169: return  8;  /* MmCreateKernelStack(2) */
-    case 170: return  8;  /* MmDeleteKernelStack(2) */
-    case 171: return  4;  /* MmFreeContiguousMemory(1) */
-    case 173: return  4;  /* MmGetPhysicalAddress(1) */
-    case 175: return 12;  /* MmLockUnlockBufferPages(3) */
-    case 176: return  8;  /* MmLockUnlockPhysicalPage(2) */
-    case 177: return 12;  /* MmMapIoSpace(3) */
-    case 178: return 12;  /* MmPersistContiguousMemory(3) */
-    case 179: return  4;  /* MmQueryAddressProtect(1) */
-    case 180: return  4;  /* MmQueryAllocationSize(1) */
-    case 181: return  4;  /* MmQueryStatistics(1) */
-    case 182: return 12;  /* MmSetAddressProtect(3) */
 
     /* ── NT Virtual Memory ── */
-    case 184: return 20;  /* NtAllocateVirtualMemory(5) */
 
     /* ── NT File I/O & Handle ── */
-    case 187: return  4;  /* NtClose(1) */
-    case 189: return 16;  /* NtCreateEvent(4) */
-    case 190: return 36;  /* NtCreateFile(9) */
-    case 193: return 16;  /* NtCreateSemaphore(4) */
-    case 195: return  4;  /* NtDeleteFile(1) */
-    case 196: return 40;  /* NtDeviceIoControlFile(10) */
-    case 197: return 12;  /* NtDuplicateObject(3) */
-    case 198: return  8;  /* NtFlushBuffersFile(2) */
-    case 199: return 12;  /* NtFreeVirtualMemory(3) */
-    case 200: return 40;  /* NtFsControlFile(10) */
-    case 202: return 24;  /* NtOpenFile(6) */
-    case 203: return  8;  /* NtOpenSymbolicLinkObject(2) */
-    case 207: return 36;  /* NtQueryDirectoryFile(9) */
-    case 210: return  8;  /* NtQueryFullAttributesFile(2) */
-    case 211: return 20;  /* NtQueryInformationFile(5) */
-    case 215: return 12;  /* NtQuerySymbolicLinkObject(3) */
-    case 217: return 16;  /* NtQueryVirtualMemory(4) */
-    case 218: return 20;  /* NtQueryVolumeInformationFile(5) */
-    case 219: return 32;  /* NtReadFile(8) */
-    case 222: return 12;  /* NtReleaseSemaphore(3) */
-    case 225: return  8;  /* NtSetEvent(2) */
-    case 226: return 20;  /* NtSetInformationFile(5) */
-    case 228: return  8;  /* NtSetSystemTime(2) */
-    case 233: return 20;  /* NtWaitForMultipleObjectsEx(5) */
-    case 234: return 12;  /* NtWaitForSingleObject(3) */
-    case 236: return 32;  /* NtWriteFile(8) */
-    case 238: return  0;  /* NtYieldExecution(void) */
 
     /* ── Object Manager ── */
     case 246: return 12;  /* ObReferenceObjectByHandle(3) - Xbox: Handle,Type,Object* */
-    case 247: return 20;  /* ObReferenceObjectByName(5) */
-    case 250: return  0;  /* ObfDereferenceObject (fastcall: arg in ecx) */
 
     /* ── Network / PHY ── */
-    case 252: return  4;  /* PhyGetLinkState(1) */
-    case 253: return  8;  /* PhyInitialize(2) */
 
     /* ── Threading ── */
-    case 255: return 40;  /* PsCreateSystemThreadEx(10) */
-    case 256: return 12;  /* KeDelayExecutionThread(3) */
-    case 258: return  4;  /* PsTerminateSystemThread(1) */
     /* case 259: DATA export - PsThreadObjectType */
 
     /* ── Runtime Library ── */
-    case 260: return 12;  /* RtlAnsiStringToUnicodeString(3) */
-    case 269: return 12;  /* RtlCompareMemoryUlong(3) */
-    case 277: return  4;  /* RtlEnterCriticalSection(1) */
-    case 279: return 12;  /* RtlEqualString(3) */
-    case 289: return  8;  /* RtlInitAnsiString(2) */
-    case 291: return  4;  /* RtlInitializeCriticalSection(1) */
-    case 294: return  4;  /* RtlLeaveCriticalSection(1) */
-    case 301: return  4;  /* RtlNtStatusToDosError(1) */
-    case 302: return  4;  /* RtlRaiseException(1) */
-    case 304: return  8;  /* RtlTimeFieldsToTime(2) */
-    case 305: return  8;  /* RtlTimeToTimeFields(2) */
-    case 308: return 12;  /* RtlUnicodeStringToAnsiString(3) */
-    case 312: return 16;  /* RtlUnwind(4) */
-    case 354: return 12;  /* RtlRip(3) */
 
     /* ── Xbox Identity (data exports) ── */
     /* cases 322-328, 355-357: DATA exports */
 
     /* ── Port I/O ── */
-    case 335: return 12;  /* WRITE_PORT_BUFFER_USHORT(3) */
-    case 336: return 12;  /* WRITE_PORT_BUFFER_ULONG(3) */
 
     /* ── Crypto ── */
-    case 337: return  4;  /* XcSHAInit(1) */
-    case 338: return 12;  /* XcSHAUpdate(3) */
-    case 339: return  8;  /* XcSHAFinal(2) */
-    case 340: return 12;  /* XcRC4Key(3) */
-    case 344: return 12;  /* XcPKDecPrivate(3) */
-    case 345: return  4;  /* XcPKGetKeyLen(1) */
-    case 346: return 12;  /* XcVerifyPKCS1Signature(3) */
-    case 347: return 20;  /* XcModExp(5) */
-    case 349: return 12;  /* XcKeyTable(3) */
-    case 353: return  8;  /* XcUpdateCrypto(2) */
 
     default:  return  0;  /* DATA exports or truly unknown */
     }

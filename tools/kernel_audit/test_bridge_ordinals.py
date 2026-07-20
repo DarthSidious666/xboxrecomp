@@ -77,6 +77,38 @@ def test_no_duplicate_ordinals():
     print("ok  no_duplicate_ordinals")
 
 
+def test_arg_size_comments_match_their_ordinal():
+    """The stdcall arg table names each function in a comment; check it.
+
+    Routing and argument sizes are two separate tables, and fixing one does not
+    fix the other. Ordinal 67 was routed correctly to IoCreateSymbolicLink while
+    its arg entry still said `40; /* IoCreateFile(10) */` - so every call popped
+    40 bytes instead of 8 and walked esp 32 bytes off. That does not fail where
+    it happens: it surfaces later as a function returning with ebx/esi/edi
+    restored from the wrong stack slots, which is about as far from "wrong
+    stdcall size" as a symptom can look.
+    """
+    exports = load_exports()
+    with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
+        src = fh.read()
+    m = re.search(r"stdcall_args_for_ordinal.*?\n\}", src, re.S)
+    assert m, "could not locate stdcall_args_for_ordinal"
+
+    bad = []
+    for ordinal, _bytes, named in re.findall(
+            r"case\s+(\d+):\s*return\s+(\d+);\s*/\*\s*([A-Za-z_][A-Za-z0-9_]*)",
+            m.group(0)):
+        ordinal = int(ordinal)
+        expected = exports.get(ordinal)
+        if expected and expected != named:
+            bad.append(f"ordinal {ordinal} arg entry is commented {named}, "
+                       f"but ordinal {ordinal} is {expected}")
+
+    assert not bad, "arg-size table disagrees with the export table:\n  " + \
+                    "\n  ".join(bad)
+    print("ok  arg_size_comments_match_their_ordinal")
+
+
 def test_arg_sizes_are_dword_multiples():
     """stdcall cleanup pops whole dwords; an odd size corrupts the stack."""
     with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
@@ -95,5 +127,6 @@ def test_arg_sizes_are_dword_multiples():
 if __name__ == "__main__":
     test_every_route_matches_its_ordinal()
     test_no_duplicate_ordinals()
+    test_arg_size_comments_match_their_ordinal()
     test_arg_sizes_are_dword_multiples()
     print("\nall passed")
