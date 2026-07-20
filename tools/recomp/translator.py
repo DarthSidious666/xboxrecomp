@@ -839,9 +839,23 @@ class BatchTranslator:
                 f'#include "{header_name}"',
                 "",
             ]
+            stub_lines.append(
+                "/* Each stub consumes the dummy return address its caller pushed,")
+            stub_lines.append(
+                " * exactly as a real 'ret' would. An empty body leaves esp 4 bytes")
+            stub_lines.append(
+                " * low, and the caller then reads every subsequent stack slot off by")
+            stub_lines.append(
+                " * one - which surfaces far from here, as corrupted callee-saved")
+            stub_lines.append(
+                " * registers or a garbage local. Args are not popped: the callee's")
+            stub_lines.append(
+                " * stdcall byte count is unknown, and cdecl is the safer guess. */")
+            stub_lines.append("")
             for addr in sorted(unresolved):
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ /* 0x{addr:08X}: not detected */ }}"
+                    f"void {unresolved[addr]}(void) {{ g_esp += 4; "
+                    f"/* 0x{addr:08X}: not detected */ }}"
                 )
             stub_lines.append("")
 
