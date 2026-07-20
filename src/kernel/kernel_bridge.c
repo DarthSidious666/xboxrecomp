@@ -771,6 +771,92 @@ static void bridge_KeInitializeDpc(void)
     g_eax = 0;
 }
 
+/* ── NV2A interrupt plumbing (ordinals 44, 98, 109) ───────
+ *
+ * The D3D8 library linked into a title installs an ISR for the GPU's vblank /
+ * command-completion interrupt. There is no NV2A here and nothing ever raises
+ * that interrupt, so these exist to let initialisation complete rather than to
+ * deliver anything.
+ *
+ * KeConnectInterrupt reports success: reporting failure sends Halo's
+ * rasterizer down an error path during preinitialize, and the goal is to get
+ * past setup, not to pretend the hardware is broken.
+ *
+ * ponytail: no interrupt is ever delivered. Code that *waits* on the ISR
+ * rather than polling will hang here, and the fix for that is to bridge the
+ * D3D8 entry point that owns the wait, not to synthesise NV2A interrupts.
+ */
+
+/* ULONG HalGetInterruptVector(ULONG BusInterruptLevel, PKIRQL Irql) */
+static void bridge_HalGetInterruptVector(void)
+{
+    uint32_t level   = STACK_ARG(0);
+    uint32_t irql_va = STACK_ARG(1);
+
+    if (irql_va) {
+        /* IRQL is conventionally the vector for device interrupts. */
+        BRIDGE_MEM8(irql_va) = (uint8_t)level;
+    }
+    g_eax = level;
+}
+
+/* VOID KeInitializeInterrupt(PKINTERRUPT, ServiceRoutine, ServiceContext,
+ *                            Vector, Irql, InterruptMode, ShareVector) */
+static void bridge_KeInitializeInterrupt(void)
+{
+    uint32_t interrupt_va = STACK_ARG(0);
+    uint32_t routine      = STACK_ARG(1);
+    uint32_t context      = STACK_ARG(2);
+    uint32_t vector       = STACK_ARG(3);
+
+    /* Xbox KINTERRUPT is 44 bytes. */
+    memset(XBOX_TO_NATIVE(interrupt_va), 0, 44);
+    BRIDGE_MEM32(interrupt_va + 0)  = routine;
+    BRIDGE_MEM32(interrupt_va + 4)  = context;
+    BRIDGE_MEM32(interrupt_va + 8)  = vector;
+    g_eax = 0;
+}
+
+/* BOOLEAN KeConnectInterrupt(PKINTERRUPT Interrupt) */
+static void bridge_KeConnectInterrupt(void)
+{
+    g_eax = 1;  /* connected -- see the note above */
+}
+
+/* ── MmClaimGpuInstanceMemory (ordinal 168) ───────────────
+ * PVOID MmClaimGpuInstanceMemory(SIZE_T NumberOfBytes, SIZE_T *Padding)
+ *
+ * Reserves the GPU instance memory the NV2A keeps its object context in. On
+ * hardware it sits at the very top of physical RAM, so the returned address is
+ * the end of the contiguous window minus the request. D3D8 stores this and
+ * indexes off it, so returning 0 (the unbridged default) had it building
+ * pointers from a null base.
+ *
+ * MAXULONG_PTR means "claim everything left"; the console answers with the
+ * default instance size rather than the whole of RAM.
+ */
+static void bridge_MmClaimGpuInstanceMemory(void)
+{
+    uint32_t bytes      = STACK_ARG(0);
+    uint32_t padding_va = STACK_ARG(1);
+
+    if (bytes == 0xFFFFFFFFu) {
+        bytes = XBOX_GPU_INSTANCE_DEFAULT;
+    }
+    if (padding_va) {
+        BRIDGE_MEM32(padding_va) = 0;
+    }
+    g_eax = XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - bytes;
+}
+
+/* VOID HalRegisterShutdownNotification(PHAL_SHUTDOWN_REGISTRATION, BOOLEAN)
+ * Records a callback for console shutdown. Nothing here ever shuts down that
+ * way, so registration is accepted and dropped. */
+static void bridge_HalRegisterShutdownNotification(void)
+{
+    g_eax = 0;
+}
+
 /* ── KeInitializeTimerEx (ordinal 113) ────────────────────
  * VOID KeInitializeTimerEx(PKTIMER Timer, TIMER_TYPE Type)
  *
@@ -1615,6 +1701,13 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* DPC / Timer init */
     case 107: return bridge_KeInitializeDpc;
     case 113: return bridge_KeInitializeTimerEx;
+
+    /* NV2A interrupt plumbing */
+    case  44: return bridge_HalGetInterruptVector;
+    case  98: return bridge_KeConnectInterrupt;
+    case 109: return bridge_KeInitializeInterrupt;
+    case  47: return bridge_HalRegisterShutdownNotification;
+    case 168: return bridge_MmClaimGpuInstanceMemory;
 
     /* Synchronization */
     case 189: return bridge_NtCreateEvent;

@@ -46,10 +46,16 @@ static HANDLE g_mapping_handle = NULL;
 
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
-/* Contiguous / physical memory window (see MemoryLayoutInit). */
-#define XBOX_CONTIG_BASE 0x80000000u
-#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
+/* Contiguous / physical memory window (see MemoryLayoutInit).
+ * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
+ * the same numbers for MmClaimGpuInstanceMemory. */
 static void *g_contig_memory = NULL;
+
+/* NV2A GPU register aperture (see MemoryLayoutInit). Backed as plain RAM so
+ * that D3D8 code linked into the title can poke it without faulting. */
+#define XBOX_NV2A_BASE 0xFD000000u
+#define XBOX_NV2A_SIZE (16u * 1024u * 1024u)
+static void *g_nv2a_memory = NULL;
 
 /* Separate allocation for Xbox kernel address space (0x80010000+).
  * Some RenderWare code reads the kernel PE header to detect features. */
@@ -430,6 +436,44 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
+     * NV2A hardware register aperture at 0xFD000000 (16 MB).
+     *
+     * The GPU's registers are memory-mapped here on real hardware. A title
+     * that only calls D3D never notices, but the D3D8 library is linked into
+     * the XBE rather than provided by the kernel, so once execution is inside
+     * it the register pokes are just loads and stores in recompiled code.
+     * Halo faults reading 0xFD001804 during rasterizer_preinitialize, a few
+     * instructions after Direct3DCreate8 returns.
+     *
+     * Backed as ordinary zeroed RAM. That is enough to get through
+     * initialisation, and reads returning zero are the benign answer for the
+     * status and capability registers touched here.
+     *
+     * ponytail: plain memory, no register semantics. A spin loop waiting for
+     * a bit to *set* would hang rather than fault -- if that shows up, the fix
+     * is to bridge the D3D8 entry point that owns the loop, not to start
+     * emulating NV2A. Nothing has needed that yet.
+     */
+    {
+        uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
+        g_nv2a_memory = VirtualAlloc(
+            (LPVOID)nv2a_native,
+            XBOX_NV2A_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE
+        );
+        if (g_nv2a_memory) {
+            fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
+                    "0x%08X (zeroed, no register semantics)\n",
+                    XBOX_NV2A_SIZE / (1024 * 1024), XBOX_NV2A_BASE);
+        } else {
+            fprintf(stderr, "  WARNING: NV2A aperture at 0x%08X failed "
+                    "(error %lu); D3D register access will fault\n",
+                    XBOX_NV2A_BASE, GetLastError());
+        }
+    }
+
+    /*
      * Allocate a page at Xbox kernel address space (0x80010000).
      *
      * RenderWare's Xbox driver code (xbcache.c) reads MEM32(0x8001003C)
@@ -517,6 +561,10 @@ void xbox_MemoryLayoutShutdown(void)
     if (g_kernel_memory) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
+    }
+    if (g_nv2a_memory) {
+        VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
+        g_nv2a_memory = NULL;
     }
     /* Unmap mirror views first */
     for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
