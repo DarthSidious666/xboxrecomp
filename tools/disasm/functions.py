@@ -322,7 +322,8 @@ class FunctionDetector:
         Walks forward from start, tracking the furthest reachable point
         through fall-through and internal jumps.
         """
-        max_addr = start
+        max_addr = start   # exclusive end of the code decoded so far
+        max_target = start  # highest branch target that must be *inside* it
         addr = start
 
         # Upper bound
@@ -353,13 +354,23 @@ class FunctionDetector:
             # is_jump and is_cond_jump are mutually exclusive; is_branch is both.
             if insn.is_branch and insn.jump_target is not None:
                 target = insn.jump_target
-                if start <= target < upper and target > max_addr:
+                if start <= target < upper and target > max_target:
                     # This jump goes forward within bounds, extend
-                    max_addr = target
+                    max_target = target
 
             if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
-                # Check if we've covered all internal jump targets
-                if addr + insn.size >= max_addr:
+                # Stop only once we have decoded *past* every internal branch
+                # target. A target is an address that must be inside the
+                # function, so landing exactly on it is not coverage -- the
+                # instruction there still has to be decoded. Using the target
+                # as an exclusive end cut functions off at their own
+                # out-of-line tail: MSVC routinely emits "jmp <backward>" and
+                # then parks a conditional branch's target after it. Halo's
+                # get_edge_vertex ended at the branch target, so the tail was
+                # lifted as a separate function and the jump to it became a
+                # tail call that returned without running the epilogue --
+                # leaking the whole 28-byte frame on every call.
+                if insn.end_address > max_target:
                     break
                 # There might be more code after (jumped over)
                 addr = insn.end_address
