@@ -1811,6 +1811,57 @@ void xbox_kernel_bridge_init(void)
         }
     }
 
+    /*
+     * Thunk entries below the header-declared base.
+     *
+     * KernelImageThunkAddress points at the main import run, but the linker can
+     * emit further runs just before it, separated by a NULL. Halo has three at
+     * base-0x10 (ordinals 52, 51 and 5). Those stay unpatched, so game code
+     * doing "mov ebx,[thunk]; call ebx" jumps to the raw 0x8000xxxx marker
+     * instead of a kernel function. The indirect call cannot resolve it, yields
+     * 0, and a caller looping until it sees an error code never sees one - in
+     * Halo that hung main() in a file-enumeration loop before it reached any
+     * initialisation.
+     *
+     * Only entries still carrying the ordinal marker are touched, so scanning
+     * back over unrelated .rdata is harmless.
+     */
+    {
+        const int LOOKBEHIND = 16;   /* entries, i.e. 64 bytes */
+        DWORD scan_protect;
+        uint32_t low = g_thunk_table_base - LOOKBEHIND * 4;
+
+        VirtualProtect((LPVOID)((uintptr_t)low + g_xbox_mem_offset),
+                       LOOKBEHIND * 4, PAGE_READWRITE, &scan_protect);
+
+        for (i = 1; i <= LOOKBEHIND; i++) {
+            uint32_t va = g_thunk_table_base - i * 4;
+            uint32_t current = BRIDGE_MEM32(va);
+            int slot;
+
+            if (!(current & 0x80000000)) {
+                continue;            /* NULL separator or ordinary data */
+            }
+            slot = g_thunk_table_count + i;   /* park these above the main run */
+            if (slot >= XBOX_KERNEL_THUNK_TABLE_SIZE) {
+                break;
+            }
+
+            g_slot_ordinals[slot] = current & 0x7FFFFFFF;
+            g_slot_bridges[slot] = bridge_for_ordinal(g_slot_ordinals[slot]);
+            g_slot_arg_bytes[slot] = stdcall_args_for_ordinal(g_slot_ordinals[slot]);
+            BRIDGE_MEM32(va) = KERNEL_VA_BASE + slot * 4;
+            resolved++;
+            if (g_slot_bridges[slot]) bridged++; else unbridged++;
+
+            fprintf(stderr, "  [KERNEL] extra thunk at 0x%08X: ordinal %u\n",
+                    va, g_slot_ordinals[slot]);
+        }
+
+        VirtualProtect((LPVOID)((uintptr_t)low + g_xbox_mem_offset),
+                       LOOKBEHIND * 4, scan_protect, &scan_protect);
+    }
+
     /* Restore original protection */
     VirtualProtect(
         (LPVOID)((uintptr_t)g_thunk_table_base + g_xbox_mem_offset),
