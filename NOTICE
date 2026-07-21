@@ -1,0 +1,71 @@
+xboxrecomp — third-party attribution
+=====================================
+
+Most of this repository is MIT (see LICENSE). The components below are not,
+and are included here under their original licences with their original
+copyright intact. They are other people's work and are credited as such.
+
+
+LGPL-2.1-or-later — extracted from xemu
+---------------------------------------
+
+  https://github.com/xemu-project/xemu
+
+  Copyright (c) 2012      espes
+  Copyright (c) 2018-2019 Jannik Vogel
+  Copyright (c) 2019-2025 Matt Borgerson
+
+  Files:
+    src/apu/apu_core.c        MCPX APU core
+    src/apu/apu_dsp.c         MCPX APU DSP (GP/EP)
+    src/apu/apu_vp.c          MCPX APU voice processor
+    src/apu/apu_debug.h
+    src/apu/apu_regs.h
+    src/apu/apu_shim.h
+    src/apu/apu_state.h
+    src/apu/fpconv.h
+    src/nv2a/nv2a_regs.h      NV2A register definitions
+
+  Licensed under the GNU Lesser General Public License, version 2.1 or (at
+  your option) any later version. The full text belongs at
+  LICENSES/LGPL-2.1.txt; the canonical copy is
+  https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
+
+  These files keep their own licence. Linking against them from MIT or
+  proprietary code is expressly permitted by the LGPL — that is what
+  distinguishes it from the GPL. What the LGPL asks in return is that the
+  notices stay, the source stays available, and a user can relink against a
+  modified version of the library. Distributing this repository, source
+  included, satisfies that.
+
+
+Derived algorithms — credited, independently implemented
+--------------------------------------------------------
+
+  src/d3d/d3d8_swizzle.h
+    Implements Xbox Z-order (Morton) texture unswizzling. The masked-increment
+    technique is Fabian Giesen's, published on his blog; xemu's
+    hw/xbox/nv2a/pgraph/swizzle.c is cited in the file as the reference that
+    pointed us at it.
+
+  src/d3d/d3d8_combiners.h
+    NV2A register-combiner translation. Cites xemu's pgraph combiner
+    implementation as a reference for the hardware's behaviour.
+
+  Algorithms and hardware behaviour are not themselves copyrightable, and
+  these are our own implementations. They are listed here because the debt is
+  real and should be visible even where no licence obligation attaches. If
+  anyone believes either file crosses from "implements the same algorithm"
+  into "copies the expression", raise an issue and we will rewrite or
+  relicense it — getting the credit right matters more to us than the licence
+  label.
+
+
+Reference material (no code taken)
+-----------------------------------
+
+  xemu, Cxbx-Reloaded, and xboxdevwiki were used as references for hardware
+  behaviour: register offsets, kernel export ordinals, structure layouts.
+  Those are functional facts rather than expression, and no code was copied
+  for them.
+</content>

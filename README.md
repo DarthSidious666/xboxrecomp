@@ -101,8 +101,8 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 | **xbox_kernel** | Custom | Xbox kernel → Win32 (115 of the kernel's 366 ordinals resolved, 55 with dedicated bridges: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
 | **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
-| **xbox_apu** | xemu | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
-| **xbox_nv2a** | xemu+Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
+| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
+| **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
 | **xbox_input** | Custom | Xbox gamepad → XInput |
 
 ### Building the Libraries
@@ -439,7 +439,23 @@ A: C is portable, debuggable, and the compiler optimizes it for you. You can rea
 
 ## License
 
-MIT
+**MIT**, except for third-party components which keep their original licence:
+
+| Component | Licence | Copyright |
+|---|---|---|
+| `src/apu/**` | LGPL-2.1-or-later | espes; Jannik Vogel; Matt Borgerson |
+| `src/nv2a/nv2a_regs.h` | LGPL-2.1-or-later | espes; Jannik Vogel; Matt Borgerson |
+| everything else | MIT | sp00nz |
+
+The APU and the NV2A register definitions were extracted from
+[xemu](https://github.com/xemu-project/xemu) and are that project's work, not
+ours. LGPL-2.1 expressly permits linking them from MIT or proprietary code, so
+a recompiled game is unaffected; what it asks is that the notices stay, the
+source stays available, and users can relink against a modified library.
+
+See [NOTICE](NOTICE) for the full attribution — including algorithms we
+implemented ourselves but learned from xemu, credited there even where no
+licence obligation attaches.
 
 ## Credits
 
