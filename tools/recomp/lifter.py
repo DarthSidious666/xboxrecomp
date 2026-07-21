@@ -1411,7 +1411,16 @@ class Lifter:
                 # Tail call - no return address push (reuses current frame's)
                 # Bridge ebp so the target function can inherit our frame pointer.
                 name = self._call_target_name(insn.jump_target)
-                return [f"g_seh_ebp = ebp; {name}(); return; /* tail jmp 0x{insn.jump_target:08X} */"]
+                tail = (f"g_seh_ebp = ebp; {name}(); return; "
+                        f"/* tail jmp 0x{insn.jump_target:08X} */")
+                if self.trace_exit_name:
+                    # Tag the exit so a trace says which one was taken. A
+                    # function whose paths all look individually balanced can
+                    # still leak, and knowing the path is the difference
+                    # between measuring and guessing.
+                    return [f'RECOMP_TRACE_ESP("{self.trace_exit_name}", '
+                            f'"tail 0x{insn.jump_target:08X}");', tail]
+                return [tail]
             return [f"goto loc_{insn.jump_target:08X};"]
         elif len(ops) >= 1:
             # Detect intra-function switch tables (computed gotos)
