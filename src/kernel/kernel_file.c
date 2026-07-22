@@ -342,8 +342,12 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     switch (FileInformationClass) {
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
-            if (!SetFilePointerEx(FileHandle, info->CurrentByteOffset, NULL, FILE_BEGIN))
+            if (!SetFilePointerEx(FileHandle, info->CurrentByteOffset, NULL, FILE_BEGIN)) {
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                    "SetFilePosition failed: offset=%lld err=%u",
+                    (long long)info->CurrentByteOffset.QuadPart, GetLastError());
                 return STATUS_UNSUCCESSFUL;
+            }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -353,6 +357,9 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             SetFilePointerEx(FileHandle, zero, &cur, FILE_CURRENT);
             SetFilePointerEx(FileHandle, info->EndOfFile, NULL, FILE_BEGIN);
             if (!SetEndOfFile(FileHandle)) {
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                    "SetEndOfFile failed: size=%lld err=%u",
+                    (long long)info->EndOfFile.QuadPart, GetLastError());
                 SetFilePointerEx(FileHandle, cur, NULL, FILE_BEGIN);
                 return STATUS_UNSUCCESSFUL;
             }

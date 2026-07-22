@@ -1018,6 +1018,28 @@ static HANDLE bridge_read_handle(uint32_t va)
 }
 
 /* Resolve a token to a HANDLE and release its table slot (for NtClose). */
+/* Resolve a handle token passed BY VALUE, without consuming it.
+ *
+ * Three accessors, easily confused, and confusing two of them broke all file
+ * I/O: bridge_read_handle(va) reads a token *from memory* and suits a PHANDLE
+ * out-parameter; bridge_take_handle(token) resolves and CLEARS the table slot,
+ * which is NtClose semantics; this one resolves and leaves the slot alone,
+ * which is what every by-value HANDLE argument needs.
+ *
+ * NtSetInformationFile and friends take the handle by value, but were calling
+ * bridge_read_handle on it -- dereferencing the token as if it were an address.
+ * Halo created its save file successfully and then failed the very next call,
+ * which surfaced as "couldn't open or create saved game file". */
+static HANDLE bridge_resolve_handle(uint32_t token)
+{
+    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
+        uint32_t i = token & BRIDGE_HANDLE_MASK;
+        return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
+    }
+    /* Untagged: synthetic/dummy handle -- pass through unchanged. */
+    return (HANDLE)(uintptr_t)token;
+}
+
 static HANDLE bridge_take_handle(uint32_t token)
 {
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
@@ -1155,7 +1177,7 @@ static void bridge_NtOpenFile(void)
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
-    HANDLE   handle    = bridge_read_handle(STACK_ARG(0));
+    HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
     uint32_t iostatus  = STACK_ARG(4);
     uint32_t buffer_va = STACK_ARG(5);
     uint32_t length    = STACK_ARG(6);
@@ -1178,7 +1200,7 @@ static void bridge_NtReadFile(void)
 /* ── NtWriteFile (ordinal 236, 8 args = 32 bytes) ─────── */
 static void bridge_NtWriteFile(void)
 {
-    HANDLE   handle    = bridge_read_handle(STACK_ARG(0));
+    HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
     uint32_t iostatus  = STACK_ARG(4);
     uint32_t buffer_va = STACK_ARG(5);
     uint32_t length    = STACK_ARG(6);
@@ -1201,7 +1223,7 @@ static void bridge_NtWriteFile(void)
 /* ── NtQueryInformationFile (ordinal 211, 5 args = 20 bytes) */
 static void bridge_NtQueryInformationFile(void)
 {
-    HANDLE   handle    = bridge_read_handle(STACK_ARG(0));
+    HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
     uint32_t ios_va    = STACK_ARG(1);
     uint32_t info_va   = STACK_ARG(2);
     uint32_t length    = STACK_ARG(3);
@@ -1218,7 +1240,7 @@ static void bridge_NtQueryInformationFile(void)
 /* ── NtSetInformationFile (ordinal 226, 5 args = 20 bytes) ─ */
 static void bridge_NtSetInformationFile(void)
 {
-    HANDLE   handle    = bridge_read_handle(STACK_ARG(0));
+    HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
     uint32_t ios_va    = STACK_ARG(1);
     uint32_t info_va   = STACK_ARG(2);
     uint32_t length    = STACK_ARG(3);
@@ -1235,7 +1257,7 @@ static void bridge_NtSetInformationFile(void)
 /* ── NtQueryVolumeInformationFile (ordinal 218, 5 args = 20 bytes) */
 static void bridge_NtQueryVolumeInformationFile(void)
 {
-    HANDLE   handle    = bridge_read_handle(STACK_ARG(0));
+    HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
     uint32_t ios_va    = STACK_ARG(1);
     uint32_t info_va   = STACK_ARG(2);
     uint32_t length    = STACK_ARG(3);
@@ -1266,7 +1288,7 @@ static void bridge_NtQueryFullAttributesFile(void)
 /* ── NtFlushBuffersFile (ordinal 198, 2 args = 8 bytes) ─── */
 static void bridge_NtFlushBuffersFile(void)
 {
-    HANDLE   handle = bridge_read_handle(STACK_ARG(0));
+    HANDLE   handle = bridge_resolve_handle(STACK_ARG(0));
     uint32_t ios_va = STACK_ARG(1);
     XBOX_IO_STATUS_BLOCK ios;
 
@@ -1289,7 +1311,7 @@ static void bridge_NtDeleteFile(void)
 /* ── NtQueryDirectoryFile (ordinal 207, 9 args = 36 bytes) ─ */
 static void bridge_NtQueryDirectoryFile(void)
 {
-    HANDLE   handle      = bridge_read_handle(STACK_ARG(0));
+    HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t ios_va      = STACK_ARG(4);
     uint32_t info_va     = STACK_ARG(5);
     uint32_t length      = STACK_ARG(6);
