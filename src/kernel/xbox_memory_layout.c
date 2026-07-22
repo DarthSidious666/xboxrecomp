@@ -788,6 +788,16 @@ static uint32_t g_heap_next = XBOX_HEAP_BASE;
 
 static int g_heap_alloc_count = 0;
 
+/* Block table backing xbox_HeapFree. A bump pointer alone never reclaims,
+ * which is fine for a title that allocates once and fatal for a debug build
+ * that churns. Flat array rather than an intrusive list: allocations come back
+ * in bump order, so index order is address order and coalescing is a
+ * neighbour check. */
+#define XBOX_HEAP_MAX_BLOCKS 65536
+static struct { uint32_t addr; uint32_t size; uint8_t free; }
+    g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
+static int g_heap_block_count = 0;
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
@@ -800,7 +810,25 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
      * resulting in zero-size allocations. With a bump allocator, these all
      * return the same address, causing overlapping structures. Enforce a
      * minimum of 4096 bytes so each allocation gets its own memory. */
-    if (size < 4096) size = 4096;
+    if (size < 16) size = 16;
+
+    /* Reuse a freed block first. Without this the heap only ever grows: Halo's
+     * debug build allocates and releases heavily through init, exhausted all
+     * 48 MB in 4,726 allocations, and its second D3D CreateDevice then failed
+     * with E_OUTOFMEMORY -- which the title reports by clearing
+     * global_d3d_device, so the rasterizer asserts and startup stops. */
+    for (int i = 0; i < g_heap_block_count; i++) {
+        if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size) {
+            continue;
+        }
+        if (g_heap_blocks[i].addr & (alignment - 1)) {
+            continue;   /* wrong alignment for this request */
+        }
+        g_heap_blocks[i].free = 0;
+        result = g_heap_blocks[i].addr;
+        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+        return result;
+    }
 
     /* Align the next pointer */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
@@ -816,19 +844,68 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     /* Zero-fill the allocated block (Xbox memory is always zeroed) */
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
 
+    if (g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
+        g_heap_blocks[g_heap_block_count].addr = result;
+        g_heap_blocks[g_heap_block_count].size = size;
+        g_heap_blocks[g_heap_block_count].free = 0;
+        g_heap_block_count++;
+    }
+
     g_heap_alloc_count++;
-    fprintf(stderr, "  [HEAP] #%d: size=%u align=%u → 0x%08X..0x%08X (used %u/%u)\n",
-            g_heap_alloc_count, size, alignment, result, result + size,
-            g_heap_next - XBOX_HEAP_BASE, XBOX_HEAP_SIZE);
-    fflush(stderr);
+    /* Rate-limited: a debug title makes thousands of these and the log is a
+     * diagnostic, not a transaction record. */
+    if (g_heap_alloc_count <= 32 || (g_heap_alloc_count % 512) == 0) {
+        fprintf(stderr, "  [HEAP] #%d: size=%u align=%u → 0x%08X..0x%08X (used %u/%u)\n",
+                g_heap_alloc_count, size, alignment, result, result + size,
+                g_heap_next - XBOX_HEAP_BASE, XBOX_HEAP_SIZE);
+        fflush(stderr);
+    }
 
     return result;
 }
 
 void xbox_HeapFree(uint32_t xbox_va)
 {
-    /* No-op for bump allocator */
-    (void)xbox_va;
+    static int frees = 0, matched = 0;
+
+    if (!xbox_va) {
+        return;
+    }
+    frees++;
+    if (frees <= 8) {
+        fprintf(stderr, "  [HEAP] free #%d va=0x%08X blocks=%d\n",
+                frees, xbox_va, g_heap_block_count);
+        fflush(stderr);
+    }
+    for (int i = 0; i < g_heap_block_count; i++) {
+        if (g_heap_blocks[i].addr != xbox_va || g_heap_blocks[i].free) {
+            continue;
+        }
+        g_heap_blocks[i].free = 1;
+        if (++matched % 512 == 0) {
+            fprintf(stderr, "  [HEAP] frees=%d matched=%d blocks=%d\n",
+                    frees, matched, g_heap_block_count);
+            fflush(stderr);
+        }
+
+        /* Coalesce with neighbours. Blocks are recorded in bump order, so
+         * index order is address order and adjacency is a simple end==start
+         * test. Keeps large contiguous requests satisfiable after a lot of
+         * small churn. */
+        if (i + 1 < g_heap_block_count && g_heap_blocks[i + 1].free &&
+            g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[i + 1].addr) {
+            g_heap_blocks[i].size += g_heap_blocks[i + 1].size;
+            g_heap_blocks[i + 1].size = 0;
+            g_heap_blocks[i + 1].addr = 0;
+        }
+        if (i > 0 && g_heap_blocks[i - 1].free &&
+            g_heap_blocks[i - 1].addr + g_heap_blocks[i - 1].size == g_heap_blocks[i].addr) {
+            g_heap_blocks[i - 1].size += g_heap_blocks[i].size;
+            g_heap_blocks[i].size = 0;
+            g_heap_blocks[i].addr = 0;
+        }
+        return;
+    }
 }
 
 HANDLE xbox_GetMappingHandle(void)
