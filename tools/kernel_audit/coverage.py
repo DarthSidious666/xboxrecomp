@@ -16,7 +16,8 @@ The headline "N imports missing" number on its own is misleading in both
 directions. An XBE imports whatever its statically-linked XDK references, so
 much of the list is never called; and an unrouted ordinal is not necessarily
 fatal, because kernel_bridge.c's argument-size table lets the generic stub clean
-the right number of bytes off the simulated stack and return 0.
+the right number of bytes off the simulated stack and return 0. A missing size entry is the dangerous case: the stub then pops
+nothing and leaks the arguments.
 
 Data exports are called out separately because they are a different mechanism:
 the thunk holds a pointer to a variable, not a function, so routing one to a
@@ -45,7 +46,10 @@ DATA_EXPORTS = {
     "KeTickCount", "KeTimeIncrement", "KeInterruptTime", "KeSystemTime",
     "LaunchDataPage", "XboxHardwareInfo", "XboxKrnlVersion", "XboxHDKey",
     "XboxSignatureKey", "XboxLANKey", "XboxAlternateSignatureKeys",
-    "XePublicKeyData", "XeImageFileName", "XcKeyTable",
+    "XePublicKeyData", "XeImageFileName",
+    # NOT here: XcKeyTable (347) looks like a table but is a function --
+    # VOID XcKeyTable(ULONG CipherSelect, PUCHAR KeyTable, PUCHAR Key) --
+    # and kernel_bridge.c already sizes it as 3 args.
 }
 
 
@@ -62,19 +66,24 @@ def bridge_arg_sizes():
 
 
 def thunk_routes():
-    """Ordinals kernel_thunks.c resolves directly.
+    """Ordinals resolved as data exports, from kernel_data_va_for_ordinal.
 
-    Data exports live here rather than in the bridge: their thunk holds a
-    pointer into emulated kernel data, so there is no function to wrap and no
-    stack arguments to size. Checking only the bridge reports every one of them
-    as a gap, which is how this tool first claimed Crimson Skies was missing 18
-    data exports that were already handled.
+    Data exports are not functions: their thunk holds a pointer into emulated
+    kernel data, so there is nothing to wrap and no stack arguments to size.
+    Counting them as gaps overstates the work, which is why they are separated
+    out here.
+
+    Read from kernel_bridge.c's kernel_data_va_for_ordinal specifically, not
+    from kernel_thunks.c. kernel_thunks.c has its own ordinal switch for a
+    different purpose, and matching against it happened to give the right answer
+    for one title and the wrong one for the next.
     """
-    path = os.path.join(ROOT, "src", "kernel", "kernel_thunks.c")
-    if not os.path.exists(path):
+    src = open(BRIDGE_C, encoding="utf-8", errors="replace").read()
+    m = re.search(r"kernel_data_va_for_ordinal.*?\n\}", src, re.S)
+    if not m:
         return set()
-    src = open(path, encoding="utf-8", errors="replace").read()
-    return {int(o) for o in re.findall(r"case\s+(\d+):\s*return\s+", src)}
+    return {int(o) for o in re.findall(
+        r"case\s+(\d+):\s*return\s+XBOX_KERNEL_DATA_BASE", m.group(0))}
 
 
 def kernel_impls():
@@ -135,8 +144,14 @@ def main(argv=None):
               and not (i["name"] in DATA_EXPORTS and i["ordinal"] in _thunks)]
     print("  of the %d unhandled, %d have no argument-size entry either --" %
           (n - len(covered), len(unsafe)))
-    print("  those cannot be stack-safely stubbed and will corrupt the")
-    print("  simulated stack if the title ever calls them:")
+    # stdcall_args_for_ordinal defaults to 0, so a missing entry makes the stub
+    # pop nothing and LEAK the caller's arguments -- 4 bytes per argument, every
+    # call. That accumulates rather than failing immediately, which is why it
+    # shows up far from the cause. (The repo has been here before: a 2-argument
+    # CRT handler leaking 0x24 bytes a call turned a 6-iteration init loop into
+    # 21,938 allocations and exhausted the heap.)
+    print("  so the stub pops nothing and leaks 4 bytes per argument per call,")
+    print("  which accumulates until something far away runs out of stack:")
     for i in unsafe:
         print("      %3d  %s" % (i["ordinal"], i["name"]))
     if not unsafe:

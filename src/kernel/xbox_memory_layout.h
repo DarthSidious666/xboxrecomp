@@ -40,9 +40,19 @@ extern "C" {
  * game code reads from addresses like 0x20 and 0x28 (Xbox kernel structures). */
 #define XBOX_MAP_START          0x00000000
 
-/* Xbox physical memory */
-#define XBOX_TOTAL_RAM          (64 * 1024 * 1024)  /* 64 MB */
+/* Xbox physical memory. 64 MB is the retail default; debug/beta builds ship for
+ * 128 MB devkits and allocate accordingly (Halo's cachebeta pre-allocates ~57 MB
+ * plus its debug arrays, which only fits on a devkit). Runtime-overridable via
+ * xbox_SetTotalRam() before xbox_MemoryLayoutInit(); see g_xbox_total_ram. */
+#define XBOX_TOTAL_RAM          (64 * 1024 * 1024)  /* 64 MB (default) */
+#define XBOX_DEVKIT_RAM         (128 * 1024 * 1024) /* 128 MB (debug kit) */
 #define XBOX_GPU_RESERVED       (4 * 1024 * 1024)   /* ~4 MB for GPU */
+
+/* Actual mapped RAM for this run. Defaults to XBOX_TOTAL_RAM; a title with a
+ * devkit build calls xbox_SetTotalRam(XBOX_DEVKIT_RAM) before init. Heap top and
+ * mirror stride derive from this, not from the compile-time constant. */
+extern size_t g_xbox_total_ram;
+void xbox_SetTotalRam(size_t bytes);
 
 /* NOTE: Section addresses (.text, .rdata, .data, etc.) are NOT hardcoded.
  * They are parsed from the XBE header at runtime in xbox_MemoryLayoutInit().
@@ -119,16 +129,44 @@ void xbox_ProtectMirrorsForDebug(void);
 #define KDATA_XE_IMAGE_FILENAME 0x060  /* XeImageFileName (ANSI_STRING) */
 #define KDATA_IO_COMPLETION_TYPE 0x070 /* IoCompletionObjectType (4 bytes) */
 #define KDATA_IO_DEVICE_TYPE    0x080  /* IoDeviceObjectType (4 bytes) */
+/* Object-type exports a title may compare against each other, so each needs a
+ * distinct non-zero value rather than a shared placeholder. */
+#define KDATA_MUTANT_OBJ_TYPE   0x090  /* ExMutantObjectType (4 bytes) */
+#define KDATA_SEMAPHORE_OBJ_TYPE 0x0A0 /* ExSemaphoreObjectType (4 bytes) */
+#define KDATA_TIMER_OBJ_TYPE    0x0B0  /* ExTimerObjectType (4 bytes) */
+#define KDATA_FILE_OBJ_TYPE     0x0C0  /* IoFileObjectType (4 bytes) */
+#define KDATA_TIME_INCREMENT    0x0D0  /* KeTimeIncrement (4 bytes) */
+#define KDATA_BOOT_SMC_VIDEO    0x0E0  /* HalBootSMCVideoMode (4 bytes) */
+#define KDATA_IDEX_CHANNEL      0x0F0  /* IdexChannelObject (opaque) */
 #define KDATA_HD_KEY            0x100  /* XboxHDKey (16 bytes) */
 #define KDATA_SIGNATURE_KEY     0x110  /* XboxSignatureKey (16 bytes) */
 #define KDATA_LAN_KEY           0x120  /* XboxLANKey (16 bytes) */
 #define KDATA_ALT_SIGNATURE_KEYS 0x130 /* XboxAlternateSignatureKeys (256 bytes) */
 #define KDATA_XE_PUBLIC_KEY     0x300  /* XePublicKeyData (284 bytes) */
+/* HAL disk identity strings (ordinals 41/42). Each is an XBOX_ANSI_STRING
+ * (Length, MaximumLength, Buffer VA) followed by the string bytes it points to,
+ * because HalRandGather dereferences Buffer to read the text as entropy. */
+#define KDATA_DISK_MODEL_STR    0x420  /* XBOX_ANSI_STRING (8 bytes) */
+#define KDATA_DISK_MODEL_BUF    0x430  /* model text (up to 48 bytes) */
+#define KDATA_DISK_SERIAL_STR   0x460  /* XBOX_ANSI_STRING (8 bytes) */
+#define KDATA_DISK_SERIAL_BUF   0x470  /* serial text (up to 32 bytes) */
+#define KDATA_DISK_CACHE_PARTS  0x4A0  /* HalDiskCachePartitionCount (4 bytes) */
 
 /** Size of the simulated Xbox stack (8 MB).
  *  Increased from 1 MB because failed RECOMP_ICALL indirect calls
  *  can leak stdcall args onto the stack each frame. An 8 MB stack
  *  provides enough headroom for extended gameplay sessions. */
+
+/* Thread-local storage class for the recompiled register set. Must match
+ * templates/runtime/recomp_types.h -- a mismatch is a link-time surprise. */
+#if defined(_MSC_VER)
+#  define RECOMP_TLS __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define RECOMP_TLS __thread
+#else
+#  define RECOMP_TLS _Thread_local
+#endif
+
 #define XBOX_STACK_SIZE     (8 * 1024 * 1024)
 
 /** Base VA of the stack area (above last XBE section). */
@@ -142,14 +180,13 @@ void xbox_ProtectMirrorsForDebug(void);
  * ================================================================ */
 
 /** Base VA of the dynamic heap area (above stack). */
-#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00880000 */
+#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00F80000 */
 
-/** Size of the dynamic heap.
- *  Xbox has 64 MB total RAM. The total mapped region (data + stack + heap)
- *  must equal 64 MB so the RenderWare engine's memory probing stops at the
- *  correct boundary. On a real Xbox, probing past 64 MB causes a page fault
- *  that the engine catches via SEH to determine available memory. */
-#define XBOX_HEAP_SIZE      (XBOX_TOTAL_RAM - XBOX_HEAP_BASE)  /* ~55.5 MB */
+/** Exclusive top of the dynamic heap: the end of RAM for this run. Runtime,
+ *  not a macro, because RAM size is now configurable (retail 64 MB vs devkit
+ *  128 MB). The total mapped region (data + stack + heap) equals RAM so the
+ *  engine's memory probing stops at the correct boundary. */
+#define XBOX_HEAP_TOP       ((uint32_t)g_xbox_total_ram)   /* RAM maps from VA 0 */
 
 /** No static mirror/guard region. RAM mirror is handled via file mapping
  *  views that alias the same physical pages as the base 64 MB region. */
@@ -181,5 +218,10 @@ HANDLE xbox_GetMappingHandle(void);
 #ifdef __cplusplus
 }
 #endif
+
+
+/* Carve a simulated stack for a spawned thread. Returns the Xbox VA of the
+ * stack top, or 0 when the pool is exhausted. */
+uint32_t xbox_AllocThreadStack(void);
 
 #endif /* XBOX_MEMORY_LAYOUT_H */

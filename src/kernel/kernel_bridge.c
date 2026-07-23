@@ -28,6 +28,13 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include <stdio.h>
+/* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
+ * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
+ * to 32 bits and sign-extended it into a `struct bridge_thread_start *`. Every
+ * subsequent s->field wrote to an address that had nothing to do with the
+ * allocation. MSVC says so (C4013 + C4047 "differs in levels of indirection")
+ * but only as warnings, and this file is compiled with /W4 /WX-. */
+#include <stdlib.h>
 #include <float.h>
 
 /* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
@@ -75,25 +82,44 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  */
 static uint32_t kernel_data_va_for_ordinal(ULONG ordinal)
 {
+    /* Ordinals here are checked BEFORE function routing (see the thunk build
+     * loop), so an ordinal listed by mistake turns a real kernel function into
+     * a data address -- the title then calls it and jumps into kernel data.
+     *
+     * This table had a whole block shifted. 17 (ExFreePool), 65
+     * (IoCreateDevice), 327 (XeLoadSection) and 328 (XeUnloadSection) are all
+     * functions and were all being handed data addresses; Crimson Skies imports
+     * every one of them. In the other direction, the genuine exports at 16, 353,
+     * 354, 355, 356 and 357 got no thunk at all, so a title reading
+     * XboxLANKey or KeTimeIncrement read whatever the function fallback left.
+     *
+     * test_bridge_ordinals.py now checks every entry below against the export
+     * table, which is why the block cannot drift again unnoticed. */
     switch (ordinal) {
-    case  17: return XBOX_KERNEL_DATA_BASE + KDATA_EVENT_OBJ_TYPE;
+    case  16: return XBOX_KERNEL_DATA_BASE + KDATA_EVENT_OBJ_TYPE;
+    case  22: return XBOX_KERNEL_DATA_BASE + KDATA_MUTANT_OBJ_TYPE;
+    case  30: return XBOX_KERNEL_DATA_BASE + KDATA_SEMAPHORE_OBJ_TYPE;
+    case  31: return XBOX_KERNEL_DATA_BASE + KDATA_TIMER_OBJ_TYPE;
+    case  40: return XBOX_KERNEL_DATA_BASE + KDATA_DISK_CACHE_PARTS;
     case  41: return XBOX_KERNEL_DATA_BASE + KDATA_DISK_MODEL_STR;
     case  42: return XBOX_KERNEL_DATA_BASE + KDATA_DISK_SERIAL_STR;
-    case  65: return XBOX_KERNEL_DATA_BASE + KDATA_IO_COMPLETION_TYPE;
-    case  71: return XBOX_KERNEL_DATA_BASE + KDATA_IO_DEVICE_TYPE;
+    case  64: return XBOX_KERNEL_DATA_BASE + KDATA_IO_COMPLETION_TYPE;
+    case  70: return XBOX_KERNEL_DATA_BASE + KDATA_IO_DEVICE_TYPE;
+    case  71: return XBOX_KERNEL_DATA_BASE + KDATA_FILE_OBJ_TYPE;
     case 156: return XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT;
+    case 157: return XBOX_KERNEL_DATA_BASE + KDATA_TIME_INCREMENT;
     case 164: return XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE;
     case 259: return XBOX_KERNEL_DATA_BASE + KDATA_THREAD_OBJ_TYPE;
     case 322: return XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO;
     case 323: return XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY;
     case 324: return XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION;
     case 325: return XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY;
-    case 326: return XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY;
-    case 327: return XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS;
-    case 328: return XBOX_KERNEL_DATA_BASE + KDATA_XE_IMAGE_FILENAME;
-    case 355: return XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY;         /* alias */
-    case 356: return XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS; /* alias */
-    case 357: return XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY;
+    case 326: return XBOX_KERNEL_DATA_BASE + KDATA_XE_IMAGE_FILENAME;
+    case 353: return XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY;
+    case 354: return XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS;
+    case 355: return XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY;
+    case 356: return XBOX_KERNEL_DATA_BASE + KDATA_BOOT_SMC_VIDEO;
+    case 357: return XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL;
     default:  return 0;  /* Not a data export */
     }
 }
@@ -131,13 +157,42 @@ static void kernel_data_init(void)
     /* LaunchDataPage (ordinal 164) - NULL (no launch data) */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = 0;
 
-    /* PsThreadObjectType (ordinal 259) - type object (stub: 0) */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_THREAD_OBJ_TYPE) = 0;
+    /* Object-type exports. Each gets a DISTINCT non-zero value rather than 0.
+     *
+     * They were all zero, which is wrong twice over: a title that null-checks
+     * one sees "no such type", and a title that distinguishes two of them --
+     * ObReferenceObjectByHandle takes an expected type and compares it -- sees
+     * every type as equal, so a mutant handle passes a check meant for events.
+     * The values are opaque to the game; only identity and non-nullness matter,
+     * so they are the export ordinal offset into the kernel data area, which
+     * also makes a stray one recognisable in a crash dump.
+     */
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_THREAD_OBJ_TYPE)    = XBOX_KERNEL_DATA_BASE + KDATA_THREAD_OBJ_TYPE;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_EVENT_OBJ_TYPE)     = XBOX_KERNEL_DATA_BASE + KDATA_EVENT_OBJ_TYPE;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_MUTANT_OBJ_TYPE)    = XBOX_KERNEL_DATA_BASE + KDATA_MUTANT_OBJ_TYPE;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SEMAPHORE_OBJ_TYPE) = XBOX_KERNEL_DATA_BASE + KDATA_SEMAPHORE_OBJ_TYPE;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TIMER_OBJ_TYPE)     = XBOX_KERNEL_DATA_BASE + KDATA_TIMER_OBJ_TYPE;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_FILE_OBJ_TYPE)      = XBOX_KERNEL_DATA_BASE + KDATA_FILE_OBJ_TYPE;
 
-    /* ExEventObjectType (ordinal 17) - type object (stub: 0) */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_EVENT_OBJ_TYPE) = 0;
+    /* KeTimeIncrement (ordinal 157) - 100ns units per clock tick. 0x2710 is
+     * 1 ms, which is what KeTickCount above is updated at. A title dividing by
+     * this to convert ticks to time gets a division by zero if it is left 0. */
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TIME_INCREMENT) = 0x2710;
 
-    /* IoCompletionObjectType (ordinal 65) - type object (stub: 0) */
+    /* HalBootSMCVideoMode (ordinal 356) - SMC video mode word from boot. 0 is
+     * "no video mode reported", which titles treat as auto-detect. */
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_BOOT_SMC_VIDEO) = 0;
+
+    /* IdexChannelObject (ordinal 357) - IDE channel object. Opaque; only ever
+     * passed back to Io* routines we stub, so a recognisable non-null is enough. */
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL) = XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL;
+
+    /* HalDiskCachePartitionCount (ordinal 40) - number of cache partitions.
+     * Retail consoles report 3 (X, Y, Z). Titles size a partition array from
+     * this, so 0 gives a zero-length array and 1 hides two drives. */
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_DISK_CACHE_PARTS) = 3;
+
+    /* IoCompletionObjectType (ordinal 64) - type object */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IO_COMPLETION_TYPE) = 0;
 
     /* IoDeviceObjectType (ordinal 71) - type object (stub: 0) */
@@ -1820,6 +1875,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case   2: return 16;  /* AvSendTVEncoderOption (4) */
     case   3: return 24;  /* AvSetDisplayMode (6) */
     case   4: return  4;  /* AvSetSavedDataAddress (1) */
+    case   5: return  0;  /* DbgBreakPoint (void) */
     case   8: return  0;  /* DbgPrint - __cdecl varargs, caller cleans */
     case   9: return  8;  /* HalReadSMCTrayState (2) */
     case  14: return  4;  /* ExAllocatePool (1) */
@@ -1827,6 +1883,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  17: return  4;  /* ExFreePool (1) */
     case  23: return  4;  /* ExQueryPoolBlockSize (1) */
     case  24: return 20;  /* ExQueryNonVolatileSetting (5) */
+    case  35: return  0;  /* FscGetCacheSize (void) */
     case  37: return  4;  /* FscSetCacheSize (1) */
     case  38: return  4;  /* HalClearSoftwareInterrupt (1) */
     case  39: return  8;  /* HalDisableSystemInterrupt (2) */
@@ -1865,6 +1922,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 113: return  8;  /* KeInitializeTimerEx (2) */
     case 119: return 12;  /* KeInsertQueueDpc (3) */
     case 124: return  4;  /* KeQueryBasePriorityThread (1) */
+    case 125: return  0;  /* KeQueryInterruptTime (void) */
     case 126: return  0;  /* KeQueryPerformanceCounter (void) */
     case 127: return  0;  /* KeQueryPerformanceFrequency (void) */
     case 128: return  4;  /* KeQuerySystemTime (1) */
@@ -1873,6 +1931,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 139: return  4;  /* KeRestoreFloatingPointState (1) */
     case 142: return  4;  /* KeSaveFloatingPointState (1) */
     case 143: return  8;  /* KeSetBasePriorityThread (2) */
+    case 144: return  8;  /* KeSetDisableBoostThread (2) */
     case 145: return 12;  /* KeSetEvent (3) */
     case 149: return 16;  /* KeSetTimer (Timer+DueTime[8]+Dpc) */
     case 150: return 20;  /* KeSetTimerEx (Timer+DueTime[8]+Period+Dpc) */
@@ -1884,10 +1943,12 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 161: return  0;  /* KfLowerIrql (fastcall: arg in ecx) */
     case 165: return  4;  /* MmAllocateContiguousMemory (1) */
     case 166: return 20;  /* MmAllocateContiguousMemoryEx (5) */
+    case 167: return  8;  /* MmAllocateSystemMemory (2) */
     case 168: return  8;  /* MmClaimGpuInstanceMemory (2) */
     case 169: return  8;  /* MmCreateKernelStack (2) */
     case 170: return  8;  /* MmDeleteKernelStack (2) */
     case 171: return  4;  /* MmFreeContiguousMemory (1) */
+    case 172: return  8;  /* MmFreeSystemMemory (2) */
     case 173: return  4;  /* MmGetPhysicalAddress (1) */
     case 175: return 12;  /* MmLockUnlockBufferPages (3) */
     case 176: return  8;  /* MmLockUnlockPhysicalPage (2) */
@@ -1898,12 +1959,16 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 181: return  4;  /* MmQueryStatistics (1) */
     case 182: return 12;  /* MmSetAddressProtect (3) */
     case 184: return 20;  /* NtAllocateVirtualMemory (5) */
+    case 185: return  8;  /* NtCancelTimer (2) */
+    case 186: return  4;  /* NtClearEvent (1) */
     case 187: return  4;  /* NtClose (1) */
     case 188: return  8;  /* NtCreateDirectoryObject (2) */
     case 189: return 16;  /* NtCreateEvent (4) */
     case 190: return 36;  /* NtCreateFile (9) */
+    case 191: return 16;  /* NtCreateIoCompletion (4) */
     case 192: return 12;  /* NtCreateMutant (3) */
     case 193: return 16;  /* NtCreateSemaphore (4) */
+    case 194: return 12;  /* NtCreateTimer (3) */
     case 195: return  4;  /* NtDeleteFile (1) */
     case 196: return 40;  /* NtDeviceIoControlFile (10) */
     case 197: return 12;  /* NtDuplicateObject (3) */
@@ -1912,6 +1977,9 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 200: return 40;  /* NtFsControlFile (10) */
     case 202: return 24;  /* NtOpenFile (6) */
     case 203: return  8;  /* NtOpenSymbolicLinkObject (2) */
+    case 204: return 16;  /* NtProtectVirtualMemory (4) */
+    case 205: return  8;  /* NtPulseEvent (2) */
+    case 206: return 20;  /* NtQueueApcThread (5) */
     case 207: return 36;  /* NtQueryDirectoryFile (9) */
     case 210: return  8;  /* NtQueryFullAttributesFile (2) */
     case 211: return 20;  /* NtQueryInformationFile (5) */
@@ -1919,18 +1987,26 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 217: return 16;  /* NtQueryVirtualMemory (4) */
     case 218: return 20;  /* NtQueryVolumeInformationFile (5) */
     case 219: return 32;  /* NtReadFile (8) */
+    case 220: return 32;  /* NtReadFileScatter (8) */
     case 221: return  8;  /* NtReleaseMutant (2) */
     case 222: return 12;  /* NtReleaseSemaphore (3) */
+    case 223: return 20;  /* NtRemoveIoCompletion (5) */
     case 224: return  8;  /* NtResumeThread (2) */
     case 225: return  8;  /* NtSetEvent (2) */
     case 226: return 20;  /* NtSetInformationFile (5) */
+    case 227: return 20;  /* NtSetIoCompletion (5) */
     case 228: return  8;  /* NtSetSystemTime (2) */
+    case 229: return 32;  /* NtSetTimerEx (8) */
+    case 230: return 20;  /* NtSignalAndWaitForSingleObjectEx (5) */
+    case 231: return  8;  /* NtSuspendThread (2) */
     case 232: return 12;  /* NtUserIoApcDispatcher (3) */
     case 233: return 12;  /* NtWaitForSingleObject (3) */
     case 234: return 16;  /* NtWaitForSingleObjectEx (4) */
     case 235: return 20;  /* NtWaitForMultipleObjectsEx (5) */
     case 236: return 32;  /* NtWriteFile (8) */
+    case 237: return 32;  /* NtWriteFileGather (8) */
     case 238: return  0;  /* NtYieldExecution (void) */
+    case 243: return 16;  /* ObOpenObjectByName (4) */
     case 247: return 20;  /* ObReferenceObjectByName (5) */
     case 250: return  0;  /* ObfDereferenceObject (fastcall: arg in ecx) */
     case 252: return  4;  /* PhyGetLinkState (1) */
@@ -1938,11 +2014,15 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 255: return 40;  /* PsCreateSystemThreadEx (10) */
     case 258: return  4;  /* PsTerminateSystemThread (1) */
     case 260: return 12;  /* RtlAnsiStringToUnicodeString (3) */
+    case 268: return 12;  /* RtlCompareMemory (3) */
     case 269: return 12;  /* RtlCompareMemoryUlong (3) */
     case 270: return 12;  /* RtlCompareString (3) */
     case 277: return  4;  /* RtlEnterCriticalSection (1) */
     case 279: return 12;  /* RtlEqualString (3) */
+    case 285: return 12;  /* RtlFillMemoryUlong (3) */
+    case 286: return  4;  /* RtlFreeAnsiString (1) */
     case 289: return  8;  /* RtlInitAnsiString (2) */
+    case 290: return  8;  /* RtlInitUnicodeString (2) */
     case 291: return  4;  /* RtlInitializeCriticalSection (1) */
     case 294: return  4;  /* RtlLeaveCriticalSection (1) */
     case 301: return  4;  /* RtlNtStatusToDosError (1) */

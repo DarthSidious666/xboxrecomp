@@ -37,6 +37,14 @@ static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
 
+/* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
+size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
+
+void xbox_SetTotalRam(size_t bytes)
+{
+    g_xbox_total_ram = bytes;
+}
+
 /* File mapping handle for the Xbox memory region.
  * Using CreateFileMapping + MapViewOfFileEx allows mirror views to alias
  * the same physical pages as the base region, so writes to mirror addresses
@@ -56,6 +64,11 @@ static void *g_contig_memory = NULL;
 #define XBOX_NV2A_BASE 0xFD000000u
 #define XBOX_NV2A_SIZE (16u * 1024u * 1024u)
 static void *g_nv2a_memory = NULL;
+
+/* MCPX southbridge register span: APU 0xFE800000 through NIC 0xFEF00000. */
+#define XBOX_MCPX_BASE 0xFE800000u
+#define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
+static void *g_mcpx_memory = NULL;
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
 
@@ -145,6 +158,28 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 #define NV2A_USER_DMA_PUT 0x800040u
 #define NV2A_USER_DMA_GET 0x800044u
 
+/*
+ * Free-running counters in the MCPX aperture.
+ *
+ * Some hardware registers are clocks, not flags: software reads them and waits
+ * until the value passes a target. Against zeroed RAM the value never moves and
+ * the wait is forever. DirectSound's CMcpxCore::SetupVoiceProcessor spins on
+ * the APU sample counter at 0xFE820010 exactly this way, which is where Halo
+ * stopped once input initialisation started working.
+ *
+ * Ticking it is the honest model: on hardware this counter advances on its own
+ * whether or not anything is listening.
+ *
+ * ponytail: the rate is "as fast as this thread loops", not 48 kHz. Nothing
+ * paces audio off it yet. Derive it from a real clock if timing starts to
+ * matter.
+ */
+static const uint32_t MCPX_COUNTERS[] = {
+    0x020010,   /* APU GP sample counter, DirectSound SetupVoiceProcessor */
+};
+
+static void *g_mcpx_regs = NULL;
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -172,6 +207,23 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 *get = *put;
             }
         }
+        if (g_mcpx_regs) {
+            for (size_t i = 0; i < sizeof(MCPX_COUNTERS) / sizeof(MCPX_COUNTERS[0]); i++) {
+                volatile uint32_t *c =
+                    (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]);
+                *c += 1;
+            }
+        }
+
+        /* Advance KeTickCount. It was written once at init and left frozen,
+         * which silently breaks every timeout that polls it: Halo's DHCP setup
+         * waits on a tick deadline that never arrives and spins forever bringing
+         * up XNet. A live clock is also just the truth -- KeTickCount ticks on
+         * hardware whether or not anyone is asleep. GetTickCount() shares the
+         * millisecond unit, so the rate matches. */
+        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                               + g_memory_offset) = GetTickCount();
+
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
     return 0;
@@ -196,16 +248,16 @@ static void *g_kernel_memory = NULL;
 ptrdiff_t g_xbox_mem_offset = 0;
 
 /* Global registers for recompiled code (via recomp_types.h) */
-uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
-uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
+RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
-uint32_t g_seh_ebp = 0;
-double g_fp_stack[8];
-int g_fp_top = 0;
+RECOMP_TLS uint32_t g_seh_ebp = 0;
+RECOMP_TLS double g_fp_stack[8];
+RECOMP_TLS int g_fp_top = 0;
 /* Last frame established by `mov ebp, esp`. Read by frameless functions
  * that address their caller's frame through ebp. */
-uint32_t g_ebp = 0;
+RECOMP_TLS uint32_t g_ebp = 0;
 
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};
@@ -228,8 +280,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * This includes low memory (KPCR at 0x0-0xFF) which game code reads
      * from, the XBE sections, and the simulated stack.
      */
-    /* Map the full 64MB Xbox address space (covers all sections + stack + heap) */
-    g_memory_size = XBOX_TOTAL_RAM;
+    /* Map the full Xbox address space (covers all sections + stack + heap).
+     * Size is runtime-configurable: retail 64 MB, devkit debug builds 128 MB. */
+    g_memory_size = g_xbox_total_ram;
 
     /*
      * Create a file mapping backed by the page file.
@@ -609,6 +662,47 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+    /*
+     * MCPX device apertures.
+     *
+     * The NV2A block above is not the only hardware the title touches
+     * directly. The southbridge devices live higher up:
+     *
+     *   0xFE800000  APU (audio processing unit)
+     *   0xFEC00000  AC97
+     *   0xFED00000  USB0 / USB1
+     *   0xFEF00000  NIC
+     *
+     * Halo faults reading 0xFED00000 during input initialisation -- the XDK's
+     * USB code talks to the host controller's registers rather than going
+     * through a driver. Back the whole span as plain RAM for the same reason
+     * the NV2A aperture is backed: a read of zero is survivable, a fault is
+     * not.
+     *
+     * ponytail: no register semantics anywhere in here. If something spins
+     * waiting for a bit to set, extend the NV2A ack thread's table rather than
+     * emulating the device.
+     */
+    {
+        uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
+        g_mcpx_memory = VirtualAlloc(
+            (LPVOID)mcpx_native,
+            XBOX_MCPX_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE
+        );
+        g_mcpx_regs = g_mcpx_memory;
+        if (g_mcpx_memory) {
+            fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
+                    "0x%08X (APU/AC97/USB/NIC, zeroed)\n",
+                    XBOX_MCPX_SIZE / (1024 * 1024), XBOX_MCPX_BASE);
+        } else {
+            fprintf(stderr, "  WARNING: MCPX aperture at 0x%08X failed "
+                    "(error %lu); USB/audio register access will fault\n",
+                    XBOX_MCPX_BASE, GetLastError());
+        }
+    }
+
     if (g_nv2a_memory) {
         xbox_Nv2aAckStart();
     }
@@ -651,8 +745,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     /* Initialize the dynamic heap. */
     fprintf(stderr, "  Heap: %u MB at Xbox VA 0x%08X-0x%08X\n",
-            XBOX_HEAP_SIZE / (1024 * 1024), XBOX_HEAP_BASE,
-            XBOX_HEAP_BASE + XBOX_HEAP_SIZE);
+            (unsigned)((XBOX_HEAP_TOP - XBOX_HEAP_BASE) / (1024 * 1024)),
+            XBOX_HEAP_BASE, XBOX_HEAP_TOP);
 
     /*
      * Map mirror views of the 64 MB region.
@@ -798,6 +892,34 @@ static struct { uint32_t addr; uint32_t size; uint8_t free; }
     g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
 
+/*
+ * Simulated stacks for spawned threads.
+ *
+ * The main thread owns the top of the XBOX_STACK region and grows down; worker
+ * stacks are carved from the bottom upward so the two cannot meet until the
+ * whole 8 MB is gone. Xbox VAs, not host memory: recompiled code addresses its
+ * stack through MEM32() like any other Xbox pointer.
+ */
+#define XBOX_THREAD_STACK_SIZE  (512 * 1024)
+#define XBOX_MAX_THREAD_STACKS  8
+
+static int g_thread_stacks_used = 0;
+
+uint32_t xbox_AllocThreadStack(void)
+{
+    uint32_t base;
+
+    if (g_thread_stacks_used >= XBOX_MAX_THREAD_STACKS) {
+        return 0;
+    }
+    base = XBOX_STACK_BASE +
+           (uint32_t)g_thread_stacks_used * XBOX_THREAD_STACK_SIZE;
+    g_thread_stacks_used++;
+
+    /* Top of the slice, 16-byte aligned, growing down. */
+    return base + XBOX_THREAD_STACK_SIZE - 16;
+}
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
@@ -833,9 +955,38 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     /* Align the next pointer */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
-    if (result + size > XBOX_HEAP_BASE + XBOX_HEAP_SIZE) {
+    if (result + size > XBOX_HEAP_TOP) {
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
-                size, g_heap_next - XBOX_HEAP_BASE, XBOX_HEAP_SIZE);
+                size, g_heap_next - XBOX_HEAP_BASE,
+                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
+        /* Who ate the heap? Group live blocks by size -- an exhausted heap is
+         * nearly always one request size repeated, and the count names it. */
+        {
+            static int dumped = 0;
+            static struct { uint32_t size; int n; } hist[256];
+            if (!dumped) {
+                int used = 0;
+                dumped = 1;
+                for (int i = 0; i < g_heap_block_count; i++) {
+                    int j = 0;
+                    if (g_heap_blocks[i].free || !g_heap_blocks[i].size) continue;
+                    while (j < used && hist[j].size != g_heap_blocks[i].size) j++;
+                    if (j == used) {
+                        if (used == 256) continue;   /* ponytail: 256 distinct sizes is plenty */
+                        hist[used].size = g_heap_blocks[i].size;
+                        hist[used++].n = 0;
+                    }
+                    hist[j].n++;
+                }
+                for (int j = 0; j < used; j++) {
+                    if ((uint64_t)hist[j].n * hist[j].size < 1024 * 1024) continue;
+                    fprintf(stderr, "  [HEAP] %d live blocks of %u bytes (%u KB)\n",
+                            hist[j].n, hist[j].size,
+                            (unsigned)((uint64_t)hist[j].n * hist[j].size / 1024));
+                }
+                fflush(stderr);
+            }
+        }
         return 0;
     }
 
@@ -857,7 +1008,8 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     if (g_heap_alloc_count <= 32 || (g_heap_alloc_count % 512) == 0) {
         fprintf(stderr, "  [HEAP] #%d: size=%u align=%u → 0x%08X..0x%08X (used %u/%u)\n",
                 g_heap_alloc_count, size, alignment, result, result + size,
-                g_heap_next - XBOX_HEAP_BASE, XBOX_HEAP_SIZE);
+                g_heap_next - XBOX_HEAP_BASE,
+                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
         fflush(stderr);
     }
 
