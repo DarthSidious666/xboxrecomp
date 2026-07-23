@@ -904,7 +904,7 @@ class BatchTranslator:
                 "",
             ]
             stub_lines.append(
-                "/* Each stub consumes the dummy return address its caller pushed,")
+                "/* Each stub consumes the return address its caller pushed,")
             stub_lines.append(
                 " * exactly as a real 'ret' would. An empty body leaves esp 4 bytes")
             stub_lines.append(

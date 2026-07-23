@@ -30,6 +30,7 @@
 #ifdef RECOMP_ICALL_FEEDBACK
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "recomp_icall_feedback.h"
 
@@ -65,6 +66,21 @@ void recomp_icall_feedback_dump(const char *path)
 
     fprintf(stderr, "[icall-feedback] %s: %lu resolved, %lu unresolved targets\n",
             path, resolved, unresolved);
+}
+
+static void dump_at_exit(void)
+{
+    recomp_icall_feedback_dump(RECOMP_ICALL_FEEDBACK_PATH);
+}
+
+void recomp_icall_feedback_init(void)
+{
+    /* atexit only fires on a clean exit. A title killed by a watchdog timeout
+     * (run.sh uses `timeout`, which is exit 124) never reaches it, which is why
+     * the crash handler dumps too -- and why, if a title neither exits nor
+     * crashes, you must call the dump yourself from wherever you decide the run
+     * is over. There is deliberately no timer thread doing it behind your back. */
+    atexit(dump_at_exit);
 }
 
 #else  /* !RECOMP_ICALL_FEEDBACK */

@@ -55,9 +55,28 @@ extern volatile unsigned char g_icall_seen[RECOMP_ICALL_FB_SIZE];
  */
 void recomp_icall_feedback_dump(const char *path);
 
+/** Register an atexit() dump to RECOMP_ICALL_FEEDBACK_PATH. */
+void recomp_icall_feedback_init(void);
+
+/* Default dump location, relative to the working directory. CUSTOMIZE if your
+ * launcher runs from somewhere you would rather not write to. */
+#ifndef RECOMP_ICALL_FEEDBACK_PATH
+#define RECOMP_ICALL_FEEDBACK_PATH "icall_targets.dump"
+#endif
+
+/* Call these from the host program. They are macros so a host can call them
+ * unconditionally without #ifdef -- both compile away when the feature is off,
+ * which is the point: instrumentation the host has to bracket in #ifdef is
+ * instrumentation that rots. */
+#define RECOMP_ICALL_FEEDBACK_INIT() recomp_icall_feedback_init()
+#define RECOMP_ICALL_FEEDBACK_DUMP() \
+    recomp_icall_feedback_dump(RECOMP_ICALL_FEEDBACK_PATH)
+
 #else  /* !RECOMP_ICALL_FEEDBACK */
 
 #define RECOMP_ICALL_OBSERVE(va, flags) ((void)0)
+#define RECOMP_ICALL_FEEDBACK_INIT()   ((void)0)
+#define RECOMP_ICALL_FEEDBACK_DUMP()   ((void)0)
 
 #endif
 
