@@ -170,6 +170,15 @@ def main():
                         help="JSON list of addresses the project implements by "
                              "hand. Their bodies are not generated, so the "
                              "hand-written definition links instead")
+    parser.add_argument("--exclude-manual", metavar="FILE",
+                        nargs="?", const="src/game/recomp/recomp_manual.c",
+                        help="Scan a C file (default recomp_manual.c) for the "
+                             "functions it defines by hand and skip generating "
+                             "their bodies -- the same effect as listing them in "
+                             "--manual-functions, but read straight from the "
+                             "source of truth so the two cannot drift. Handles "
+                             "sub_X_gen wrappers and pins referenced sub_ names. "
+                             "Ported from the Burnout 3 fork.")
     parser.add_argument("--trace-functions", metavar="FILE",
                         help="JSON list of addresses to emit an entry trace "
                              "for (RECOMP_TRACE_ENTER). For bring-up: shows "
@@ -340,6 +349,44 @@ def main():
                 entry["name"] = pinned_name
             print(f"Hand-written overrides: {len(manual)} functions will not "
                   f"be generated", file=sys.stderr)
+
+        # --exclude-manual: derive the same `manual` set by scanning the C file
+        # the project hand-writes, instead of a separate JSON that has to be
+        # kept in sync with it. Everything below maps onto mechanisms already
+        # used above -- the `manual` set (declare-only) and func_db name pinning
+        # -- so the translator needs no changes.
+        if args.exclude_manual:
+            from .manual_scan import scan as _scan_manual
+            skip, wrap, referenced = _scan_manual(args.exclude_manual)
+            known = set(translator.func_db)
+
+            # referenced-but-not-wrapped: the hand-written code names these as
+            # sub_XXXXXXXX (declares or calls them), so they must keep that
+            # name whatever a naming pass wanted. Otherwise the manual reference
+            # is left undefined at link.
+            pinned = 0
+            for addr in (referenced & known) - wrap:
+                info = translator.func_db[addr]
+                plain = f"sub_{addr:08X}"
+                if info.get("name") != plain:
+                    info["name"] = plain
+                    pinned += 1
+
+            # wrap: recomp_manual.c defines sub_X itself and calls the generated
+            # body as sub_X_gen. So do NOT add these to `manual` (the body is
+            # still needed) -- just rename them so the emitted body is sub_X_gen.
+            for addr in wrap & known:
+                translator.func_db[addr]["name"] = f"sub_{addr:08X}_gen"
+
+            # skip - wrap: defined by hand and not wrapped -> declare-only, which
+            # is exactly what membership in `manual` produces.
+            newly = {a for a in (skip - wrap) if a in known} - manual
+            manual |= newly
+            print(f"Excluding {len(newly)} functions defined in "
+                  f"{args.exclude_manual}"
+                  + (f"; {pinned} pinned to sub_ names" if pinned else "")
+                  + (f"; {len(wrap & known)} wrapped as sub_X_gen" if wrap else ""),
+                  file=sys.stderr)
 
         stats = translator.translate_batch_split(
             funcs,
