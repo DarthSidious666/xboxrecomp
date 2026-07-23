@@ -1,0 +1,118 @@
+"""
+Self-check for the x87 float-compare branch idiom.
+
+Run: py -3 tools/recomp/test_fpu_branch.py
+
+`fcomp; fnstsw ax; test ah, mask; jp/jnp` is how all pre-SSE x86 code branches on
+a float comparison. The lifter set _fpu_cmp from the compare but then made fnstsw
+a no-op and hardcoded the jp/jnp branch to a constant, so every float comparison
+went one fixed direction. Halo's render_camera_build_frustum took the wrong path
+in sub_00109150 and left world_to_view all zeros, failing
+valid_real_matrix4x3 at render_cameras.c:458 -- the boot blocker.
+
+This checks the two halves the fix restored: fnstsw ax reconstructs ah from
+_fpu_cmp, and jp/jnp after test read a real parity of (ah & mask).
+"""
+
+import os
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+from tools.recomp.lifter import Lifter  # noqa: E402
+
+
+class _Op:
+    def __init__(self, text, type="reg", reg=None, size=4, mem_size=None, imm=0):
+        self.text = text
+        self.type = type
+        self.reg = reg
+        self.size = size
+        self.mem_size = mem_size
+        self.imm = imm
+
+
+class _Insn:
+    def __init__(self, mnemonic, operands, op_str=""):
+        self.mnemonic = mnemonic
+        self.operands = operands
+        self.op_str = op_str
+        self.is_cond_jump = False
+        self.is_call = False
+        self.is_ret = False
+        self.is_jump = False
+        self.call_target = None
+        self.jump_target = None
+
+
+def test_fnstsw_ax_sets_ah_from_fpu_cmp():
+    out = "\n".join(Lifter().lift_instruction(_Insn("fnstsw", [], "ax")))
+    assert "_fpu_cmp" in out, out
+    assert "eax = (eax & 0xFFFF00FFu)" in out, out
+    # equal -> 0x40, less -> 0x01, greater -> 0x00, shifted into ah
+    assert "0x40u" in out and "0x01u" in out and "<< 8" in out, out
+
+
+def test_fnstsw_to_memory_stays_a_noop():
+    out = "\n".join(Lifter().lift_instruction(
+        _Insn("fnstsw", [_Op("word ptr [eax]", type="mem", mem_size=2)],
+              "word ptr [eax]")))
+    assert "fpu compare" not in out, out
+
+
+C_HELPER = r"""
+#include <stdint.h>
+#include <stdio.h>
+static inline int recomp_parity8(uint32_t x){x&=0xFFu;x^=x>>4;x^=x>>2;x^=x>>1;return (int)(~x&1u);}
+#define RECOMP_PARITY8(x) recomp_parity8((uint32_t)(x))
+
+/* Reproduce the fixed idiom for each compare outcome and confirm the branch. */
+static int branch_jnp(int fpu_cmp) {
+    uint32_t eax = 0;
+    eax = (eax & 0xFFFF00FFu) | ((uint32_t)((fpu_cmp==0)?0x40u:(fpu_cmp<0)?0x01u:0x00u) << 8);
+    uint32_t ah = (eax >> 8) & 0xFFu;
+    /* test ah,0x44 ; jnp taken?  jnp = PF==0 */
+    return (!RECOMP_PARITY8(ah & 0x44u));
+}
+int main(void){
+    /* Standard idiom `test ah,0x44; jnp` jumps ONLY when equal (fpu_cmp==0). */
+    if (branch_jnp(1))  { printf("FAIL: greater took jnp\n"); return 1; }  /* > : PF=1, no jump */
+    if (!branch_jnp(0)) { printf("FAIL: equal missed jnp\n"); return 1; }  /* = : PF=0, jump */
+    if (branch_jnp(-1)) { printf("FAIL: less took jnp\n"); return 1; }     /* < : PF=1, no jump */
+    printf("OK jnp branches only on equal\n");
+    return 0;
+}
+"""
+
+
+def test_idiom_semantics_compiled():
+    import shutil
+    cc = shutil.which("clang") or shutil.which("gcc") \
+        or (r"C:\Program Files\LLVM\bin\clang.exe"
+            if os.path.exists(r"C:\Program Files\LLVM\bin\clang.exe") else None)
+    if not cc:
+        print("  SKIP no C compiler")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        c = os.path.join(tmp, "t.c")
+        open(c, "w").write(C_HELPER)
+        exe = os.path.join(tmp, "t.exe")
+        r = subprocess.run([cc, "-w", c, "-o", exe], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-1500:]
+        r = subprocess.run([exe], capture_output=True, text=True)
+        assert r.returncode == 0 and r.stdout.startswith("OK"), r.stdout + r.stderr
+        print("     " + r.stdout.strip())
+
+
+def _run():
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    for fn in fns:
+        fn()
+        print("  ok  %s" % fn.__name__)
+    print("%d checks passed" % len(fns))
+
+
+if __name__ == "__main__":
+    _run()

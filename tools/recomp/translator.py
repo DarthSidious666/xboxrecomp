@@ -359,11 +359,15 @@ class FunctionTranslator:
         self.lifter.needs_cf = has_carry
         self.lifter.publishes_ebp = self._func_has_prologue(instructions)
 
-        # Add _fpu_cmp for FPU compare instructions (both old and new style)
+        # Add _fpu_cmp for FPU compare instructions (both old and new style).
+        # Also for fnstsw, which reads _fpu_cmp to reconstruct ah in the
+        # `fnstsw ax; test ah, mask; jp/jnp` float branch idiom -- otherwise the
+        # generated fnstsw references an undeclared _fpu_cmp.
         has_fpu_cmp = any(insn.mnemonic in ("fcompi", "fcomip", "fucomi",
                                              "fucompi", "fucomip", "fcomi",
                                              "fcom", "fcomp", "fcompp",
-                                             "fucom", "fucomp", "fucompp")
+                                             "fucom", "fucomp", "fucompp",
+                                             "fnstsw")
                           for insn in instructions)
         if has_fpu_cmp:
             lines.append(f"    int _fpu_cmp = 0; /* FPU compare result: -1/0/1 */")

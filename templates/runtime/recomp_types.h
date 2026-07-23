@@ -340,6 +340,19 @@ static inline uint32_t ROR32(uint32_t val, int n) {
     MEM32(sp) = _pv; \
 } while(0)
 
+/**
+ * x86 parity flag: 1 when the low byte of the result has an EVEN number of set
+ * bits (that is what PF means). Used by the x87 float-compare idiom
+ * `fnstsw ax; test ah, mask; jp/jnp`, which is how all pre-SSE code branches on
+ * a float comparison. Without a real parity here the branch was hardcoded and
+ * every such comparison went one fixed direction.
+ */
+static inline int recomp_parity8(uint32_t x) {
+    x &= 0xFFu; x ^= x >> 4; x ^= x >> 2; x ^= x >> 1;
+    return (int)(~x & 1u);   /* 1 = even parity (PF set) */
+}
+#define RECOMP_PARITY8(x) recomp_parity8((uint32_t)(x))
+
 /** Pop a 32-bit value from the simulated stack. */
 #define POP32(sp, dst) do { \
     (dst) = MEM32(sp); \

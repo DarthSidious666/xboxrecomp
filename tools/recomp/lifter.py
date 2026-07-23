@@ -14,6 +14,7 @@ Memory model:
   - Xbox data sections mapped at original VAs
 """
 
+import re
 import struct
 
 from .disasm import Instruction, Operand
@@ -385,8 +386,10 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"((int32_t)({lhs} - {rhs}) < 0)", desc
         if jcc == "jns":
             return f"((int32_t)({lhs} - {rhs}) >= 0)", desc
-        if jcc in ("jp", "jnp"):
-            return f"1 /* {jcc} after cmp - parity */", desc
+        if jcc == "jp":
+            return f"RECOMP_PARITY8(({lhs}) - ({rhs}))", desc
+        if jcc == "jnp":
+            return f"(!RECOMP_PARITY8(({lhs}) - ({rhs})))", desc
         return None
 
     # ── test: flags from (a & b), operands unchanged ──
@@ -403,8 +406,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return "0", desc  # OF=0 after test
         if jcc == "jno":
             return "1", desc
-        if jcc in ("jp", "jnp"):
-            return f"1 /* {jcc} after test - parity */", desc
+        if jcc == "jp":
+            # PF from (a & b) low byte. This is the x87 float branch idiom
+            # `fnstsw ax; test ah, mask; jp/jnp` (fnstsw put the compare bits
+            # into ah). jp jumps on even parity (PF=1).
+            return f"RECOMP_PARITY8(({lhs}) & ({rhs}))", desc
+        if jcc == "jnp":
+            return f"(!RECOMP_PARITY8(({lhs}) & ({rhs})))", desc
         return None
 
     # ── sub: a = a - b, flags from (a_orig - b) ──
@@ -1716,6 +1724,31 @@ class Lifter:
 
     # ── FPU (x87) ──
 
+    def _fcom_rhs(self, ops):
+        """The value an fcom-family instruction compares st0 against.
+
+        `fcom`/`fcomp`/`fcompp` with no operand compare st0 with st1. With a
+        memory operand they compare st0 with that float/double. With an st(i)
+        operand, that register. Returning fp_st1() unconditionally (the old
+        behavior) is only right for the no-operand form.
+        """
+        if not ops:
+            return "fp_st1()"
+        op = ops[0]
+        if getattr(op, "type", None) == "mem":
+            if getattr(op, "mem_size", 4) == 8:
+                return f"MEMD({_fmt_mem(op)})"
+            return f"MEMF({_fmt_mem(op)})"
+        if getattr(op, "type", None) == "reg" and op.reg:
+            mm = re.search(r"st\(?(\d+)\)?", op.reg)
+            idx = int(mm.group(1)) if mm else 1
+            if idx == 0:
+                return "fp_top()"
+            if idx == 1:
+                return "fp_st1()"
+            return f"g_fp_stack[(g_fp_top + {idx}) & 7]"
+        return "fp_st1()"
+
     def _lift_fpu(self, insn, m, ops):
         """Basic FPU instruction translation using double locals."""
         # FPU is complex. We translate common patterns to double operations.
@@ -1837,17 +1870,34 @@ class Lifter:
         if m == "fxch":
             return [f"{{ double _t = fp_top(); fp_top() = fp_st1(); fp_st1() = _t; }} /* fxch */"]
         if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp"):
-            # Set _fpu_cmp for the fcomp/fnstsw/sahf pattern
-            return [f"_fpu_cmp = (fp_top() < fp_st1()) ? -1 : (fp_top() > fp_st1()) ? 1 : 0;"
+            # Compare st0 against the operand, not always st1. `fcomp [mem]`
+            # compares st0 with the memory value; only the no-operand form
+            # compares st0 with st1. Getting this wrong made every float compare
+            # against a constant read a garbage st1 -- Halo's camera FOV and
+            # world_to_view checks both fed on it.
+            rhs = self._fcom_rhs(ops)
+            return [f"_fpu_cmp = (fp_top() < {rhs}) ? -1 : (fp_top() > {rhs}) ? 1 : 0;"
                     f" /* {m} {insn.op_str} */"]
         if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi"):
             # These set EFLAGS directly (CF, ZF, PF) from FPU comparison
             # fcompi/fucompi pop st(0) after comparing; fcomi/fucomi do not
             pops = m.endswith("pi") or m.endswith("ip")
             pop_code = " fp_pop();" if pops else ""
-            return [f"_fpu_cmp = (fp_top() < fp_st1()) ? -1 : (fp_top() > fp_st1()) ? 1 : 0;"
+            rhs = self._fcom_rhs(ops)
+            return [f"_fpu_cmp = (fp_top() < {rhs}) ? -1 : (fp_top() > {rhs}) ? 1 : 0;"
                     f"{pop_code} /* {m} */"]
         if m == "fnstsw":
+            # `fnstsw ax` after an FPU compare is half of the pre-SSE float
+            # branch idiom `fcomp; fnstsw ax; test ah, mask; j(p/np/z/nz)`.
+            # Put the compare's C3/C2/C0 condition bits into ah so the following
+            # test reads a real value instead of stale eax. _fpu_cmp is -1/0/1
+            # for st0 </=/> src; the FPU sets C3 on equal (ah bit 6 = 0x40) and
+            # C0 on less-than (ah bit 0 = 0x01), C2 only on unordered (NaN),
+            # which non-NaN game math does not hit.
+            if insn.op_str.strip() in ("ax", "eax"):
+                return ["eax = (eax & 0xFFFF00FFu) | ((uint32_t)("
+                        "(_fpu_cmp == 0) ? 0x40u : (_fpu_cmp < 0) ? 0x01u : 0x00u"
+                        ") << 8); /* fnstsw ax <- fpu compare */"]
             return [f"/* fnstsw {insn.op_str} - store FPU status word */"]
         if m == "fnstcw":
             return [f"/* fnstcw {insn.op_str} - store FPU control word */"]
