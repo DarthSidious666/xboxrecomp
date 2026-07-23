@@ -175,6 +175,54 @@ def cmd_merge(args):
     return 0
 
 
+def cmd_seeds(args):
+    """Write a filtered seed file from the database.
+
+    Measurement and action are deliberately separate. The database records
+    everything the title actually branched to, because throwing away an
+    observation is unrecoverable. What is safe to hand the function detector is
+    a narrower question, and getting it wrong is expensive: a seeded address
+    that is not really a function start produces a bogus function whose
+    translation is wrong, and that is worse than the no-op stub it replaced.
+
+    The alignment filter exists because of a measured regression on Halo 2276.
+    Seeding all 25 observed unresolved targets made the title crash *earlier*
+    (segfault before the render_cameras.c:458 assert it used to reach, 6
+    CreateTexture calls instead of 12). 21 of them were 16-aligned, which is
+    what MSVC emits for a real function start; 4 were not. An unaligned
+    indirect target is far more likely to be a garbage vtable read that
+    happened to land inside .text than a function the detector missed -- the
+    RECOMP_ICALL range check is trying to catch exactly that class and cannot,
+    because the garbage is in range.
+    """
+    db = load_db(args.db)
+    if not db:
+        print("empty or missing database: %s" % args.db, file=sys.stderr)
+        return 1
+
+    # Deliberately NOT filtered against the current functions.json. Seeds are an
+    # input to the pass that rewrites functions.json from scratch, so dropping
+    # "already known" targets is circular: on the next run they are only known
+    # *because* they were seeded, and an indirect-only target is one the detector
+    # cannot re-derive on its own. A seed file must be a standalone statement of
+    # what to seed, idempotent across runs.
+    kept, dropped = {}, []
+    for va, flags in sorted(db.items()):
+        if args.align and (va % args.align):
+            dropped.append((va, "not %d-aligned" % args.align))
+            continue
+        kept[va] = flags
+
+    save_db(args.out, kept)
+    print("seeds written : %s" % args.out)
+    print("  from database: %d targets" % len(db))
+    print("  kept         : %d" % len(kept))
+    print("  dropped      : %d" % len(dropped))
+    for va, why in dropped:
+        print("     0x%08X  %s" % (va, why))
+    return 0
+
+
 def cmd_report(args):
     db = load_db(args.db)
     if not db:
@@ -215,6 +263,16 @@ def main(argv=None):
     m.add_argument("dumps", nargs="+", help="files written by "
                                            "recomp_icall_feedback_dump()")
     m.set_defaults(func=cmd_merge)
+
+    s = sub.add_parser("seeds", help="write a filtered seed file from the database")
+    s.add_argument("--out", required=True, metavar="JSON",
+                   help="seed file to write (feed to tools.disasm "
+                        "--seed-functions)")
+    s.add_argument("--align", type=int, default=16, metavar="N",
+                   help="drop targets not N-byte aligned; 0 disables. Default "
+                        "%(default)s, which is what MSVC emits for a function "
+                        "start. See cmd_seeds for why this defaults on.")
+    s.set_defaults(func=cmd_seeds)
 
     r = sub.add_parser("report", help="summarise the database")
     r.set_defaults(func=cmd_report)

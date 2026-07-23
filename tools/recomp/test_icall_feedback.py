@@ -92,6 +92,49 @@ def test_database_is_directly_loadable_as_seed_functions():
     assert raw[1]["seen"] == "unresolved", raw[1]
 
 
+def test_seeds_drops_unaligned_targets():
+    """Measured on Halo 2276: seeding the raw observed set made the title crash
+    earlier than before (segfault before the render_cameras.c:458 assert it used
+    to reach). The 4 offenders were the only unaligned ones. Filtering to
+    16-aligned restored the original milestone, and the next run confirmed those
+    same 4 were still the only unresolved targets -- i.e. they are not function
+    starts, they are garbage that happens to land in .text."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "targets.json")
+        out = os.path.join(tmp, "seeds.json")
+        save_db(db, {0x001B5540: 2, 0x001D99BA: 2, 0x0024B5FB: 2, 0x00130EC0: 2})
+        assert main(["--db", db, "seeds", "--out", out, "--align", "16"]) == 0
+        kept = load_db(out)
+    assert sorted(kept) == [0x00130EC0, 0x001B5540], [hex(v) for v in kept]
+
+
+def test_seeds_align_zero_keeps_everything():
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "targets.json")
+        out = os.path.join(tmp, "seeds.json")
+        save_db(db, {0x001B5540: 2, 0x001D99BA: 2})
+        assert main(["--db", db, "seeds", "--out", out, "--align", "0"]) == 0
+        assert len(load_db(out)) == 2
+
+
+def test_seeds_are_not_filtered_against_current_functions_json():
+    """Seeds are an INPUT to the pass that rewrites functions.json from scratch.
+    Dropping 'already known' targets is circular: next run they are only known
+    because they were seeded, and an indirect-only target cannot be re-derived.
+    A seed file must be a standalone, idempotent statement of what to seed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "targets.json")
+        out = os.path.join(tmp, "seeds.json")
+        fns = os.path.join(tmp, "functions.json")
+        save_db(db, {0x00130EC0: 1, 0x001B5540: 2})
+        with open(fns, "w") as f:
+            json.dump([{"start": "0x00130EC0", "end": "0x00130F00"}], f)
+        assert main(["--db", db, "--functions", fns,
+                     "seeds", "--out", out]) == 0
+        kept = load_db(out)
+    assert sorted(kept) == [0x00130EC0, 0x001B5540], [hex(v) for v in kept]
+
+
 def test_zero_flag_entries_are_not_recorded():
     # A zero byte means "never observed"; it must not become a seed.
     with tempfile.TemporaryDirectory() as tmp:

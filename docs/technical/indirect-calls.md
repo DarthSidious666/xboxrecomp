@@ -303,10 +303,17 @@ recomp_icall_feedback_dump("icall.txt");
 Then close the loop:
 
 ```
-python -m tools.recomp.icall_feedback merge icall.txt
-python -m tools.disasm --seed-functions tools/recomp/output/icall_targets.json
+python -m tools.recomp.icall_feedback --db game/2276/icall_targets.json \
+    --functions build/disasm/functions.json merge icall.txt
+python -m tools.recomp.icall_feedback --db game/2276/icall_targets.json \
+    seeds --out game/2276/icall_seeds.json --align 16
+python -m tools.disasm ... --seed-functions game/2276/icall_seeds.json
 # re-run the recompiler; repeat
 ```
+
+**Seed `icall_seeds.json`, not `icall_targets.json`.** The database is the raw
+cumulative measurement; the seed file is the filtered subset that is safe to hand
+the detector. Do not skip the filter — see below.
 
 Each observed target is flagged `resolved` (dispatch found a translation, so it
 confirms a real function start) or `unresolved` (dispatch failed — a real gap
@@ -326,6 +333,53 @@ unresolved addresses by where they land relative to known functions, which is a
 guess; this is a record of where the title actually branched. Use both — feed the
 measured set in as seeds first, then classify whatever the detector still cannot
 place.
+
+### Measured result, Halo build 2276
+
+Two rounds, on a title that asserts in `render_cameras.c:458` before reaching
+`main()`:
+
+| | round 1 | round 2 (after seeding) |
+|---|---|---|
+| distinct targets observed | 67 | 71 (+4, execution reached further) |
+| resolved | 42 | **66** |
+| unresolved **in that run** | 25 | **5** |
+| cumulative gaps not a known function start | 24 | **4** |
+| functions detected | 8,849 | 8,869 |
+
+20 of the 24 gaps closed. The pre-existing `[ICALL] Failed to resolve` diagnostic
+had reported **3** of those 24 — it rate-limits at 16 reports because each dumps a
+16-entry ring buffer, so it went silent long before the interesting targets
+appeared.
+
+### Why the alignment filter is on by default
+
+**Seeding the raw measured set made the title crash earlier than before.** It
+segfaulted (`exit=139`) on a read through `0xFFFFFFF3` before reaching the assert
+it used to reach, with 6 `CreateTexture` calls instead of 12.
+
+This is precisely the trap `run.sh` warns about: distinct assert sites went
+**1 → 0**, which looks like a win and is not one. Zero asserts because execution
+died before the code that asserts.
+
+The cause was the 4 observed targets that were **not 16-aligned**. Filtering to
+16-aligned restored the original milestone and exit code. Round 2 then confirmed
+the diagnosis independently: those same 4 addresses were still the only
+unresolved targets, so they are not function starts the detector missed — they are
+garbage that happens to land inside `.text`, most likely uninitialised vtable
+reads. The `RECOMP_ICALL` range check is trying to catch exactly that class and
+cannot, because the garbage is in range.
+
+Real MSVC function starts are 16-aligned. Unaligned *resolved* targets do exist
+(the detector finds some via `cc_boundary` and `tail_jump`), which is why the
+filter is applied when generating seeds rather than when recording observations —
+the database keeps everything, because discarding a measurement is unrecoverable.
+
+One caveat not yet explained: the filtered build still makes 6 `CreateTexture`
+calls where baseline made 12, with the same total `[D3D]` call count, the same
+assert site and the same exit code. 20 previously-stubbed indirect calls now do
+real work, so the path legitimately changed — but "legitimately changed" is a
+hypothesis, not a finding.
 
 ## Key Insight
 
