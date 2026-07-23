@@ -337,8 +337,27 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
     if (!th) free(s);
+    /* Record the game thread so a host-tick-driven title's watchdog can sample
+     * it via xbox_thread_debug_handle. Harmless for default-model titles: they
+     * spawn workers too, but never read it back. See kernel_thread.c. */
+    else xbox_set_game_thread(th);
     return th;
 }
+
+/* Two ways a title expects its first PsCreateSystemThreadEx to behave.
+ *
+ * INLINE (default): the first call IS the game starting -- run the routine
+ * inline, inheriting register state, and it drives its own main loop forever.
+ * This is what Halo and Crimson Skies need and the historical behavior.
+ *
+ * SPAWN: the title's entry spawns an init thread and RETURNS, expecting the host
+ * to drive the per-frame tick afterwards (Burnout 3 is tick-driven). Here the
+ * first call must spawn a real thread and return, so control comes back to the
+ * host. Opt in with xbox_SetThreadMode before the game starts. See
+ * docs/technical/burnout3-reunification.md. */
+/* XBOX_THREAD_MODE_* and xbox_SetThreadMode are declared in xbox_memory_layout.h. */
+static int g_thread_mode = XBOX_THREAD_MODE_INLINE;
+void xbox_SetThreadMode(int mode) { g_thread_mode = mode; }
 
 static void bridge_PsCreateSystemThreadEx(void)
 {
@@ -346,7 +365,10 @@ static void bridge_PsCreateSystemThreadEx(void)
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
     uint32_t start_routine   = STACK_ARG(9);
-    int is_first_call = (g_thread_call_count == 0);
+    /* In SPAWN mode there is no privileged "first call": every thread is real,
+     * so the entry can return. In INLINE mode the first call runs the game. */
+    int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
+                        && (g_thread_call_count == 0);
     g_thread_call_count++;
 
     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",

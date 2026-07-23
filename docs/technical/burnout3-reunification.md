@@ -98,14 +98,29 @@ both low-risk:
 Completing Phase 0 is a regen + full rebuild (the giant chunks are slow) and does
 not touch the runtime, so it is safe — just not instant.
 
-**Phase 1 — threading reconciliation. The gate.** Make xboxrecomp's
-`PsCreateSystemThreadEx` support *both* a real-thread mode (Burnout 3's frame
-pump) and the synchronous mode (Halo), selected per title — a runtime flag, not a
-fork. Bring `xbox_worker_stack_alloc` / `xbox_thread_debug_handle` and the
-worker-stack region into xboxrecomp's kernel as the real-thread path. Validate
-against **both** Halo (synchronous unchanged) and a Burnout 3 that keeps its own
-kernel but calls the merged interface. This is delicate — it touches a shipping
-path in two titles — and should not be rushed.
+**Phase 1 — threading reconciliation. Done.** xboxrecomp's kernel now supports
+both driving models, defaulting to the one Halo and Crimson Skies use so they are
+untouched.
+
+- `XBOX_WORKER_STACK_*` region + `xbox_worker_stack_alloc`/`free` (verbatim from
+  the Burnout 3 fork): a guest stack for the host's own thread to call recompiled
+  code from, which is what a host-tick-driven title needs to pump its frame tick.
+- `xbox_thread_debug_handle` + `g_game_thread`, recorded when the bridge spawns a
+  thread, so a host watchdog can sample the game thread.
+- `xbox_SetThreadMode(XBOX_THREAD_MODE_SPAWN)`: in SPAWN mode every
+  `PsCreateSystemThreadEx` is a real thread so the title's entry can return and
+  the host can drive. Default is `INLINE` — the first call runs the game in place,
+  the historical behavior.
+
+All of it is additive: a default-model title calls none of it, so the region is
+unused address space and the code is never reached. Verified: Halo builds and
+runs **byte-identically** (same exit, same milestones, same
+`render_cameras.c:458`), the allocator passes a standalone correctness check (16
+distinct slices, exhaustion, free/reuse, aligned stride), and Burnout 3's exact
+`main.c` threading API compiles against xboxrecomp's headers. What remains is
+Phase 2 wiring it up under a real swap — including confirming empirically whether
+Burnout 3's init thread must genuinely run concurrently (SPAWN) or whether INLINE
+suffices.
 
 **Phase 2 — kernel swap.** With threading reconciled, Burnout 3 uses xboxrecomp's
 kernel. This is where the 50 misroutings get fixed and where the correct export

@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
 
 /* ============================================================================
  * Thread Start Wrapper
@@ -392,4 +393,47 @@ NTSTATUS __stdcall xbox_NtResumeThread(
         "NtResumeThread: thread=%p previous_count=%u", ThreadHandle, prev);
 
     return STATUS_SUCCESS;
+}
+
+
+/* ================================================================
+ * Worker stack slices + game-thread tracking (host-tick-driven titles)
+ * ================================================================
+ *
+ * Ported from the Burnout 3 fork as the runtimes reunite. A host-driven title
+ * returns from its entry after spawning an init thread and expects the host's
+ * own thread to drive the per-frame tick; to call recompiled code from there it
+ * needs a guest stack, which a worker slice provides. Additive: a default-model
+ * title never calls any of this, so it is inert for Halo, Crimson Skies, etc.
+ * See docs/technical/burnout3-reunification.md and XBOX_WORKER_STACK_* in
+ * xbox_memory_layout.h.
+ */
+
+/* The game's own thread, kept so a wedged boot can be inspected from the host
+ * watchdog. Set when a title's game thread is spawned; NULL under the default
+ * inline model, where there is no separate thread to sample. */
+static HANDLE g_game_thread = NULL;
+
+void  xbox_set_game_thread(void *h) { g_game_thread = (HANDLE)h; }
+void *xbox_thread_debug_handle(void) { return (void *)g_game_thread; }
+
+/* One bit per worker stack slice. Interlocked because a host-driven title can
+ * allocate a slice from the host thread while recompiled code allocates one for
+ * a spawned worker, so the allocator itself must be thread-safe. */
+static volatile LONG g_worker_stack_used[XBOX_WORKER_STACK_COUNT];
+
+int xbox_worker_stack_alloc(void)
+{
+    int i;
+    for (i = 0; i < XBOX_WORKER_STACK_COUNT; i++) {
+        if (InterlockedCompareExchange(&g_worker_stack_used[i], 1, 0) == 0)
+            return i;
+    }
+    return -1;  /* all slices in use */
+}
+
+void xbox_worker_stack_free(int slot)
+{
+    if (slot >= 0 && slot < XBOX_WORKER_STACK_COUNT)
+        InterlockedExchange(&g_worker_stack_used[slot], 0);
 }
