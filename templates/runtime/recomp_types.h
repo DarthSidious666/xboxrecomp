@@ -47,6 +47,19 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+/* math.h is load-bearing, and its absence was invisible.
+ *
+ * The lifter emits sqrt() and fabs() for fsqrt/fabs -- 146 of them in one of
+ * Halo's nine chunks alone -- and now sin/cos/tan/atan2/log2/exp2/fmod for the
+ * x87 transcendentals. With no declaration in scope, C89 implicit declaration
+ * makes every one of them return `int`: the caller reads EAX instead of XMM0 and
+ * gets garbage, then converts that garbage to double. Vector normalisation is
+ * 1/sqrt(x), so this corrupts every matrix the title builds.
+ *
+ * Nothing reported it because generated code is compiled with /w (see the game
+ * CMakeLists) -- MSVC's C4013 was emitted and discarded. Same failure as the
+ * missing stdlib.h in kernel_bridge.c, in a hotter path. */
+#include <math.h>
 
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
 #if !defined(_MSC_VER) && !defined(__forceinline)

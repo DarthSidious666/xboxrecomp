@@ -1774,6 +1774,66 @@ class Lifter:
             return [f"fp_top() = fabs(fp_top()); /* fabs */"]
         if m == "fsqrt":
             return [f"fp_top() = sqrt(fp_top()); /* fsqrt */"]
+        # x87 transcendentals. None of these were implemented, so every one fell
+        # through to the unknown-op path and left the FP stack untouched --
+        # silently, because an unimplemented FPU op looks exactly like an
+        # instruction that only had a side effect on the status word.
+        #
+        # Halo 2276 alone has 123 fcos, 108 fsin, 31 fpatan, 8 fptan, 5 fyl2x,
+        # 3 f2xm1 and 1 fprem. Every camera matrix and rotation in the game goes
+        # through them, which is why render_camera_build_frustum asserted on
+        # valid_real_matrix4x3: the matrix was built out of tangents that were
+        # never computed, so it held whatever had been in those globals before.
+        #
+        # These are exact-enough mappings onto libm. The 80-bit intermediates of
+        # real x87 are not reproduced -- fp_stack is double -- which is the same
+        # approximation every other op here already makes.
+        if m == "fsin":
+            return [f"fp_top() = sin(fp_top()); /* fsin */"]
+        if m == "fcos":
+            return [f"fp_top() = cos(fp_top()); /* fcos */"]
+        if m == "fsincos":
+            # Replaces st0 with sin, then pushes cos. Order matters: the push
+            # must see the sine already stored.
+            return [f"{{ double _a = fp_top(); fp_top() = sin(_a);"
+                    f" fp_push(cos(_a)); }} /* fsincos */"]
+        if m == "fptan":
+            # st0 = tan(st0), then push 1.0. The constant push is not decoration:
+            # callers use it as the denominator of a subsequent fdiv.
+            return [f"{{ fp_top() = tan(fp_top()); fp_push(1.0); }} /* fptan */"]
+        if m == "fpatan":
+            # st1 = atan2(st1, st0), pop. Argument order is st1 over st0.
+            return [f"{{ fp_st1() = atan2(fp_st1(), fp_top()); fp_pop(); }}"
+                    f" /* fpatan */"]
+        if m == "fyl2x":
+            # st1 = st1 * log2(st0), pop.
+            return [f"{{ fp_st1() = fp_st1() * log2(fp_top()); fp_pop(); }}"
+                    f" /* fyl2x */"]
+        if m == "fyl2xp1":
+            return [f"{{ fp_st1() = fp_st1() * log2(fp_top() + 1.0); fp_pop(); }}"
+                    f" /* fyl2xp1 */"]
+        if m == "f2xm1":
+            return [f"fp_top() = exp2(fp_top()) - 1.0; /* f2xm1 */"]
+        if m in ("fprem", "fprem1"):
+            # Both leave the remainder in st0 and clear C2 to say "complete".
+            # fprem truncates toward zero, fprem1 rounds to nearest (IEEE), which
+            # is the difference between fmod and remainder.
+            fn = "fmod" if m == "fprem" else "remainder"
+            return [f"fp_top() = {fn}(fp_top(), fp_st1()); /* {m} */"]
+        if m == "fscale":
+            return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
+        if m == "frndint":
+            return [f"fp_top() = nearbyint(fp_top()); /* frndint */"]
+        if m == "fldpi":
+            return [f"fp_push(3.14159265358979323846); /* fldpi */"]
+        if m == "fldl2e":
+            return [f"fp_push(1.44269504088896340736); /* fldl2e */"]
+        if m == "fldl2t":
+            return [f"fp_push(3.32192809488736234787); /* fldl2t */"]
+        if m == "fldlg2":
+            return [f"fp_push(0.30102999566398119521); /* fldlg2 */"]
+        if m == "fldln2":
+            return [f"fp_push(0.69314718055994530942); /* fldln2 */"]
         if m == "fxch":
             return [f"{{ double _t = fp_top(); fp_top() = fp_st1(); fp_st1() = _t; }} /* fxch */"]
         if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp"):
