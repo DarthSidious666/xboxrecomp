@@ -109,11 +109,18 @@ def save_db(path, targets):
         f.write("\n")
 
 
-def load_function_starts():
-    """Known function start VAs, or None if the database has not been built."""
-    if not os.path.exists(FUNCTIONS_PATH):
+def load_function_starts(path=None):
+    """Known function start VAs, or None if the database has not been built.
+
+    Defaults to the in-repo disasm output, but a real per-title project puts it
+    somewhere else (Halo: build/disasm/functions.json), so this is overridable.
+    Cross-referencing against another title's function database would silently
+    report every target as a gap.
+    """
+    path = path or FUNCTIONS_PATH
+    if not os.path.exists(path):
         return None
-    with open(FUNCTIONS_PATH) as f:
+    with open(path) as f:
         return {int(fn["start"], 16) for fn in json.load(f)}
 
 
@@ -150,10 +157,10 @@ def cmd_merge(args):
     unresolved = sorted(va for va, f in db.items() if f & SEEN_UNRESOLVED)
     print("  ever-unresolved: %d" % len(unresolved))
 
-    starts = load_function_starts()
+    starts = load_function_starts(args.functions)
     if starts is None:
-        print("\n  (tools/disasm/output/functions.json not built --"
-              " skipping cross-reference)")
+        print("\n  (no functions.json -- skipping cross-reference;"
+              " pass --functions)")
     else:
         missing = [va for va in unresolved if va not in starts]
         print("\n  of those, NOT a known function start: %d" % len(missing))
@@ -162,7 +169,7 @@ def cmd_merge(args):
         if len(missing) > 20:
             print("     ... and %d more" % (len(missing) - 20))
         print("\n  These are the real gaps. Seed them:")
-        print("    python -m tools.disasm --seed-functions %s" % args.db)
+        print("    python -m tools.disasm ... --seed-functions %s" % args.db)
         print("  Then classify what the detector still cannot place:")
         print("    python tools/recomp/analyze_unresolved.py")
     return 0
@@ -181,9 +188,9 @@ def cmd_report(args):
     for flags in sorted(counts):
         print("    %-11s %6d" % (FLAG_NAMES.get(flags, str(flags)), counts[flags]))
 
-    starts = load_function_starts()
+    starts = load_function_starts(args.functions)
     if starts is None:
-        print("  (functions.json not built -- no cross-reference)")
+        print("  (no functions.json -- no cross-reference; pass --functions)")
         return 0
     known = sum(1 for va in db if va in starts)
     print("  known function starts   : %d" % known)
@@ -198,6 +205,10 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=DEFAULT_DB,
                     help="cumulative database path (default: %(default)s)")
+    ap.add_argument("--functions", default=None, metavar="JSON",
+                    help="functions.json to cross-reference against. Defaults to "
+                         "the in-repo disasm output; a per-title project keeps its "
+                         "own (Halo: build/disasm/functions.json).")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     m = sub.add_parser("merge", help="merge runtime dumps into the database")
