@@ -2661,6 +2661,17 @@ void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
  * resolves each to a per-ordinal bridge function, and replaces the entry
  * with a synthetic VA for dispatch.
  */
+/* Per-title ordinal remap; NULL = identity (the kernel's own XDK). Set by
+ * xbox_kernel_set_ordinal_remap before init. See kernel.h. */
+static const unsigned short *g_ordinal_remap = NULL;
+static int g_ordinal_remap_count = 0;
+
+void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count)
+{
+    g_ordinal_remap = map;
+    g_ordinal_remap_count = count;
+}
+
 void xbox_kernel_bridge_init(void)
 {
     int i;
@@ -2689,8 +2700,16 @@ void xbox_kernel_bridge_init(void)
         uint32_t current = BRIDGE_MEM32(va);
 
         if (current & 0x80000000) {
-            /* Read the actual ordinal from Xbox memory */
+            /* Read the actual ordinal from Xbox memory, then translate it into
+             * the kernel's canonical ordinal space. Identity unless the title
+             * set a remap (a different XDK). Every routing decision below --
+             * data export, bridge, arg size -- keys off the canonical ordinal,
+             * so one translation here covers all three. */
             ULONG ordinal = current & 0x7FFFFFFF;
+            if (g_ordinal_remap && ordinal < (ULONG)g_ordinal_remap_count
+                && g_ordinal_remap[ordinal]) {
+                ordinal = g_ordinal_remap[ordinal];
+            }
             g_slot_ordinals[i] = ordinal;
 
             /* Check if this is a data export */

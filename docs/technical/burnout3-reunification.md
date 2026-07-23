@@ -139,29 +139,38 @@ Phase 2 wiring it up under a real swap — including confirming empirically whet
 Burnout 3's init thread must genuinely run concurrently (SPAWN) or whether INLINE
 suffices.
 
-**Phase 2 — kernel swap. Attempted; blocked on per-title routing.** The
-mechanical swap works: Burnout 3 builds and links against xboxrecomp's kernel and
-platform (repoint two `add_subdirectory` lines), the `0xFE000000 + i*4` dispatch
-contract is identical so the recompiled code needs no change, and Phase 1's
-`xbox_SetThreadMode(SPAWN)` makes its frame pump run — the first
-`PsCreateSystemThreadEx` spawned a real thread and the entry returned, exactly as
-intended. But the game exits during engine setup because xboxrecomp's routing
-table is built for a different XDK than Burnout 3's (see the export-ordinal note
-above). So the real work here is not the CMake edit — it is making the kernel
-route ordinals from **per-title data** instead of a hardcoded switch:
+**Phase 2 — kernel swap: routing done, threading-execution next.** Two parts.
 
-- `stdcall_args_for_ordinal`, `kernel_data_va_for_ordinal`, and the dispatch
-  switch in `kernel_bridge.c` all hardcode one XDK's ordinal → (function,
-  arg-size, data) mapping. Drive them from a table keyed by the title's XBE
-  import analysis instead, so the same kernel serves any XDK.
-- With that, Burnout 3 uses xboxrecomp's kernel *code* (the correctness fixes, the
-  audit tooling, the Phase 1 threading) with its *own* ordinal routing, and Halo
-  and Crimson keep theirs. Regenerate `gen/` with xboxrecomp's tools in the same
-  step (gen reaches the kernel only through `RECOMP_ICALL` by ordinal, so it does
-  not hard-depend on names — but the two should move together).
+*Routing (done).* Rather than refactor the kernel's three hardcoded ordinal
+tables, a single translation layer maps a title's ordinals into the kernel's
+canonical space before any routing decision. `xbox_kernel_set_ordinal_remap`
+takes `map[title_ordinal] = canonical_ordinal`; the init loop applies it right
+where it reads the ordinal, so the data-export, bridge, and arg-size lookups all
+see the canonical number. `tools/kernel_audit/gen_ordinal_remap.py` builds the
+map by matching each function the title imports to the ordinal the kernel's own
+table gives that name. Measured: Halo (XDK 3911) and Crimson (5659) remap
+**nothing** — their XDK is the kernel's canonical one, so they are byte-identical
+(verified: Halo still exits 3 at `render_cameras.c:458`). Burnout 3 (XDK 5849)
+remaps 47 ordinals and leaves 3 its parser could not name as identity. With the
+remap installed, **Burnout 3 no longer exits during engine setup** — ordinal 49
+now resolves to `HalRequestSoftwareInterrupt` (which the kernel benignly stubs),
+`xbe_entry_point` returns normally, and the title enters its host loop and starts
+loading crash-mode HUD textures on xboxrecomp's kernel. Zero "no bridge" warnings
+of consequence, zero FP exceptions.
 
-The threading gate (Phase 1) is what made even the *attempt* possible; the
-routing is the next gate.
+*Threading execution (next).* One layer deeper: the init worker
+`PsCreateSystemThreadEx` spawns runs but does not advance the game state (zero
+kernel calls from the worker stack region). xboxrecomp's `bridge_thread_main` and
+Burnout 3's `xbox_recomp_thread_wrapper` set the new thread up almost identically
+(esp = stack top, push ctx2/ctx1/dummy-return, call the routine), so this is a
+narrow integration difference in how the spawned routine runs under the swapped
+kernel, not a routing problem. That is the next thing to chase — the routing gate
+is now open.
+
+The kernel *code* is shared, the ordinal *table* is per-title data, and Halo and
+Crimson are untouched. Regenerate `gen/` with xboxrecomp's tools when this lands
+(gen reaches the kernel only through `RECOMP_ICALL` by ordinal, so it does not
+hard-depend on names — but the two should move together).
 
 **Phase 3 — nv2a / d3d.** The hardest, most coupled. Burnout 3's game speaks to
 its nv2a through two local bridge headers (`d3d_device_snapshot.h`,
