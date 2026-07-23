@@ -34,7 +34,9 @@ Same toolchain (`ficompiler.exe`), same runtime ABI (`InitPrecompiledDll` return
 `xefu_69c41281` (`xb1krnl.exe`) is **one 832,546-byte host function** plus 65 pieces of CRT
 scaffolding (`__report_gsfailure`, `capture_previous_context`, `InitPrecompiledDll`, …).
 The 41 MB game module is the same shape at scale — its `.pdata` is 76 entries whose largest
-five ranges are **16,387,345**, 1,192,616, 940,880, 639,689 and 603,236 bytes.
+five ranges are **16,387,345**, 1,192,616, 940,880, 639,689 and 603,236 bytes. A full IDA
+pass over that module independently agrees: **105 functions** for 21 MB of `.text` (against
+2,246 for the PPC `xboxkrnlcf` at a fifth the size), the flat-arena signature at scale.
 
 Note the correct reading of that `.pdata`: unwind info covers **99.996 %** of `.text`, but as
 ~76 enormous ranges. It is not "no unwind info" — it is "the whole translated arena is a
