@@ -130,12 +130,40 @@ def test_arith_honors_operands():
     # faddp: st1 += st0, pop
     o = lift("faddp", [], "")
     assert "fp_st1() = fp_st1() + fp_top(); fp_pop();" in o, o
+    # faddp st(1): capstone reports the pop form as ONE operand. Must target
+    # st(i) and pop -- NOT st0 without a pop (that broke normalize's sum of
+    # squares and gave Halo a 1/sqrt(2)-scaled camera basis).
+    o = lift("faddp", [st1], "st(1)")
+    assert "fp_st1() = fp_st1() + fp_top(); fp_pop();" in o, o
+    # faddp st(2): st(2) = st(2) + st0, pop
+    o = lift("faddp", [_Op("st2", type="reg", reg="st(2)")], "st(2)")
+    assert "g_fp_stack[(g_fp_top + 2) & 7] = g_fp_stack[(g_fp_top + 2) & 7] + fp_top(); fp_pop();" in o, o
+    # fmul st(3): non-pop single operand stays st0 *= st(3), no pop
+    o = lift("fmul", [_Op("st3", type="reg", reg="st(3)")], "st(3)")
+    assert "fp_top() = fp_top() * g_fp_stack[(g_fp_top + 3) & 7]" in o and "fp_pop" not in o, o
+    # fmulp st(1): st1 *= st0, pop
+    o = lift("fmulp", [st1], "st(1)")
+    assert "fp_st1() = fp_st1() * fp_top(); fp_pop();" in o, o
     # fsubr [mem]: st0 = mem - st0 (reversed)
     o = lift("fsubr", [mem], "dword ptr [0xK]")
     assert "fp_top() = MEMF(0xK) - fp_top()" in o, o
     # fdivrp st(1), st(0): st1 = st0 / st1, pop
     o = lift("fdivrp", [st1, st0], "st(1), st(0)")
     assert "fp_st1() = fp_top() / fp_st1(); fp_pop();" in o, o
+
+
+def test_fst_mem_does_not_pop():
+    """fst [mem] stores st0 WITHOUT popping; only fstp pops. fp_pop() is a real
+    pop (g_fp_top++), not a no-op, so emitting it for fst emptied the FP stack
+    under valid_real_matrix4x3 and failed Halo's camera assert."""
+    import tools.recomp.lifter as lf
+    lf._fmt_mem = lambda op: "0xK"
+    L = Lifter()
+    mem = _Op("m", type="mem", mem_size=4)
+    o = L.lift_instruction(_Insn("fst", [mem], "dword ptr [0xK]"))[0]
+    assert "fp_pop" not in o, o
+    o = L.lift_instruction(_Insn("fstp", [mem], "dword ptr [0xK]"))[0]
+    assert "fp_pop();" in o, o
 
 
 def test_fstp_sti_pops():

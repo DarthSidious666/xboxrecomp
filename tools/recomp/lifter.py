@@ -1784,12 +1784,18 @@ class Lifter:
             return [f"/* fld {insn.op_str} */"]
 
         if m in ("fst", "fstp"):
-            pop = "p" if m == "fstp" else ""
+            # Only fstp pops. fst stores st0 and leaves the stack alone. The old
+            # code emitted fp_pop() for BOTH -- fp_pop() is g_fp_top++, a real
+            # pop, not a no-op -- so every `fst [mem]` (store WITHOUT pop) shrank
+            # the FP stack by one. valid_real_matrix4x3 does `fst [tmp]` before
+            # its fabs/fcompare, so the compare ran on an emptied stack slot and
+            # rejected orthonormal camera matrices at render_cameras.c:458.
+            do_pop = " fp_pop();" if m == "fstp" else ""
             if len(ops) >= 1 and ops[0].type == "mem":
                 if ops[0].mem_size == 4:
-                    return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top(); fp_pop{pop}(); /* {m} */"]
+                    return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top();{do_pop} /* {m} */"]
                 elif ops[0].mem_size == 8:
-                    return [f"MEMD({_fmt_mem(ops[0])}) = fp_top(); fp_pop{pop}(); /* {m} */"]
+                    return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{do_pop} /* {m} */"]
             # fst/fstp st(i): copy st0 to st(i); fstp then pops. This used to be
             # a bare comment -- a no-op -- which LEAKS the FPU stack. `fstp st(0)`
             # is the common idiom for "pop the value fptan/fsincos just pushed";
@@ -1855,11 +1861,24 @@ class Lifter:
                     code += " fp_pop();"
                 return [f"{code} /* {m} {insn.op_str} */"]
 
-            # One register operand: fXXX st(i) -> st0 op= st(i), no pop.
+            # One register operand. Capstone reports the pop forms this way too
+            # -- `faddp st(1)` comes through as a single operand st(1), NOT as
+            # two operands and NOT as the no-operand form. The pop variants put
+            # the result in st(i) and pop; only the non-pop variants target st0:
+            #   fadd  st(i)  ->  st0  = st0  op st(i)          (no pop)
+            #   faddp st(i)  ->  st(i) = st(i) op st0 ; pop
+            # Treating faddp st(i) as the no-pop st0 form left the FP stack one
+            # slot deep AND wrote the wrong slot, so a normalize's sum of squares
+            # double-counted -- a unit vector got length sqrt(2) and Halo's
+            # world_to_view basis came out scaled by 1/sqrt(2) (0.707), failing
+            # valid_real_matrix4x3.
             if len(ops) >= 1 and ops[0].type == "reg":
                 si = self._st_index(ops[0].reg)
-                return [f"{_combine('fp_top()', self._st_expr(si))}"
-                        f" /* {m} {insn.op_str} */"]
+                if pops:
+                    code = _combine(self._st_expr(si), "fp_top()") + " fp_pop();"
+                else:
+                    code = _combine("fp_top()", self._st_expr(si))
+                return [f"{code} /* {m} {insn.op_str} */"]
 
             # No operand: the stack pop form, st1 op= st0, pop.
             code = _combine("fp_st1()", "fp_top()") + " fp_pop();"
