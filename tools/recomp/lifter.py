@@ -1771,6 +1771,16 @@ class Lifter:
                     elif ops[0].mem_size == 8:
                         return [f"fp_push(MEMD({_fmt_mem(ops[0])})); /* fld double */"]
                     return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld */"]
+                if ops[0].type == "reg":
+                    # fld st(i) pushes a COPY of st(i). Was a no-op comment,
+                    # which silently dropped a stack slot -- sub_00109150 (the
+                    # world_to_view builder) duplicates values with fld st(0)
+                    # three times. Capture the value first: fp_push mutates
+                    # g_fp_top, so passing fp_top() directly would read the
+                    # slot after the decrement.
+                    src = self._st_expr(self._st_index(ops[0].reg))
+                    return [f"{{ double _t = {src}; fp_push(_t); }}"
+                            f" /* fld {insn.op_str} */"]
             return [f"/* fld {insn.op_str} */"]
 
         if m in ("fst", "fstp"):
