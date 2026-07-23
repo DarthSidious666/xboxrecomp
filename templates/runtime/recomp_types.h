@@ -374,6 +374,27 @@ typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(uint32_t xbox_va);
 
 /**
+ * Build the flat, directly-indexed dispatch table.
+ *
+ * Turns recomp_lookup from a binary search over every translated function into
+ * a bounds check and one indexed load -- the C form of Microsoft's
+ * `jmp [table + guest_eip*8]`. Call it once at startup, before any recompiled
+ * code runs.
+ *
+ * Entirely optional: if it is never called, or returns 0 because the allocation
+ * failed, recomp_lookup keeps using the binary search and everything still
+ * works. Costs 8 bytes per byte of guest code span (see
+ * recomp_dispatch_flat_bytes), allocated with calloc so the untouched middle
+ * stays uncommitted.
+ *
+ * Returns 1 if the flat table is in use, 0 if the search is.
+ */
+int recomp_dispatch_init(void);
+
+/** Bytes held by the flat table, or 0 if it was never built. */
+size_t recomp_dispatch_flat_bytes(void);
+
+/**
  * Look up a kernel thunk function by its synthetic VA.
  * Kernel thunks live at 0xFE000000+ (synthetic addresses assigned
  * during kernel bridge initialization).
