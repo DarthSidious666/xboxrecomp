@@ -256,7 +256,7 @@ class FunctionDetector:
                 code_ranges.add(addr)
 
         call_targets = self.engine.get_call_targets()
-        realigned = 0
+        realigned = unaligned = 0
         for target in call_targets:
             section = self.image.get_section_at_va(target)
             if not (section and section.executable):
@@ -270,6 +270,15 @@ class FunctionDetector:
             # Engine.decode_at. On Halo 2276 this is 46 functions that were
             # becoming `g_esp += 4` no-op stubs.
             if target not in self.engine.instructions:
+                # Manufacturing an instruction here is creating evidence, not
+                # reading it, so require corroboration. A call operand decoded
+                # out of data produces a plausible-looking in-section address
+                # that is almost never aligned; a real MSVC function start
+                # almost always is. Targets that already decoded are untouched,
+                # whatever their alignment -- that is pre-existing behaviour.
+                if target % config.CALL_TARGET_REALIGN_ALIGNMENT:
+                    unaligned += 1
+                    continue
                 if self.engine.decode_at(target):
                     realigned += 1
                 else:
@@ -279,8 +288,9 @@ class FunctionDetector:
                 config.CONFIDENCE_CALL_TARGET,
                 "call_target"
             )
-        if realigned:
-            print(f"  Realigned {realigned} call targets the sweep stepped over")
+        if realigned or unaligned:
+            print(f"  Realigned {realigned} call targets the sweep stepped over"
+                  f" ({unaligned} rejected as unaligned)")
 
     def _pass_tail_jump_targets(self, sections: List[SectionInfo]) -> bool:
         """
