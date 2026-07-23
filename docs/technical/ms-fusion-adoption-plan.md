@@ -87,15 +87,7 @@ per call, so behaviour is identical by construction. What would make it wrong: a
 title whose code span is large enough that the table is not worth the RAM, or
 manual overrides registered *after* init — both detectable at build time.
 
-### 5. `decode_at` inside `recursive_descent` — **planned**
-
-`recursive_descent` only reads `engine.instructions` (`insn = ...get(addr); if
-insn is None: break`), so it dead-ends at exactly the holes item 3 exists to fix.
-Reachability currently sits at 76.1%. Same one-line-ish fix, wider blast radius,
-so it needs measuring rather than assuming: more reachable code means more
-detected functions, but also more opportunity to follow a bad decode.
-
-### 6. Keep the sweep in phase at source — **planned**
+### 5. Keep the sweep in phase at source — **planned**
 
 Item 3 patches the symptom at call targets. The cause is that `linear_sweep`
 never restarts from a known-good boundary. Sweeping forward from every known

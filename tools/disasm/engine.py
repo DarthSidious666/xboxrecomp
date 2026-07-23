@@ -299,6 +299,18 @@ class DisasmEngine:
 
                 insn = self.instructions.get(addr)
                 if insn is None:
+                    # Tried calling decode_at here to realign, on the theory
+                    # that descent was being truncated by the same out-of-phase
+                    # runs decode_at fixes for call targets. Measured on Halo
+                    # 2276: +138 reachable instructions out of 640k (0.02%),
+                    # zero new functions, and one tail_jump_target lost. Not
+                    # worth the risk of following a bad decode deeper.
+                    #
+                    # It is small because descent starts from function heads the
+                    # sweep already decoded and stops at ret/jmp, so it seldom
+                    # walks into a hole in the first place -- the call-target
+                    # path in _pass_call_targets already catches the cases that
+                    # matter. See docs/technical/ms-fusion-adoption-plan.md.
                     break
 
                 reachable.add(addr)
