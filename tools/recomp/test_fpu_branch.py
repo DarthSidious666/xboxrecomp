@@ -152,6 +152,20 @@ def test_arith_honors_operands():
     assert "fp_st1() = fp_top() / fp_st1(); fp_pop();" in o, o
 
 
+def test_fcom_pop_counts():
+    """fcom pops 0, fcomp pops 1, fcompp pops 2. Emitting no pop for the pop
+    forms leaked a slot on every float compare and drifted g_fp_top, failing
+    Halo's camera matrix validation non-deterministically."""
+    L = Lifter()
+    st1 = _Op("st1", type="reg", reg="st(1)")
+    o = "\n".join(L.lift_instruction(_Insn("fcom", [st1], "st(1)")))
+    assert "fp_pop" not in o, o
+    o = "\n".join(L.lift_instruction(_Insn("fcomp", [st1], "st(1)")))
+    assert o.count("fp_pop();") == 1, o
+    o = "\n".join(L.lift_instruction(_Insn("fcompp", [], "")))
+    assert o.count("fp_pop();") == 2, o
+
+
 def test_fst_mem_does_not_pop():
     """fst [mem] stores st0 WITHOUT popping; only fstp pops. fp_pop() is a real
     pop (g_fp_top++), not a no-op, so emitting it for fst emptied the FP stack

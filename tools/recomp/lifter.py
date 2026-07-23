@@ -1966,8 +1966,18 @@ class Lifter:
             # against a constant read a garbage st1 -- Halo's camera FOV and
             # world_to_view checks both fed on it.
             rhs = self._fcom_rhs(ops)
+            # Pop count is in the mnemonic and was being ignored: fcom/fucom pop
+            # nothing, fcomp/fucomp pop once, fcompp/fucompp pop twice. Emitting
+            # zero pops for every form leaked a stack slot on each fcomp -- and
+            # float compares are everywhere -- so g_fp_top drifted and later fld
+            # st(i)/faddp read the wrong slots. valid_real_matrix4x3 calls the
+            # leaking per-vector check three times, then its own dot products ran
+            # on a drifted stack: an orthonormal matrix failed non-deterministically
+            # at render_cameras.c:458. Compare first (rhs may be fp_st1()), then pop.
+            npop = 2 if m.endswith("pp") else (1 if m.endswith("p") else 0)
+            pops = " fp_pop();" * npop
             return [f"_fpu_cmp = (fp_top() < {rhs}) ? -1 : (fp_top() > {rhs}) ? 1 : 0;"
-                    f" /* {m} {insn.op_str} */"]
+                    f"{pops} /* {m} {insn.op_str} */"]
         if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi"):
             # These set EFLAGS directly (CF, ZF, PF) from FPU comparison
             # fcompi/fucompi pop st(0) after comparing; fcomi/fucomi do not
