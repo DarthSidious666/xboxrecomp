@@ -285,6 +285,48 @@ if (now - last_time >= 2000) {
 | Stack leak per failed ICALL | 4 bytes (dummy return address) |
 | Stack headroom | 8 MB (sufficient for hours of gameplay) |
 
+## Target Feedback: Measure Instead of Guess
+
+Static analysis cannot see where a vtable call goes. Running the title can.
+
+Build with `RECOMP_ICALL_FEEDBACK` defined and every indirect branch records its
+target into a flat byte array indexed by guest VA — one subtract, one compare,
+one OR on the hot path, and nothing at all in a default build. Dump it from
+`atexit` and from your crash handler (a title that dies mid-boot is exactly the
+one whose targets you want):
+
+```c
+#include "recomp_icall_feedback.h"
+recomp_icall_feedback_dump("icall.txt");
+```
+
+Then close the loop:
+
+```
+python -m tools.recomp.icall_feedback merge icall.txt
+python -m tools.disasm --seed-functions tools/recomp/output/icall_targets.json
+# re-run the recompiler; repeat
+```
+
+Each observed target is flagged `resolved` (dispatch found a translation, so it
+confirms a real function start) or `unresolved` (dispatch failed — a real gap
+that was silently becoming a stub). The database is **cumulative**: a target seen
+in an earlier run is never dropped because a later run did not reach it. That is
+what makes the loop converge — each pass translates more code, which lets the
+title reach further, which surfaces more targets.
+
+This is the local equivalent of the two feedback inputs Microsoft's own
+recompiler takes: `VirtualDispatchTraceFiles` (recorded indirect-branch target
+sets) and `UpdateEnlightenments: true` (a persisted analysis database the
+compiler rewrites on every build). See
+[ms-fusion-codegen-teardown.md](ms-fusion-codegen-teardown.md).
+
+It replaces inference with measurement. `analyze_unresolved.py` classifies
+unresolved addresses by where they land relative to known functions, which is a
+guess; this is a record of where the title actually branched. Use both — feed the
+measured set in as seeds first, then classify whatever the detector still cannot
+place.
+
 ## Key Insight
 
 The hardest 10% of static recompilation is indirect calls. Direct calls are mechanical translation. Memory access is solved by the mapping layer. But indirect calls require runtime dispatch with correct stack management, failure recovery, garbage detection, and per-function workarounds for corrupted vtables. Every new crash in the recompiled game is almost certainly an ICALL problem.

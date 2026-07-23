@@ -233,9 +233,15 @@ a title that currently boots.
   Microsoft decomposes CR0 into four bytes in the *optimized* tier. Our lifter already threads
   `flag_state` through basic blocks; the lesson is that storing a small fixed set of boolean
   outcomes is cheap enough that a production optimizing compiler does it by choice.
-- **Record indirect-branch targets at runtime, merge into the next build.** `EtlDigestPath`,
-  `VirtualDispatchTraceFiles`, `UpdateEnlightenments: true`. Replaces guessing in
-  `tools/recomp/analyze_unresolved.py` with measurement. Small, self-contained, high value.
+- ~~**Record indirect-branch targets at runtime, merge into the next build.**~~ **Done.**
+  `RECOMP_ICALL_FEEDBACK` + `src/kernel/icall_feedback.c` +
+  `tools/recomp/icall_feedback.py`, feeding the existing `tools/disasm
+  --seed-functions` input. Cumulative across runs, so it converges instead of
+  reporting only the last run. See
+  [indirect-calls.md](indirect-calls.md#target-feedback-measure-instead-of-guess).
+  This also produces the data needed to *evaluate* the Tier 1 change: once the
+  observed target set stops growing, the residual `unresolved` count is the real
+  size of the problem that block-level dispatch would eliminate.
 - **Cache TLS registers into locals per function**, writing back at exits and before calls. The
   reachable part of the register-model gap.
 - **Per-title script/config file** instead of special cases in the lifter (`xefu.lua`).

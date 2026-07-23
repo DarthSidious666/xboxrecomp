@@ -152,6 +152,21 @@ extern volatile uint64_t g_icall_count;
  */
 void recomp_icall_fail_log(uint32_t va);
 
+/* Indirect-branch target feedback. The ring buffer above is crash forensics --
+ * 16 entries, overwritten constantly. This is a durable, deduplicated record of
+ * every target the title ever reached, for feeding back into the next codegen
+ * run (tools/recomp/icall_feedback.py).
+ *
+ * The header is pulled in only when the feature is on, so a default build needs
+ * neither the file nor src/kernel on its include path. Disabled,
+ * RECOMP_ICALL_OBSERVE discards its arguments without expanding them, so the
+ * RECOMP_ICALL_SEEN_* constants need not exist either. */
+#ifdef RECOMP_ICALL_FEEDBACK
+#include "recomp_icall_feedback.h"
+#else
+#define RECOMP_ICALL_OBSERVE(va, flags) ((void)0)
+#endif
+
 /**
  * Function entry trace, emitted only for addresses passed to
  * tools.recomp --trace-functions. Bring-up is largely "which of these
@@ -403,8 +418,9 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
-    if (_fn) _fn(); \
-    else { recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); _fn(); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
 
 /**
@@ -426,8 +442,9 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
-    if (_fn) _fn(); \
-    else { recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); _fn(); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
 
 /**
@@ -442,8 +459,9 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
-    if (_fn) { _fn(); } \
-    else { recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); _fn(); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
 
 /* ================================================================
