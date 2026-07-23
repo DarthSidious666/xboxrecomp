@@ -102,6 +102,11 @@ typedef struct D3D8Surface {
     UINT                    width;
     UINT                    height;
     D3DFORMAT               format;
+    /* Borrowed from the parent resource -- a surface is a view onto a texture
+     * level or a back buffer and owns neither the bits nor the D3D11 texture. */
+    BYTE                   *sys_mem;
+    UINT                    pitch;
+    struct D3D8Texture     *parent_texture;
 } D3D8Surface;
 
 /* ================================================================
