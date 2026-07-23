@@ -106,6 +106,46 @@ def test_idiom_semantics_compiled():
         print("     " + r.stdout.strip())
 
 
+def test_arith_honors_operands():
+    """fadd/fsub/fmul/fdiv with a memory or st(i) operand must not use the bare
+    stack-pop form. This is what left Halo's fmul-by-constant corrupting the
+    FPU stack."""
+    import tools.recomp.lifter as lf
+    lf._fmt_mem = lambda op: "0xK"
+    L = Lifter()
+
+    def lift(m, ops, s=""):
+        return L.lift_instruction(_Insn(m, ops, s))[0]
+
+    mem = _Op("m", type="mem", mem_size=4)
+    st0 = _Op("st0", type="reg", reg="st(0)")
+    st1 = _Op("st1", type="reg", reg="st(1)")
+
+    # fmul [mem]: st0 *= mem, NO pop
+    o = lift("fmul", [mem], "dword ptr [0xK]")
+    assert "fp_top() = fp_top() * MEMF(0xK)" in o and "fp_pop" not in o, o
+    # fadd st(0), st(0): double st0, no pop
+    o = lift("fadd", [st0, st0], "st(0), st(0)")
+    assert "fp_top() = fp_top() + fp_top()" in o and "fp_pop" not in o, o
+    # faddp: st1 += st0, pop
+    o = lift("faddp", [], "")
+    assert "fp_st1() = fp_st1() + fp_top(); fp_pop();" in o, o
+    # fsubr [mem]: st0 = mem - st0 (reversed)
+    o = lift("fsubr", [mem], "dword ptr [0xK]")
+    assert "fp_top() = MEMF(0xK) - fp_top()" in o, o
+    # fdivrp st(1), st(0): st1 = st0 / st1, pop
+    o = lift("fdivrp", [st1, st0], "st(1), st(0)")
+    assert "fp_st1() = fp_top() / fp_st1(); fp_pop();" in o, o
+
+
+def test_fstp_sti_pops():
+    """fstp st(i) must pop the FPU stack (it was a no-op comment, leaking it)."""
+    L = Lifter()
+    o = L.lift_instruction(_Insn("fstp", [_Op("st0", type="reg", reg="st(0)")],
+                                 "st(0)"))[0]
+    assert "fp_pop();" in o, o
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

@@ -1724,6 +1724,21 @@ class Lifter:
 
     # ── FPU (x87) ──
 
+    @staticmethod
+    def _st_index(reg):
+        """FPU register index from a capstone name like 'st(2)' or 'st2'."""
+        mm = re.search(r"st\(?(\d+)\)?", reg or "")
+        return int(mm.group(1)) if mm else 0
+
+    @staticmethod
+    def _st_expr(i):
+        """C expression for FPU register st(i) relative to the current top."""
+        if i == 0:
+            return "fp_top()"
+        if i == 1:
+            return "fp_st1()"
+        return f"g_fp_stack[(g_fp_top + {i}) & 7]"
+
     def _fcom_rhs(self, ops):
         """The value an fcom-family instruction compares st0 against.
 
@@ -1740,13 +1755,7 @@ class Lifter:
                 return f"MEMD({_fmt_mem(op)})"
             return f"MEMF({_fmt_mem(op)})"
         if getattr(op, "type", None) == "reg" and op.reg:
-            mm = re.search(r"st\(?(\d+)\)?", op.reg)
-            idx = int(mm.group(1)) if mm else 1
-            if idx == 0:
-                return "fp_top()"
-            if idx == 1:
-                return "fp_st1()"
-            return f"g_fp_stack[(g_fp_top + {idx}) & 7]"
+            return self._st_expr(self._st_index(op.reg))
         return "fp_st1()"
 
     def _lift_fpu(self, insn, m, ops):
@@ -1771,6 +1780,23 @@ class Lifter:
                     return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top(); fp_pop{pop}(); /* {m} */"]
                 elif ops[0].mem_size == 8:
                     return [f"MEMD({_fmt_mem(ops[0])}) = fp_top(); fp_pop{pop}(); /* {m} */"]
+            # fst/fstp st(i): copy st0 to st(i); fstp then pops. This used to be
+            # a bare comment -- a no-op -- which LEAKS the FPU stack. `fstp st(0)`
+            # is the common idiom for "pop the value fptan/fsincos just pushed";
+            # dropping it left every later float op one slot off. That is why
+            # Halo's field-of-view came out 0.
+            if len(ops) >= 1 and ops[0].type == "reg" and ops[0].reg:
+                mm = re.search(r"st\(?(\d+)\)?", ops[0].reg)
+                idx = int(mm.group(1)) if mm else 0
+                parts = []
+                if idx != 0:   # i==0 is a self-copy; skip, just (maybe) pop
+                    dst = "fp_st1()" if idx == 1 else \
+                          f"g_fp_stack[(g_fp_top + {idx}) & 7]"
+                    parts.append(f"{dst} = fp_top();")
+                if m == "fstp":
+                    parts.append("fp_pop();")
+                body = " ".join(parts) if parts else "(void)0;"
+                return [f"{body} /* {m} st({idx}) */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m == "fild":
@@ -1785,22 +1811,49 @@ class Lifter:
                 return [f"{mem_acc}({_fmt_mem(ops[0])}) = (int32_t)fp_top(); /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
-        if m == "fadd":
-            return [f"fp_st1() += fp_top(); fp_pop(); /* fadd */"]
-        if m == "faddp":
-            return [f"fp_st1() += fp_top(); fp_pop(); /* faddp */"]
-        if m == "fsub":
-            return [f"fp_st1() -= fp_top(); fp_pop(); /* fsub */"]
-        if m == "fsubp":
-            return [f"fp_st1() -= fp_top(); fp_pop(); /* fsubp */"]
-        if m == "fmul":
-            return [f"fp_st1() *= fp_top(); fp_pop(); /* fmul */"]
-        if m == "fmulp":
-            return [f"fp_st1() *= fp_top(); fp_pop(); /* fmulp */"]
-        if m == "fdiv":
-            return [f"fp_st1() /= fp_top(); fp_pop(); /* fdiv */"]
-        if m == "fdivp":
-            return [f"fp_st1() /= fp_top(); fp_pop(); /* fdivp */"]
+        if m in ("fadd", "faddp", "fsub", "fsubp", "fsubr", "fsubrp",
+                 "fmul", "fmulp", "fdiv", "fdivp", "fdivr", "fdivrp"):
+            # x87 binary arithmetic, operand-aware. The old handlers hardcoded
+            # the no-operand pop form (fp_st1() op= fp_top(); pop) for every
+            # variant, so `fmul [mem]`, `fadd st(0),st(0)`, and the reversed
+            # fsubr/fdivr were all wrong -- and fsubr/fdivr fell through to a
+            # no-op. That corrupted the FPU stack on any float that used a
+            # memory or register operand; Halo's field-of-view chain multiplied
+            # by a constant with `fmul [k]` and came out 0.
+            base = m[:-1] if m.endswith("p") else m       # strip pop suffix
+            reverse = base.endswith("r")                  # fsubr / fdivr
+            core = base[:-1] if reverse else base         # fsub / fdiv / fadd / fmul
+            cop = {"fadd": "+", "fsub": "-", "fmul": "*", "fdiv": "/"}[core]
+            pops = m.endswith("p")
+
+            def _combine(dst, src):
+                if cop in ("+", "*") or not reverse:
+                    return f"{dst} = {dst} {cop} {src};"
+                return f"{dst} = {src} {cop} {dst};"   # reversed sub/div
+
+            # Memory operand: dst is st0, no pop (memory forms never pop).
+            if ops and ops[0].type == "mem":
+                rhs = (f"MEMD({_fmt_mem(ops[0])})" if ops[0].mem_size == 8
+                       else f"MEMF({_fmt_mem(ops[0])})")
+                return [f"{_combine('fp_top()', rhs)} /* {m} {insn.op_str} */"]
+
+            # Two register operands: fXXX st(i), st(j).
+            if len(ops) >= 2 and ops[0].type == "reg" and ops[1].type == "reg":
+                di, si = self._st_index(ops[0].reg), self._st_index(ops[1].reg)
+                code = _combine(self._st_expr(di), self._st_expr(si))
+                if pops:
+                    code += " fp_pop();"
+                return [f"{code} /* {m} {insn.op_str} */"]
+
+            # One register operand: fXXX st(i) -> st0 op= st(i), no pop.
+            if len(ops) >= 1 and ops[0].type == "reg":
+                si = self._st_index(ops[0].reg)
+                return [f"{_combine('fp_top()', self._st_expr(si))}"
+                        f" /* {m} {insn.op_str} */"]
+
+            # No operand: the stack pop form, st1 op= st0, pop.
+            code = _combine("fp_st1()", "fp_top()") + " fp_pop();"
+            return [f"{code} /* {m} */"]
         if m == "fchs":
             return [f"fp_top() = -fp_top(); /* fchs */"]
         if m == "fabs":
