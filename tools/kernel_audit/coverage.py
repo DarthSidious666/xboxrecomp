@@ -8,7 +8,7 @@ Answers the question you actually have when standing up a new title -- "how much
 kernel work is left?" -- and, more usefully, splits the remainder by how much
 work each piece is:
 
-  A. xbox_* exists, needs a bridge_ wrapper   mechanical
+  A. xbox_* exists, needs a bridge_ wrapper   NOT mechanical, see below
   B. data export                              needs a value, not a function
   C. no implementation at all                 real work
 
@@ -18,6 +18,24 @@ much of the list is never called; and an unrouted ordinal is not necessarily
 fatal, because kernel_bridge.c's argument-size table lets the generic stub clean
 the right number of bytes off the simulated stack and return 0. A missing size entry is the dangerous case: the stub then pops
 nothing and leaks the arguments.
+
+Category A is not as cheap as it looks. An xbox_* existing does NOT mean a
+wrapper around it is safe. Those functions were written for a native caller,
+where pointers are host pointers and allocations come from the host heap; the
+bridge is a different world where pointers are guest VAs and memory lives in the
+mapped guest space. XBOX_TO_NATIVE converts an address, not an allocator.
+
+Two that bit, on Halo 2276, each crashing it earlier than the stub it replaced:
+
+  IoCreateDevice  HeapAllocs from GetProcessHeap() and writes that native
+                  pointer through an out-parameter -- into a 4-byte guest slot.
+  ExFreePool      calls HeapFree(GetProcessHeap(), P) on guest pool memory that
+                  was never on the host heap.
+
+Before routing one, check which side owns the allocation and whether any
+out-pointer has to carry a guest VA. Functions that only read or write bytes at
+a caller-supplied address are fine; functions that allocate, free, or return a
+pointer are not.
 
 Data exports are called out separately because they are a different mechanism:
 the thunk holds a pointer to a variable, not a function, so routing one to a
@@ -133,7 +151,7 @@ def main(argv=None):
     print("%s -- %d kernel imports" % (title, n))
     print("=" * 66)
     print("  handled (bridge or thunk)   %4d  (%.1f%%)" % (len(covered), 100.0 * len(covered) / n))
-    print("  xbox_* exists, needs a wrap %4d  mechanical" % len(wrap))
+    print("  xbox_* exists, needs a wrap %4d  (check its memory model first)" % len(wrap))
     print("  data exports                %4d  need a value, not a function" % len(data))
     print("  no implementation           %4d  real work" % len(todo))
     print()

@@ -1854,6 +1854,208 @@ static void bridge_generic_stub(void)
     g_eax = 0;
 }
 
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Wrappers for the ordinals Halo 2276's thunk table binds but the bridge did
+ * not route. Every one of these already had a working xbox_* implementation in
+ * src/kernel/*.c; only the wrapper that moves arguments off the simulated stack
+ * was missing, so each call was silently a no-op returning 0.
+ *
+ * Guest pointers go through XBOX_TO_NATIVE, which maps NULL to NULL. Scalars
+ * pass straight through. Handles are tokens, not host HANDLEs, so they go
+ * through bridge_resolve_handle / bridge_write_handle.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── AvGetSavedDataAddress (ordinal 1, void) */
+static void bridge_AvGetSavedDataAddress(void)
+{
+    g_eax = (uint32_t)xbox_AvGetSavedDataAddress();
+}
+
+/* ── AvSendTVEncoderOption (ordinal 2, 4 args) */
+static void bridge_AvSendTVEncoderOption(void)
+{
+    xbox_AvSendTVEncoderOption(XBOX_TO_NATIVE(STACK_ARG(0)),
+                               STACK_ARG(1), STACK_ARG(2),
+                               (PULONG)XBOX_TO_NATIVE(STACK_ARG(3)));
+    g_eax = 0;
+}
+
+/* ── ExFreePool (ordinal 17, 1 arg)
+ * Was resolving to a DATA address before the kernel_data_va_for_ordinal fix,
+ * so the title was calling into kernel data. Even after that it was an
+ * unbridged no-op, which leaks every pool block the title ever frees. */
+static void bridge_ExFreePool(void)
+{
+    xbox_ExFreePool(XBOX_TO_NATIVE(STACK_ARG(0)));
+    g_eax = 0;
+}
+
+/* ── IoCreateDevice (ordinal 65, 6 args) */
+static void bridge_IoCreateDevice(void)
+{
+    g_eax = (uint32_t)xbox_IoCreateDevice(
+        XBOX_TO_NATIVE(STACK_ARG(0)), STACK_ARG(1),
+        (PXBOX_ANSI_STRING)XBOX_TO_NATIVE(STACK_ARG(2)),
+        STACK_ARG(3), (BOOLEAN)STACK_ARG(4),
+        (PVOID*)XBOX_TO_NATIVE(STACK_ARG(5)));
+}
+
+/* ── KeCancelTimer (ordinal 97, 1 arg) */
+static void bridge_KeCancelTimer(void)
+{
+    g_eax = (uint32_t)xbox_KeCancelTimer(
+        (PXBOX_KTIMER)XBOX_TO_NATIVE(STACK_ARG(0)));
+}
+
+/* ── KeDisconnectInterrupt (ordinal 100, 1 arg) */
+static void bridge_KeDisconnectInterrupt(void)
+{
+    g_eax = (uint32_t)xbox_KeDisconnectInterrupt(
+        (PXBOX_KINTERRUPT)XBOX_TO_NATIVE(STACK_ARG(0)));
+}
+
+/* ── KeSetBasePriorityThread (ordinal 143, 2 args) */
+static void bridge_KeSetBasePriorityThread(void)
+{
+    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
+        XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
+}
+
+/* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */
+static void bridge_KeStallExecutionProcessor(void)
+{
+    xbox_KeStallExecutionProcessor(STACK_ARG(0));
+    g_eax = 0;
+}
+
+/* ── MmLockUnlockBufferPages (ordinal 175, 3 args) */
+static void bridge_MmLockUnlockBufferPages(void)
+{
+    xbox_MmLockUnlockBufferPages(XBOX_TO_NATIVE(STACK_ARG(0)),
+                                 STACK_ARG(1), (BOOLEAN)STACK_ARG(2));
+    g_eax = 0;
+}
+
+/* ── MmQueryAllocationSize (ordinal 180, 1 arg) */
+static void bridge_MmQueryAllocationSize(void)
+{
+    g_eax = (uint32_t)xbox_MmQueryAllocationSize(
+        XBOX_TO_NATIVE(STACK_ARG(0)));
+}
+
+/* ── NtCreateMutant (ordinal 192, 3 args) */
+static void bridge_NtCreateMutant(void)
+{
+    uint32_t handle_va = STACK_ARG(0);
+    XBOX_OBJECT_ATTRIBUTES oa;
+    XBOX_ANSI_STRING name;
+    HANDLE h = NULL;
+    NTSTATUS st;
+
+    bridge_build_oa(STACK_ARG(1), &oa, &name);
+    st = xbox_NtCreateMutant(&h, STACK_ARG(1) ? &oa : NULL,
+                             (BOOLEAN)STACK_ARG(2));
+    if (st >= 0 && handle_va) bridge_write_handle(handle_va, h);
+    g_eax = (uint32_t)st;
+}
+
+/* ── NtResumeThread (ordinal 224, 2 args) */
+static void bridge_NtResumeThread(void)
+{
+    g_eax = (uint32_t)xbox_NtResumeThread(
+        bridge_resolve_handle(STACK_ARG(0)),
+        (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
+}
+
+/* ── ObfDereferenceObject (ordinal 250, fastcall: object in ecx)
+ * Not STACK_ARG(0). Xbox uses __fastcall here, so the argument never reaches
+ * the stack and the arg-size entry is 0. Reading it off the stack would
+ * dereference whatever the caller happened to leave there. */
+static void bridge_ObfDereferenceObject(void)
+{
+    xbox_ObfDereferenceObject(XBOX_TO_NATIVE(g_ecx));
+    g_eax = 0;
+}
+
+/* ── PhyGetLinkState (ordinal 252, 1 arg) */
+static void bridge_PhyGetLinkState(void)
+{
+    g_eax = (uint32_t)xbox_PhyGetLinkState((BOOLEAN)STACK_ARG(0));
+}
+
+/* ── PhyInitialize (ordinal 253, 2 args) */
+static void bridge_PhyInitialize(void)
+{
+    g_eax = (uint32_t)xbox_PhyInitialize((BOOLEAN)STACK_ARG(0),
+                                         XBOX_TO_NATIVE(STACK_ARG(1)));
+}
+
+/* ── RtlTimeToTimeFields (ordinal 305, 2 args) */
+static void bridge_RtlTimeToTimeFields(void)
+{
+    xbox_RtlTimeToTimeFields(
+        (PLARGE_INTEGER)XBOX_TO_NATIVE(STACK_ARG(0)),
+        (PXBOX_TIME_FIELDS)XBOX_TO_NATIVE(STACK_ARG(1)));
+    g_eax = 0;
+}
+
+/* ── XcSHAInit / XcSHAUpdate / XcSHAFinal (ordinals 335-337) */
+static void bridge_XcSHAInit(void)
+{
+    xbox_XcSHAInit((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)));
+    g_eax = 0;
+}
+
+static void bridge_XcSHAUpdate(void)
+{
+    xbox_XcSHAUpdate((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
+                     (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(1)),
+                     STACK_ARG(2));
+    g_eax = 0;
+}
+
+static void bridge_XcSHAFinal(void)
+{
+    xbox_XcSHAFinal((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
+                    (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(1)));
+    g_eax = 0;
+}
+
+/* ── XcRC4Key / XcRC4Crypt (ordinals 338-339) */
+static void bridge_XcRC4Key(void)
+{
+    xbox_XcRC4Key((PXBOX_RC4_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
+                  STACK_ARG(1),
+                  (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)));
+    g_eax = 0;
+}
+
+static void bridge_XcRC4Crypt(void)
+{
+    xbox_XcRC4Crypt((PXBOX_RC4_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
+                    STACK_ARG(1),
+                    (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)));
+    g_eax = 0;
+}
+
+/* ── XcHMAC (ordinal 340, 7 args) */
+static void bridge_XcHMAC(void)
+{
+    xbox_XcHMAC((const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(0)), STACK_ARG(1),
+                (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
+                (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
+                (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(6)));
+    g_eax = 0;
+}
+
+/* ── XcDESKeyParity (ordinal 346, 2 args) */
+static void bridge_XcDESKeyParity(void)
+{
+    xbox_XcDESKeyParity((PUCHAR)XBOX_TO_NATIVE(STACK_ARG(0)), STACK_ARG(1));
+    g_eax = 0;
+}
+
 /* ── Dispatch table: ordinal → bridge function + stack arg bytes ── */
 
 typedef void (*bridge_func_t)(void);
@@ -2204,6 +2406,65 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* RTL */
     case 301: return bridge_RtlNtStatusToDosError;
     case 302: return bridge_RtlRaiseException;
+
+
+    /* BISECT-OFF case 338: bridge_XcRC4Key */
+    /* BISECT-OFF case 339: bridge_XcRC4Crypt */
+
+
+    /* NOT ROUTED, deliberately. The wrappers above exist and compile, and each
+     * has a working xbox_* behind it, but routing them made Halo 2276 crash
+     * EARLIER than leaving them stubbed -- twice, with two different faults.
+     * Bisected to a memory-model mismatch, not to the wrappers' arithmetic:
+     *
+     *   xbox_IoCreateDevice HeapAllocs from GetProcessHeap() and writes that
+     *   NATIVE pointer through its out-parameter. The bridge hands it the
+     *   native address of a 4-BYTE GUEST slot, so a 64-bit pointer is written
+     *   into 4 bytes: it clobbers the adjacent guest dword and leaves the title
+     *   a truncated pointer it then dereferences. Crash was a write to
+     *   0x90909090.
+     *
+     *   xbox_ExFreePool calls HeapFree(GetProcessHeap(), P). Guest pool memory
+     *   is not on the host heap, so P is a pointer HeapFree has never seen.
+     *
+     * These xbox_* functions were written for a NATIVE caller, where pointers
+     * are host pointers and allocations are host allocations. The bridge is a
+     * different world: pointers are guest VAs and memory lives in the mapped
+     * guest space. XBOX_TO_NATIVE converts an address; it cannot convert an
+     * allocator.
+     *
+     * So 'an xbox_* exists, therefore the wrapper is mechanical' is false, and
+     * tools.kernel_audit.coverage no longer says it. Each of these needs its
+     * memory model checked one at a time: which side owns the allocation, and
+     * whether an out-pointer must carry a guest VA. Ones that only read or
+     * write bytes at a caller-supplied address (the Xc* crypto group,
+     * RtlTimeToTimeFields) should be fine; ones that allocate, free, or hand
+     * back a pointer are not.
+     *
+     * Left in place rather than deleted: the wrappers are correct as argument
+     * marshalling, and re-deriving them is the easy half of the work.
+     */
+    /* case   1: bridge_AvGetSavedDataAddress */
+    /* case   2: bridge_AvSendTVEncoderOption */
+    /* case  17: bridge_ExFreePool */
+    /* case  65: bridge_IoCreateDevice */
+    /* case  97: bridge_KeCancelTimer */
+    /* case 100: bridge_KeDisconnectInterrupt */
+    /* case 143: bridge_KeSetBasePriorityThread */
+    /* case 151: bridge_KeStallExecutionProcessor */
+    /* case 175: bridge_MmLockUnlockBufferPages */
+    /* case 180: bridge_MmQueryAllocationSize */
+    /* case 192: bridge_NtCreateMutant */
+    /* case 224: bridge_NtResumeThread */
+    /* case 250: bridge_ObfDereferenceObject */
+    /* case 252: bridge_PhyGetLinkState */
+    /* case 253: bridge_PhyInitialize */
+    /* case 305: bridge_RtlTimeToTimeFields */
+    /* case 335: bridge_XcSHAInit */
+    /* case 336: bridge_XcSHAUpdate */
+    /* case 337: bridge_XcSHAFinal */
+    /* case 340: bridge_XcHMAC */
+    /* case 346: bridge_XcDESKeyParity */
 
     default:  return NULL;
     }
