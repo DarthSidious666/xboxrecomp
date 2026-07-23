@@ -1931,7 +1931,15 @@ class Lifter:
         if m == "fldln2":
             return [f"fp_push(0.69314718055994530942); /* fldln2 */"]
         if m == "fxch":
-            return [f"{{ double _t = fp_top(); fp_top() = fp_st1(); fp_st1() = _t; }} /* fxch */"]
+            # fxch st(i) swaps st0 with st(i); the bare form is st(1). Was
+            # hardcoded to st1, so fxch st(2)/st(3)/st(4) (86/7/1 sites in Halo)
+            # swapped the wrong slot -- corrupting the FP stack in the camera
+            # basis builder that feeds world_to_view.
+            i = (self._st_index(ops[0].reg)
+                 if (ops and ops[0].type == "reg" and ops[0].reg) else 1)
+            dst = self._st_expr(i)
+            return [f"{{ double _t = fp_top(); fp_top() = {dst}; {dst} = _t; }}"
+                    f" /* fxch {insn.op_str} */"]
         if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp"):
             # Compare st0 against the operand, not always st1. `fcomp [mem]`
             # compares st0 with the memory value; only the no-operand form
