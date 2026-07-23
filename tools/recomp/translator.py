@@ -45,7 +45,7 @@ def _fixup_icall_esp_save(lines):
     # For each ICALL, determine where to insert the save
     insert_before = set()  # map: line_index → True (insert save before this line)
     for icall_idx in icall_indices:
-        # The ICALL line itself contains "PUSH32(esp, 0); RECOMP_ICALL_SAFE(...)"
+        # The ICALL line itself is "PUSH32(esp, <retva>); RECOMP_ICALL_SAFE(...)"
         # Look backwards for consecutive lines containing PUSH32(esp,
         first_push_idx = icall_idx
         j = icall_idx - 1
@@ -55,6 +55,14 @@ def _fixup_icall_esp_save(lines):
             if not stripped:
                 j -= 1
                 continue
+            # A completed direct call ends the argument run, and must be tested
+            # before the generic PUSH32 check below: a direct call is emitted as
+            # "PUSH32(esp, <retva>); name();" on one line, so it also looks like
+            # an argument push. Treating it as one put the _icall_esp save
+            # *before* the direct call, and an ICALL that then failed rewound
+            # g_esp over a call that had already returned.
+            if '/* call 0x' in stripped:
+                break
             # Check if this is a PUSH32 line (arg push)
             if stripped.startswith('PUSH32(esp,'):
                 first_push_idx = j
@@ -69,8 +77,7 @@ def _fixup_icall_esp_save(lines):
                 'RECOMP_ICALL' in stripped or
                 'return;' in stripped or
                 stripped.startswith('if (') or
-                stripped.startswith('POP32(') or
-                stripped.startswith('PUSH32(esp, 0); sub_')):
+                stripped.startswith('POP32(')):
                 break
             # It's an interleaved computation - skip past it
             j -= 1
@@ -437,7 +444,8 @@ class FunctionTranslator:
             lines.append(f"")
 
         # Insert _icall_esp save points before RECOMP_ICALL_SAFE arg pushes.
-        # The pattern is: optional PUSH32 args, then PUSH32(esp, 0); RECOMP_ICALL_SAFE(...).
+        # The pattern is: optional PUSH32 args, then
+        # PUSH32(esp, <retva>); RECOMP_ICALL_SAFE(...).
         # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
         lines = _fixup_icall_esp_save(lines)
 

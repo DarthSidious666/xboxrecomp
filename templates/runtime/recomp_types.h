@@ -34,7 +34,11 @@
  *   All translated functions are void(void). Arguments are passed
  *   on the simulated Xbox stack (via push instructions before call).
  *   Return values are communicated through g_eax.
- *   The call instruction pushes a dummy return address; ret pops it.
+ *   The call instruction pushes the real guest return address (the VA of
+ *   the instruction after the call); ret discards it with esp += 4.
+ *   The value is never used to transfer control -- control flow is C
+ *   call/return -- but it must be correct because guest code reads it
+ *   (__SEH_prolog's scope table, _alloca probes, "mov eax, [esp]").
  */
 
 #ifndef RECOMP_TYPES_H
@@ -88,13 +92,31 @@ extern ptrdiff_t g_xbox_mem_offset;
  * NOT global: ebp - stays local in each function because FPO
  * functions use it as scratch. For SEH, g_seh_ebp bridges the gap.
  */
-extern uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern uint32_t g_ebx, g_esi, g_edi;
+/* Per-thread register state.
+ *
+ * These started as plain globals, which works exactly as long as one thread
+ * runs recompiled code. Halo is the first title to create real workers (its
+ * cache/file loader), and the runtime papered over that by running every worker
+ * synchronously inside PsCreateSystemThreadEx -- so a worker that blocks
+ * waiting for work never returns and startup deadlocks.
+ *
+ * On hardware each thread has its own register set, so model it that way.
+ * Thread-local costs an indirection per access; a deadlock costs the title. */
+#if defined(_MSC_VER)
+#  define RECOMP_TLS __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define RECOMP_TLS __thread
+#else
+#  define RECOMP_TLS _Thread_local
+#endif
 
-/* x87 stack. Global for the same reason the integer registers are:
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+
+/* x87 stack. Per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
-extern double g_fp_stack[8];
-extern int g_fp_top;
+extern RECOMP_TLS double g_fp_stack[8];
+extern RECOMP_TLS int g_fp_top;
 
 /**
  * SEH frame pointer bridge.
@@ -104,8 +126,8 @@ extern int g_fp_top;
  * The prolog writes g_seh_ebp, and the caller reads it after the call.
  * Similarly, __SEH_epilog reads g_seh_ebp at entry and writes it at exit.
  */
-extern uint32_t g_seh_ebp;
-extern uint32_t g_ebp;
+extern RECOMP_TLS uint32_t g_seh_ebp;
+extern RECOMP_TLS uint32_t g_ebp;
 
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
@@ -357,8 +379,8 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  *
  * Looks up the Xbox VA and calls the translated function.
  * Falls back to kernel bridge for kernel thunk synthetic VAs.
- * The caller must PUSH32 a dummy return address before this macro.
- * If not found, pops the dummy return address to keep the stack balanced.
+ * The caller must PUSH32 the guest return address before this macro.
+ * If not found, pops it back off to keep the stack balanced.
  *
  * The range check (0x00400000 to 0xFE000000) skips garbage VAs that
  * come from uninitialized vtable pointers. Adjust this range based

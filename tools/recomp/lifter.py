@@ -1297,9 +1297,16 @@ class Lifter:
     SEH_EPILOG = None
 
     def _lift_call(self, insn, ops):
-        # x86 'call' pushes return address then jumps.
-        # With global esp, we push a dummy return address (0) then call.
-        # The callee's 'ret' will pop it back off.
+        # x86 'call' pushes the address of the following instruction, then jumps.
+        # Push that real guest address, not a placeholder: the value is visible
+        # to the callee, and plenty of x86 code reads it. __SEH_prolog locates
+        # its scope table through [esp], _alloca probes walk back to it, and the
+        # `mov eax, [esp]` / `pop eax` idiom for "where was I called from" shows
+        # up in any CRT. A zero there is silently wrong until something reads it.
+        #
+        # 'ret' still only does esp += 4 and returns -- it never consumes the
+        # value -- so writing the true address costs nothing at the return side.
+        ret_va = insn.end_address
         if insn.call_target:
             name = self._call_target_name(insn.call_target)
             lines = []
@@ -1314,7 +1321,15 @@ class Lifter:
             if self.publishes_ebp:
                 lines.append("g_ebp = ebp; /* frame stays current across calls */")
             lines.append(
-                f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */")
+                f"PUSH32(esp, 0x{ret_va:08X}u); {name}(); "
+                f"/* call 0x{insn.call_target:08X} */")
+            # esp immediately after the callee returns. A per-call delta is the
+            # only way to attribute a leak to one callee rather than to the
+            # function containing them all.
+            if self.trace_exit_name:
+                lines.append(
+                    f'RECOMP_TRACE_ESP("{self.trace_exit_name}", '
+                    f'"after call 0x{insn.call_target:08X}");')
             # The SEH helpers exchange the frame pointer with their caller
             # through g_seh_ebp, because ebp is a C local rather than a global.
             #
@@ -1337,7 +1352,8 @@ class Lifter:
         elif len(ops) >= 1:
             target = _fmt_operand_read(ops[0])
             # Mark indirect calls for post-processing by _fixup_icall_esp_save
-            return [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
+            return [f"PUSH32(esp, 0x{ret_va:08X}u); "
+                    f"RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
         return ["/* call: no target */"]
 
     def _lift_ret(self, insn, ops):
