@@ -9,6 +9,7 @@ Implements multi-pass function detection with confidence scoring:
 5. Cross-validation and overlap resolution
 """
 
+import bisect
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -79,6 +80,11 @@ class FunctionDetector:
         # Final function list
         self.functions: Dict[int, Function] = {}
 
+        # Tail-jump targets landing inside another function: addr -> that
+        # function's end. Kept out of self._candidates so they cannot truncate
+        # the function they land in.
+        self._alias_entries: Dict[int, int] = {}
+
     def detect_all(self, sections: Optional[List[SectionInfo]] = None) -> int:
         """
         Run all detection passes and build the function database.
@@ -108,6 +114,29 @@ class FunctionDetector:
 
         # Pass 5: Build functions from candidates
         self._build_functions(sections)
+
+        # Pass 6: Tail-jump targets. A function reached only by "jmp" and never
+        # by "call" is invisible to every pass above, so it is emitted as a stub
+        # that returns without unwinding the frame its jumping caller built --
+        # silently corrupting the simulated stack for everything upstream. Halo
+        # had 127 of these; one of them (the CRT two-arg error handler) leaked
+        # 0x24 bytes per call and turned a 6-iteration init loop into 21,938
+        # allocations that exhausted the heap.
+        #
+        # Needs the bodies from pass 5 to tell a tail jump from an ordinary
+        # intra-function branch, so it runs after and rebuilds. Iterate: a newly
+        # found function can itself tail-jump somewhere new.
+        for _round in range(8):
+            before = len(self._candidates)
+            if not self._pass_tail_jump_targets(sections):
+                break
+            print(f"  tail-jump pass {_round}: "
+                  f"+{len(self._candidates) - before} standalone, "
+                  f"{len(self._alias_entries)} aliases")
+            self.functions.clear()
+            self._build_functions(sections)
+
+        self._build_alias_entries()
 
         # Populate call graph
         self._build_call_graph()
@@ -227,16 +256,118 @@ class FunctionDetector:
                 code_ranges.add(addr)
 
         call_targets = self.engine.get_call_targets()
+        realigned = 0
         for target in call_targets:
-            # Verify target is in a code section and has a decoded instruction
-            if target in self.engine.instructions:
-                section = self.image.get_section_at_va(target)
-                if section and section.executable:
-                    self._add_candidate(
-                        target,
-                        config.CONFIDENCE_CALL_TARGET,
-                        "call_target"
-                    )
+            section = self.image.get_section_at_va(target)
+            if not (section and section.executable):
+                continue
+            # A direct call to an executable address is the strongest evidence
+            # of a function start there is -- stronger than a prologue match,
+            # which is a guess about bytes. It used to be discarded whenever the
+            # linear sweep had stepped over that exact address, which happens
+            # wherever the sweep passes through data and comes out of phase.
+            # Decode there instead of dropping the candidate; see
+            # Engine.decode_at. On Halo 2276 this is 46 functions that were
+            # becoming `g_esp += 4` no-op stubs.
+            if target not in self.engine.instructions:
+                if self.engine.decode_at(target):
+                    realigned += 1
+                else:
+                    continue  # genuinely undecodable: not code
+            self._add_candidate(
+                target,
+                config.CONFIDENCE_CALL_TARGET,
+                "call_target"
+            )
+        if realigned:
+            print(f"  Realigned {realigned} call targets the sweep stepped over")
+
+    def _pass_tail_jump_targets(self, sections: List[SectionInfo]) -> bool:
+        """
+        Pass 6: Add the target of every unconditional jmp that leaves the body
+        of the function containing it.
+
+        Returns True if any new candidate was added.
+        """
+        bodies = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bodies]
+        added = False
+
+        for insn in self.engine.instructions.values():
+            if not insn.is_jump or insn.is_cond_jump:
+                continue
+            target = insn.jump_target
+            if target is None or target in self._candidates:
+                continue
+            if target not in self.engine.instructions:
+                continue
+
+            # The jump is a tail jump only if it leaves its own function.
+            i = bisect.bisect_right(starts, insn.address) - 1
+            if i < 0:
+                continue
+            body_start, body_end = bodies[i]
+            if insn.address >= body_end:
+                continue            # not inside any known function
+            if body_start <= target < body_end:
+                continue            # ordinary intra-function branch
+
+            section = self.image.get_section_at_va(target)
+            if section is None or not section.executable:
+                continue
+
+            # Does the target land inside some *other* function? The CRT does
+            # this constantly -- _startOneArgErrorHandling jumps into the middle
+            # of _startTwoArgErrorHandling to share its tail. Registering that
+            # address as an ordinary candidate would truncate the function it
+            # lands in, breaking the very code it wanted to reach. Record it as
+            # an alias entry instead: same end address, translated separately.
+            j = bisect.bisect_right(starts, target) - 1
+            if j >= 0 and bodies[j][0] < target < bodies[j][1]:
+                if target not in self._alias_entries:
+                    self._alias_entries[target] = bodies[j][1]
+                    added = True
+                continue
+
+            self._add_candidate(target, config.CONFIDENCE_TAIL_JUMP,
+                                "tail_jump_target")
+            added = True
+
+        return added
+
+    def _build_alias_entries(self) -> None:
+        """
+        Emit a Function for each tail-jump target that lands inside another
+        function, running from the target to that function's end.
+
+        The overlap is deliberate: the translator produces a second body for the
+        shared tail, which costs a little code size and makes the entry point
+        callable. The alternative -- a stub that returns immediately -- silently
+        skips the epilogue and leaks the caller's frame.
+        """
+        for addr, end in sorted(self._alias_entries.items()):
+            if addr in self.functions:
+                continue
+            insns = self.engine.get_instructions_in_range(addr, end)
+            if not insns:
+                continue
+            section = self.image.get_section_at_va(addr)
+            sec_name = section.name if section else ""
+            label = self.labels.get(addr)
+            name = label.name if label else f"sub_{addr:08X}"
+            if not label:
+                self.labels.auto_name_function(
+                    addr, sec_name, config.CONFIDENCE_TAIL_JUMP)
+            self.functions[addr] = Function(
+                start=addr,
+                end=end,
+                name=name,
+                section=sec_name,
+                confidence=config.CONFIDENCE_TAIL_JUMP,
+                detection_method="tail_jump_alias",
+                num_instructions=len(insns),
+                has_prologue=False,
+            )
 
     def _build_functions(self, sections: List[SectionInfo]) -> None:
         """
