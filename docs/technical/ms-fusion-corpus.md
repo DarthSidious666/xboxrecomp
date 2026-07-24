@@ -23,8 +23,8 @@ Each package's OG-Xbox game module is `xefu_<hash>…dll`; the source is recover
 
 | | **Fuzion Frenzy** | **Blinx** | **Crimson Skies** | **Conker L&R** |
 |---|---|---|---|---|
-| Build tree (`btsdx`) | `20F919` | `20F914` | `20F914` | `20F917` |
-| Title ID | `4D530856` | `4D530013` | `4D530021` | `4D530051` |
+| Build tree (`btsdx`) | `20F919` | `20F914` | `20F90F` | `20F917` |
+| Build-path id | `4D530856` | `4D530013` | `4D530851` | `4D530051` |
 | Module version | 1.0.0.42 | 1.0.0.42 | 1.0.0.42 | 1.0.0.42 |
 | Exports | Init/Cleanup/Pointers/SymbolTable | — | — | — (identical 4) |
 | Symbol records | 1,482 | 1,784 | 3,106 | 3,228 |
@@ -48,19 +48,22 @@ special-cased per title. Confirmed on four titles, not extrapolated from one.
 
 ## 2. Build drift — visible only across the corpus
 
-The `btsdx` build number differs per title: `20F914` (Crimson, Blinx) → `20F917` (Conker) →
-`20F919` (Fuzion Frenzy). The Fission toolchain was versioned as the catalog was processed;
-each title carries whatever build was current when it was compiled. A single teardown cannot
-see this.
+Every title carries a **distinct** `btsdx` build number, and they increase monotonically in the
+order the games were compiled: `20F90F` (Crimson) < `20F914` (Blinx) < `20F917` (Conker) <
+`20F919` (Fuzion Frenzy). The Fission toolchain was versioned as the catalog was processed; each
+title got whatever build was current. A single teardown cannot see this — you need the corpus.
+(The game module's own version resource is the authority here: the earlier single-title report
+read `20F914` from the *emulator-layer* `xefu.xex` path, which is a different module than the
+game's `xefu_c954bd37`.)
 
 It shows up in the output. The recompiled OG-Xbox kernel module `xefu_69c41281_00027bcf.dll`
-(source `xb1krnl.exe`) is **byte-identical** across Blinx, Crimson, and Fuzion Frenzy
+(source `xb1krnl.exe`) is **byte-identical** across Crimson, Blinx, and Fuzion Frenzy
 (md5 `4c0c3550…`) but **Conker ships a distinct build of it** (md5 `f2b36346…`). Same source
 module — the filename hash `69c41281` is the source identity and is shared by all four — but
 Conker's `20F917` compiler produced different x86-64 from the same input. So the recompiled
 output is deterministic per compiler build and shared when identical; it is not identical across
-builds. (Curiously `20F914` and `20F919` agree while `20F917` diverges, so the kernel recompile
-is not monotonic in the build number.)
+builds. (The recompiled kernel is stable across builds `20F90F`/`20F914`/`20F919` and changes
+only in `20F917`, so the codegen is not strictly monotonic in the build number.)
 
 ---
 
