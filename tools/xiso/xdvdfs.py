@@ -28,7 +28,10 @@ MAGIC = b"MICROSOFT*XBOX*MEDIA"
 #   0x0000FD90  some cracked/rebuilt images
 #   0x00030600  redump-style, video partition first
 #   0x0FD90000  full "xbox disc" layout
-BASE_CANDIDATES = (0x00000000, 0x0000FD90, 0x00030600, 0x0FD90000)
+#   0x18300000  redump full-disc dump: the game partition follows the ~387 MB
+#               DVD-video partition (magic lands at 0x18310000). Confirmed on the
+#               Blinx / Conker / Fuzion Frenzy redump images.
+BASE_CANDIDATES = (0x00000000, 0x0000FD90, 0x00030600, 0x0FD90000, 0x18300000)
 
 ATTR_DIRECTORY = 0x10
 
