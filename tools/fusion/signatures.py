@@ -241,10 +241,35 @@ def _cmd_selftest(module, xbe, funcs=None):
         print(f"   0x{va:08X} {nm}")
 
 
+def _cmd_merge(out, *inputs):
+    """Union several signature DBs (from different source titles) into one.
+
+    The library-function subset is what transfers across titles, so more source
+    titles = more names recoverable in any target. Dedupes identical
+    (name, size, pattern) entries.
+    """
+    seen = set()
+    merged = []
+    srcs = []
+    for path in inputs:
+        db = json.load(open(path))
+        srcs.append(f"{db.get('source', '?')}[{db.get('build', '?')}]")
+        for s in db["sigs"]:
+            key = (s["name"], s["size"], s["pat"], s["mask"])
+            if key not in seen:
+                seen.add(key)
+                merged.append(s)
+    json.dump({"source": "+".join(srcs), "sigs": merged}, open(out, "w"), indent=0)
+    print(f"merged {len(inputs)} DBs -> {len(merged):,} sigs "
+          f"({len({s['name'] for s in merged}):,} unique names) -> {out}")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "build":
         _cmd_build(*sys.argv[2:5])
+    elif cmd == "merge":
+        _cmd_merge(*sys.argv[2:])
     elif cmd == "match":
         _cmd_match(*sys.argv[2:])
     elif cmd == "selftest":
