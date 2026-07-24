@@ -128,6 +128,49 @@ class FusionModule:
         return c
 
     # ---- address map ------------------------------------------------------
+    def map_pairs(self, max_delta=16):
+        """The (guest_rva, host_rva) pair arrays, aligned. Returns (guest, host)
+        numpy uint32 arrays over the longest monotonic guest run in .rdata."""
+        for s in self.pe.sections:
+            if s.Name.rstrip(b"\0") != b".rdata":
+                continue
+            raw = self.img[s.VirtualAddress:s.VirtualAddress + s.Misc_VirtualSize]
+            raw = raw[:len(raw) // 4 * 4]
+            u32 = np.frombuffer(raw, dtype=np.uint32)
+            best = None
+            for phase in (0, 1):
+                g = u32[phase::2]
+                inrange = (g >= 0x1000) & (g < 0x400000)
+                d = np.diff(g.astype(np.int64))
+                good = inrange[:-1] & (d >= 0) & (d <= max_delta)
+                if good.size == 0:
+                    continue
+                idx = np.where(~good)[0]
+                bounds = np.concatenate(([-1], idx, [good.size]))
+                runs = np.diff(bounds) - 1
+                k = int(np.argmax(runs))
+                length, startp = int(runs[k]), int(bounds[k] + 1)
+                if length > 50000 and (best is None or length > best[0]):
+                    best = (length, phase, startp)
+            if best:
+                length, phase, startp = best
+                sl = slice(startp, startp + length + 1)
+                guest = u32[phase::2][sl]
+                host = u32[1 - phase::2][sl]
+                return guest, host
+        return np.array([], np.uint32), np.array([], np.uint32)
+
+    def host_of(self, guest_rva):
+        """Host RVA that guest_rva translates to, or None."""
+        if not hasattr(self, "_mg"):
+            self._mg, self._mh = self.map_pairs()
+        if self._mg.size == 0:
+            return None
+        i = int(np.searchsorted(self._mg, guest_rva))
+        if i < self._mg.size and int(self._mg[i]) == guest_rva:
+            return int(self._mh[i])
+        return None
+
     def map_entry_points(self, max_delta=16):
         """Guest RVAs the (guest_rva, host_rva) map covers, as a sorted np array.
 
