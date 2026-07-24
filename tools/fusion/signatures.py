@@ -164,7 +164,11 @@ def load_functions(funcs_path):
     return out
 
 
-def match(sigs, xbe_path, funcs_path):
+def _is_unnamed(name):
+    return (not name) or name.lower().startswith("sub_") or "__sub_" in name
+
+
+def match(sigs, xbe_path, funcs_path, only_unnamed=False):
     xbe = XbeCode(xbe_path)
     lo, hi = xbe.image_lo, xbe.image_hi
     # bucket sigs by (size, first fixed opcode byte) for speed
@@ -177,6 +181,8 @@ def match(sigs, xbe_path, funcs_path):
     for va, sz, cur_name in load_functions(funcs_path):
         if sz is None:
             continue
+        if only_unnamed and not _is_unnamed(cur_name):
+            continue   # never clobber a real name the target already has
         cand = by_size.get(sz)
         if not cand:
             continue
@@ -205,12 +211,15 @@ def _cmd_build(module, xbe, out):
           f"from {m.source} [{m.build_tree}] -> {out}")
 
 
-def _cmd_match(sigs_path, xbe, funcs, out):
+def _cmd_match(sigs_path, xbe, funcs, out, *flags):
+    only_unnamed = "--only-unnamed" in flags
     db = json.load(open(sigs_path))
-    named, ambig = match(db["sigs"], xbe, funcs)
+    named, ambig = match(db["sigs"], xbe, funcs, only_unnamed=only_unnamed)
     json.dump({f"0x{va:08X}": nm for va, nm in sorted(named.items())},
               open(out, "w"), indent=1)
-    print(f"named {len(named):,} functions ({len(ambig):,} ambiguous multi-name) -> {out}")
+    scope = "unnamed-only" if only_unnamed else "all"
+    print(f"named {len(named):,} functions [{scope}] "
+          f"({len(ambig):,} ambiguous) -> {out}")
     return named, ambig
 
 
@@ -237,7 +246,7 @@ if __name__ == "__main__":
     if cmd == "build":
         _cmd_build(*sys.argv[2:5])
     elif cmd == "match":
-        _cmd_match(*sys.argv[2:6])
+        _cmd_match(*sys.argv[2:])
     elif cmd == "selftest":
         _cmd_selftest(*sys.argv[2:5])
     else:
