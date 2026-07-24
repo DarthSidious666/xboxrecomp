@@ -11,6 +11,10 @@ PE inspection (`pefile`) and disassembly (`capstone`). This document exists to r
 Subject: the retail Windows BC package for **Crimson Skies: High Road to Revenge**
 (an original Xbox title), version `2607.1523.1.0`, analysed 2026-07-23.
 
+> Extended to all four released titles in [ms-fusion-corpus.md](ms-fusion-corpus.md) —
+> build drift, shared modules, and the networking/engine fingerprints a single title
+> cannot show.
+
 ---
 
 ## 1. It is a three-layer nesting doll
