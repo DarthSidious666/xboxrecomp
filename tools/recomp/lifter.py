@@ -750,6 +750,7 @@ class Lifter:
             seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
         self.SEH_PROLOG = seh_prolog
         self.SEH_EPILOG = seh_epilog
+        self.jump_table_targets = {}
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.
@@ -1248,7 +1249,9 @@ class Lifter:
         if not op.mem_disp or not (op.mem_index or op.mem_base):
             return []
         table_va = op.mem_disp
-        targets = self._read_jump_table(table_va)
+        targets = self.jump_table_targets.get(table_va)
+        if targets is None:
+            targets = self._read_jump_table(table_va)
         if not targets:
             return []
         # Check that ALL targets are within the current function

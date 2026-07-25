@@ -11,8 +11,10 @@ For each function:
 Produces compilable C code using recomp_types.h macros.
 """
 
+import bisect
 import json
 import os
+import struct
 
 # Import the functions, not the VA constants: configure_from_xbe() rebinds those
 # at startup, so a by-value import would freeze the fallback layout.
@@ -114,6 +116,150 @@ class FunctionTranslator:
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
                              seh_epilog=seh_epilog)
+        self.owned_function_starts = set()
+        self._recovered_cfg = {}
+        self._ownership_ready = False
+
+    @staticmethod
+    def _is_strong_entry(func_info):
+        """Return whether an entry has evidence independent of seed recovery."""
+        return bool(func_info.get("has_prologue") or func_info.get("called_by"))
+
+    def discover_cfg_ownership(self):
+        """Reassign weak seeds reached through a split computed-jump CFG."""
+        if self._ownership_ready:
+            return
+        self._ownership_ready = True
+
+        by_section = {}
+        weak_by_section = {}
+        for addr, info in self.func_db.items():
+            section = info.get("section", "")
+            if self._is_strong_entry(info):
+                by_section.setdefault(section, []).append(addr)
+            else:
+                weak_by_section.setdefault(section, []).append(addr)
+
+        for section, strong_starts in by_section.items():
+            strong_starts.sort()
+            weak_starts = sorted(weak_by_section.get(section, []))
+            for index, start in enumerate(strong_starts[:-1]):
+                original_end = self.func_db[start].get("end", start)
+                upper = strong_starts[index + 1]
+                if original_end >= upper:
+                    continue
+
+                weak_index = bisect.bisect_left(weak_starts, original_end)
+                if (weak_index >= len(weak_starts)
+                        or weak_starts[weak_index] >= upper):
+                    continue
+
+                raw_prefix = self._read_func_bytes(start, original_end)
+                if not raw_prefix:
+                    continue
+                prefix = self.disasm.disassemble_function(
+                    raw_prefix, start, original_end)
+                bridges = {
+                    insn.jump_target
+                    for insn in prefix
+                    if (insn.is_cond_jump and insn.jump_target is not None
+                        and original_end <= insn.jump_target < upper)
+                }
+                has_indexed_jump = any(
+                    insn.is_jump and insn.jump_target is None
+                    and insn.operands and insn.operands[0].type == "mem"
+                    and insn.operands[0].mem_index
+                    for insn in prefix)
+                if not bridges or not has_indexed_jump:
+                    continue
+
+                stop_addresses = {
+                    addr for addr in self.func_db if start < addr < upper
+                }
+                recovered = self._recover_cfg(
+                    start, upper, bridges, stop_addresses)
+                if recovered is None:
+                    continue
+                instructions, jump_tables, cfg_targets = recovered
+                owned = {
+                    addr for addr in weak_starts[weak_index:]
+                    if addr < upper and addr in cfg_targets
+                }
+                if not owned:
+                    continue
+
+                self.owned_function_starts.update(owned)
+                self._recovered_cfg[start] = {
+                    "end": max(insn.end_address for insn in instructions),
+                    "instructions": instructions,
+                    "jump_tables": jump_tables,
+                }
+
+    def _recover_cfg(self, start, upper, bridge_targets, stop_addresses):
+        """Decode direct CFG edges and local indexed-table destinations."""
+        raw_bytes = self._read_func_bytes(start, upper)
+        if not raw_bytes:
+            return None
+
+        entry_points = {start, *bridge_targets}
+        jump_tables = {}
+        while True:
+            instructions = self.disasm.disassemble_cfg(
+                raw_bytes, start, upper, entry_points,
+                stop_addresses=stop_addresses)
+            changed = False
+            for insn in instructions:
+                if not insn.is_jump or insn.jump_target is not None:
+                    continue
+                if not insn.operands or insn.operands[0].type != "mem":
+                    continue
+                operand = insn.operands[0]
+                if not operand.mem_index or operand.mem_base:
+                    continue
+                table_va = operand.mem_disp
+                if not (start <= table_va < upper):
+                    continue
+                targets = self._read_local_jump_table(table_va, start, upper)
+                if not targets:
+                    continue
+                jump_tables[table_va] = targets
+                for target in targets:
+                    if target not in entry_points:
+                        entry_points.add(target)
+                        changed = True
+            if not changed:
+                cfg_targets = {
+                    insn.jump_target
+                    for insn in instructions
+                    if insn.jump_target is not None
+                    and start <= insn.jump_target < upper
+                }
+                for targets in jump_tables.values():
+                    cfg_targets.update(targets)
+                return instructions, jump_tables, cfg_targets
+
+    def _read_local_jump_table(self, table_va, lower, upper,
+                               max_entries=256):
+        """Read the contiguous pointer cluster around an indexed-jump base."""
+        def scan(step, first):
+            targets = []
+            for index in range(first, max_entries + first):
+                entry_va = table_va + step * index * 4
+                offset = va_to_file_offset(entry_va)
+                if offset is None or offset + 4 > len(self.xbe_data):
+                    break
+                target = struct.unpack_from('<I', self.xbe_data, offset)[0]
+                if not (lower <= target < upper):
+                    break
+                targets.append(target)
+            return targets
+
+        backward = scan(-1, 1)
+        forward = scan(1, 0)
+        if len(backward) + len(forward) < 2:
+            return []
+        backward.reverse()
+        return backward + forward
 
     def _read_func_bytes(self, start_va, end_va):
         """Read raw bytes for a function from the XBE."""
@@ -148,7 +294,8 @@ class FunctionTranslator:
         Returns a string of C source code, or None on failure.
         """
         start = func_addr
-        end = func_info.get("end")
+        recovered = self._recovered_cfg.get(start)
+        end = recovered["end"] if recovered else func_info.get("end")
         if not end:
             end = start + func_info.get("size", 0)
         if end <= start:
@@ -165,9 +312,12 @@ class FunctionTranslator:
         # Set function bounds for the lifter
         self.lifter.func_start = start
         self.lifter.func_end = end
+        self.lifter.jump_table_targets = (
+            recovered["jump_tables"] if recovered else {})
 
         # Disassemble
-        instructions = self.disasm.disassemble_function(raw_bytes, start, end)
+        instructions = (recovered["instructions"] if recovered else
+                        self.disasm.disassemble_function(raw_bytes, start, end))
         if not instructions:
             return None
 
@@ -530,6 +680,7 @@ class BatchTranslator:
             self.xbe_data, self.func_db, self.label_db,
             self.classification_db, self.abi_db,
             seh_prolog=seh_prolog, seh_epilog=seh_epilog)
+        self.translator.discover_cfg_ownership()
 
     def get_functions_by_category(self, categories=None, exclude_categories=None):
         """
@@ -538,6 +689,8 @@ class BatchTranslator:
         """
         result = []
         for addr, func_info in sorted(self.func_db.items()):
+            if addr in self.translator.owned_function_starts:
+                continue
             cls_info = self.classification_db.get(addr, {})
             cat = cls_info.get("category", "unknown")
 
@@ -575,6 +728,9 @@ class BatchTranslator:
         Returns dict with statistics.
         """
         os.makedirs(self.output_dir, exist_ok=True)
+
+        func_list = [item for item in func_list
+                     if item[0] not in self.translator.owned_function_starts]
 
         if max_funcs:
             func_list = func_list[:max_funcs]
@@ -688,6 +844,9 @@ class BatchTranslator:
         import sys
 
         os.makedirs(output_dir, exist_ok=True)
+
+        func_list = [item for item in func_list
+                     if item[0] not in self.translator.owned_function_starts]
 
         # Translate all functions first, collecting results
         translations = []

@@ -144,6 +144,38 @@ class Disassembler:
         self._cs.detail = True
         _init_reg_names(self._cs)
 
+    def _decode_instruction(self, cs_insn):
+        """Convert one Capstone instruction into the translator model."""
+        insn = Instruction(
+            address=cs_insn.address,
+            size=cs_insn.size,
+            mnemonic=cs_insn.mnemonic,
+            op_str=cs_insn.op_str,
+            bytes_hex=cs_insn.bytes.hex(),
+        )
+
+        try:
+            ops = cs_insn.operands
+        except Exception:
+            ops = []
+        for cs_op in ops:
+            op = _parse_operand(self._cs, cs_op, cs_insn)
+            insn.operands.append(op)
+
+            if cs_op.type == CS_OP_IMM:
+                val = cs_op.imm & 0xFFFFFFFF
+                insn.imm_values.append(val)
+                if insn.is_call:
+                    insn.call_target = val
+                elif insn.is_branch:
+                    insn.jump_target = val
+            elif cs_op.type == CS_OP_MEM:
+                if (cs_op.mem.base == 0 and cs_op.mem.index == 0
+                        and cs_op.mem.disp != 0):
+                    insn.memory_refs.append(cs_op.mem.disp & 0xFFFFFFFF)
+
+        return insn
+
     def disassemble_function(self, raw_bytes, start_va, end_va):
         """
         Disassemble bytes for a single function.
@@ -155,37 +187,45 @@ class Disassembler:
 
         instructions = []
         for cs_insn in self._cs.disasm(raw_bytes[:size], start_va):
-            insn = Instruction(
-                address=cs_insn.address,
-                size=cs_insn.size,
-                mnemonic=cs_insn.mnemonic,
-                op_str=cs_insn.op_str,
-                bytes_hex=cs_insn.bytes.hex(),
-            )
-
-            # Parse operands (detail mode is enabled on the Cs object)
-            try:
-                ops = cs_insn.operands
-            except Exception:
-                ops = []
-            for cs_op in ops:
-                op = _parse_operand(self._cs, cs_op, cs_insn)
-                insn.operands.append(op)
-
-                if cs_op.type == CS_OP_IMM:
-                    val = cs_op.imm & 0xFFFFFFFF
-                    insn.imm_values.append(val)
-                    if insn.is_call:
-                        insn.call_target = val
-                    elif insn.is_branch:
-                        insn.jump_target = val
-                elif cs_op.type == CS_OP_MEM:
-                    if cs_op.mem.base == 0 and cs_op.mem.index == 0 and cs_op.mem.disp != 0:
-                        insn.memory_refs.append(cs_op.mem.disp & 0xFFFFFFFF)
-
-            instructions.append(insn)
+            instructions.append(self._decode_instruction(cs_insn))
 
         return instructions
+
+    def disassemble_cfg(self, raw_bytes, start_va, end_va, entry_points,
+                        stop_addresses=None):
+        """Decode reachable instruction streams from an explicit worklist."""
+        size = end_va - start_va
+        if size <= 0 or size > len(raw_bytes):
+            return []
+
+        decoded = {}
+        stop_addresses = set(stop_addresses or ())
+        worklist = list(entry_points)
+        while worklist:
+            entry = worklist.pop()
+            if not (start_va <= entry < end_va) or entry in decoded:
+                continue
+            offset = entry - start_va
+            for cs_insn in self._cs.disasm(raw_bytes[offset:size], entry):
+                if cs_insn.address != entry and cs_insn.address in stop_addresses:
+                    break
+                if cs_insn.address >= end_va or cs_insn.address in decoded:
+                    break
+                insn = self._decode_instruction(cs_insn)
+                decoded[insn.address] = insn
+
+                if (insn.is_cond_jump and insn.jump_target is not None
+                        and start_va <= insn.jump_target < end_va):
+                    worklist.append(insn.jump_target)
+                if insn.is_jump:
+                    if (insn.jump_target is not None
+                            and start_va <= insn.jump_target < end_va):
+                        worklist.append(insn.jump_target)
+                    break
+                if insn.is_ret:
+                    break
+
+        return [decoded[addr] for addr in sorted(decoded)]
 
     def build_basic_blocks(self, instructions, func_start, func_end,
                            extra_leaders=None):
