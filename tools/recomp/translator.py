@@ -117,8 +117,131 @@ class FunctionTranslator:
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
                              seh_epilog=seh_epilog)
         self.owned_function_starts = set()
+        self.recovered_function_starts = set()
         self._recovered_cfg = {}
         self._ownership_ready = False
+
+    def discover_static_indirect_targets(self):
+        """Recover function entries from bounded static callback tables."""
+        original_starts = sorted(self.func_db)
+        recovered_callers = {}
+
+        for caller, func_info in list(self.func_db.items()):
+            end = func_info.get("end", caller)
+            raw_bytes = self._read_func_bytes(caller, end)
+            if not raw_bytes:
+                continue
+            instructions = self.disasm.disassemble_function(
+                raw_bytes, caller, end)
+            for lower, upper in self._find_static_indirect_ranges(instructions):
+                targets = self._read_static_callback_table(
+                    lower, upper, original_starts)
+                if targets is None:
+                    continue
+                for target in targets:
+                    if target not in self.func_db:
+                        recovered_callers.setdefault(target, set()).add(caller)
+
+        for target, callers in sorted(recovered_callers.items()):
+            next_index = bisect.bisect_right(original_starts, target)
+            if next_index == 0 or next_index >= len(original_starts):
+                continue
+            previous = self.func_db[original_starts[next_index - 1]]
+            next_start = original_starts[next_index]
+            next_func = self.func_db[next_start]
+            if previous.get("end", previous["_addr"]) > target:
+                continue
+            section = next_func.get("section", "")
+            if section in (".rdata", ".data"):
+                continue
+
+            raw_bytes = self._read_func_bytes(target, next_start)
+            if not raw_bytes:
+                continue
+            instructions = self.disasm.disassemble_function(
+                raw_bytes, target, next_start)
+            if not instructions or not any(insn.is_ret for insn in instructions):
+                continue
+
+            self.func_db[target] = {
+                "_addr": target,
+                "start": f"0x{target:08X}",
+                "end": next_start,
+                "size": next_start - target,
+                "name": self.label_db.get(target, f"sub_{target:08X}"),
+                "section": section,
+                "confidence": 0.9,
+                "detection_method": "static_indirect_table",
+                "num_instructions": len(instructions),
+                "has_prologue": self._func_has_prologue(instructions),
+                "calls_to": [],
+                "called_by": sorted(callers),
+            }
+            self.recovered_function_starts.add(target)
+
+        return self.recovered_function_starts
+
+    @staticmethod
+    def _find_static_indirect_ranges(instructions, max_bytes=0x10000):
+        """Find immediate-backed ranges in functions that call a register."""
+        constants = {}
+        ranges = set()
+        has_indirect_call = False
+
+        for insn in instructions:
+            operands = insn.operands
+            if (insn.mnemonic == "mov" and len(operands) >= 2
+                    and operands[0].type == "reg"):
+                destination = operands[0].reg
+                source = operands[1]
+                if source.type == "imm":
+                    constants[destination] = source.imm
+                elif source.type == "reg" and source.reg in constants:
+                    constants[destination] = constants[source.reg]
+                else:
+                    constants.pop(destination, None)
+            elif (insn.mnemonic == "cmp" and len(operands) >= 2
+                    and operands[0].type == "reg"
+                    and operands[1].type == "reg"):
+                lower = constants.get(operands[0].reg)
+                upper = constants.get(operands[1].reg)
+                if (lower is not None and upper is not None
+                        and lower < upper and lower % 4 == 0
+                        and upper % 4 == 0 and upper - lower <= max_bytes):
+                    ranges.add((lower, upper))
+            elif (insn.is_call and insn.call_target is None
+                    and operands and operands[0].type == "reg"):
+                has_indirect_call = True
+
+        return sorted(ranges) if has_indirect_call else []
+
+    def _read_static_callback_table(self, lower, upper, original_starts):
+        """Validate and return a bounded table of static code pointers."""
+        targets = []
+        for entry_va in range(lower, upper, 4):
+            offset = va_to_file_offset(entry_va)
+            if offset is None or offset + 4 > len(self.xbe_data):
+                return None
+            target = struct.unpack_from('<I', self.xbe_data, offset)[0]
+            if target in (0, 0xFFFFFFFF):
+                continue
+
+            index = bisect.bisect_right(original_starts, target)
+            if index and self.func_db[original_starts[index - 1]].get(
+                    "end", original_starts[index - 1]) > target:
+                targets.append(target)
+                continue
+            if index == 0 or index >= len(original_starts):
+                return None
+            previous = self.func_db[original_starts[index - 1]]
+            following = self.func_db[original_starts[index]]
+            if (previous.get("section") != following.get("section")
+                    or following.get("section") in (".rdata", ".data")
+                    or va_to_file_offset(target) is None):
+                return None
+            targets.append(target)
+
+        return targets if targets else None
 
     @staticmethod
     def _is_strong_entry(func_info):
@@ -680,6 +803,7 @@ class BatchTranslator:
             self.xbe_data, self.func_db, self.label_db,
             self.classification_db, self.abi_db,
             seh_prolog=seh_prolog, seh_epilog=seh_epilog)
+        self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
 
     def get_functions_by_category(self, categories=None, exclude_categories=None):
