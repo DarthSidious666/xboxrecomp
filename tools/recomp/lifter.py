@@ -605,8 +605,10 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
     if target is None:
         return f"if ({cond_expr}) {{ /* {jcc}: {desc} - indirect */ }}"
     if lifter and lifter._is_external_target(target):
+        # Conditional tail call: same frame bridge as the unconditional tail
+        # jmp in _lift_jmp, applied only on the taken path.
         name = lifter._call_target_name(target)
-        return (f"if ({cond_expr}) {{ {name}(); return; }}"
+        return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; {name}(); return; }}"
                 f" /* {jcc}: {desc} */")
     return f"if ({cond_expr}) goto loc_{target:08X}; /* {jcc}: {desc} */"
 
@@ -1293,7 +1295,7 @@ class Lifter:
             if target:
                 if self._is_external_target(target):
                     name = self._call_target_name(target)
-                    return [f"if ({cond}) {{ {name}(); return; }} /* {jcc} */"]
+                    return [f"if ({cond}) {{ g_seh_ebp = ebp; {name}(); return; }} /* {jcc} */"]
                 return [f"if ({cond}) goto loc_{target:08X}; /* {jcc} */"]
             return [f"/* {jcc} - no target */"]
 
@@ -1302,7 +1304,7 @@ class Lifter:
         if target:
             if self._is_external_target(target):
                 name = self._call_target_name(target)
-                return [f"if (_flags /* {jcc}: {desc} */) {{ {name}(); return; }}"]
+                return [f"if (_flags /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
             return [f"if (_flags /* {jcc}: {desc} */) goto loc_{target:08X};"]
         return [f"/* {jcc}: {desc} - no target */"]
 

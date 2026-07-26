@@ -489,16 +489,35 @@ class FunctionTranslator:
         if any(insn.mnemonic == "leave" for insn in instructions):
             used_regs.add("ebp")
 
+        # Guest control leaves the bottom of this function when its last
+        # instruction neither returns, jumps, nor traps. A function the lifter
+        # split into consecutive pieces continues into the next piece exactly
+        # as an unconditional tail jump would, so bridge to it the same way.
+        # Only an address that is itself a translated function start is a
+        # usable target; anything else is an analysis boundary gap with no
+        # callable symbol.
+        last_insn = instructions[-1]
+        continues_past_end = not (
+            last_insn.is_terminator
+            or last_insn.mnemonic in ("int3", "ud2", "hlt"))
+        fallthrough_target = None
+        if (continues_past_end and end in self.func_db
+                and end not in self.owned_function_starts):
+            fallthrough_target = end
+
         # Ensure ebp tracked if function has tail jumps (lifter emits
-        # g_seh_ebp = ebp before external jmp and indirect jmp).
+        # g_seh_ebp = ebp before external jmp, external jcc, and indirect jmp,
+        # and translate_function emits it before a fallthrough tail call).
         has_tail_jump = any(
-            insn.mnemonic == "jmp" and (
+            (insn.mnemonic == "jmp" and (
                 (insn.jump_target and not (start <= insn.jump_target < end))
                 or not insn.jump_target  # indirect jmp
-            )
+            ))
+            or (insn.is_cond_jump and insn.jump_target
+                and not (start <= insn.jump_target < end))
             for insn in instructions
         )
-        if has_tail_jump:
+        if has_tail_jump or fallthrough_target is not None:
             used_regs.add("ebp")
 
         # Ensure ebp tracked if function calls __SEH_prolog or __SEH_epilog
@@ -642,6 +661,13 @@ class FunctionTranslator:
             for stmt in stmts:
                 lines.append(f"    {stmt}")
 
+            lines.append(f"")
+
+        # Continue into the next function when control runs off the bottom.
+        if fallthrough_target is not None:
+            ft_name = self.lifter._call_target_name(fallthrough_target)
+            lines.append(f"    g_seh_ebp = ebp; {ft_name}(); return;"
+                         f" /* fallthrough 0x{fallthrough_target:08X} */")
             lines.append(f"")
 
         # Insert _icall_esp save points before RECOMP_ICALL_SAFE arg pushes.
