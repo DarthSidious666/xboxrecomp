@@ -15,6 +15,7 @@
 
 ### Recent Changes
 
+- **Recompiler fall-through fix** — When the disassembler splits a straight-line run of code into separate functions at an internal branch target, the last function often ends by *falling through* into the next one (its last instruction is an ordinary op, not `ret`/`jmp`) — which x86 executes. The lifter dropped that edge, so the C body just ended and silently skipped the next function's shared epilogue: an esp leak that corrupted callee-saved registers. **4,587 / 35,286 functions in Burnout 3** had this shape. The lifter now emits the fall-through as an explicit tail call. See `tools/recomp/test_fallthrough.py`.
 - **Cross-Platform / Linux Port** — Platform abstraction layer with an **OpenGL D3D8 backend** alongside the Windows D3D11 path, POSIX path handling, and Linux build deps (`tools/linux/install_deps.sh`). Builds with GCC/Clang.
 - **`ghidra_naming` Tool (optional)** — Headless Ghidra FidDb pass recovers real CRT/XDK symbol names from a stripped XBE and merges them into `functions.json`, so generated C uses meaningful names instead of `sub_XXXXXXXX`. The core pipeline still needs no disassembler. See `tools/ghidra_naming/`.
 - **`--seed-functions`** — Iterative disasm mode: seed the function database from known/recovered entry points for fuller coverage on stripped binaries.
@@ -27,7 +28,7 @@
 - **Texture Unswizzling** — Xbox Z-order (Morton code) swizzled textures converted to linear D3D11 layout. Optimized masked-increment algorithm from xemu.
 - **NV2A PGRAPH→D3D11 Translator** — Push buffer method interception and D3D11 rendering (upstreamed from Burnout 3).
 - **EEPROM / AV Pack / SMBus** — Games can query region, language, video standard, AV pack type, and hardware info.
-- **Games in progress** — Burnout 3 (**playable**: menus, tracks, physics, audio), Xbox Dashboard (VRML+JS scene-engine bring-up), Wreckless (debugging), Blood Wake (scaffolded).
+- **Games in progress** — Burnout 3 (**honest recompiler-driven bring-up in progress**: clean recompiled code reaches engine/RenderWare init; an earlier "playable" build leaned on hand-written menu/render scaffolding that is being replaced with recompiled code), Halo (kernel + x87 bring-up), Xbox Dashboard (VRML+JS scene-engine bring-up), Wreckless (debugging), Blood Wake (scaffolded).
 
 ---
 
