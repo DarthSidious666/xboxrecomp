@@ -839,6 +839,58 @@ static void bridge_KeWaitForSingleObject(void)
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
 }
 
+static HANDLE bridge_resolve_handle(uint32_t token);
+
+/* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
+/*
+ * The synchronous sibling of ...Ex. Halo's synchronous ReadFile issues the read
+ * and then waits on its completion event through this; unbridged it fell to the
+ * "return 0" default (STATUS_SUCCESS = "already signalled"), so the read handshake
+ * completed before the data arrived and the UI-map precache never made progress.
+ */
+static void bridge_NtWaitForSingleObject(void)
+{
+    HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t alertable   = STACK_ARG(1);
+    uint32_t timeout_ptr = STACK_ARG(2);
+
+    g_eax = (uint32_t)xbox_NtWaitForSingleObject(
+        handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+}
+
+/* ── NtClearEvent (ordinal 186) ──────────────────────────── */
+/* Resets an event to non-signalled. Halo clears the read-completion event
+ * before each async map read; a no-op here left the event stuck signalled. */
+static void bridge_NtClearEvent(void)
+{
+    HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
+    g_eax = (uint32_t)xbox_NtClearEvent(handle);
+}
+
+/* ── NtSetEvent (ordinal 225) ────────────────────────────── */
+/* Signals an event and optionally returns its previous state. Unbridged it
+ * no-op'd, so a producer's "work ready" signal never landed -- Halo's map-copy
+ * worker thread then slept forever in WaitForSingleObject on the decompress
+ * context's go-event and only the first 14 KB of the map ever loaded. */
+static void bridge_NtSetEvent(void)
+{
+    HANDLE   handle = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t prev   = STACK_ARG(1);
+    g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
+}
+
+/* ── NtPulseEvent (ordinal 205) ──────────────────────────── */
+/* Signal-then-reset: releases threads currently waiting, then leaves the event
+ * non-signalled. Same unbridged-no-op hazard as NtSetEvent in the map-load
+ * handoff chain. PulseEvent carries the (deprecated, lossy) Xbox semantics
+ * faithfully -- a waiter not yet blocked misses it, exactly as on hardware. */
+static void bridge_NtPulseEvent(void)
+{
+    HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
+    if (handle) PulseEvent(handle);
+    g_eax = 0;
+}
+
 /* ── NtWaitForSingleObjectEx (ordinal 234) ───────────────── */
 /*
  * Unbridged, this fell through to the "no bridge, returning 0" default -- and 0
@@ -938,6 +990,7 @@ static void bridge_KeDelayExecutionThread(void)
     uint32_t wait_mode    = STACK_ARG(0);
     uint32_t alertable    = STACK_ARG(1);
     uint32_t interval_ptr = STACK_ARG(2);
+
 
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
@@ -1495,11 +1548,44 @@ static void bridge_NtOpenFile(void)
  *
  * ponytail: the APC runs inline here rather than at the next alertable wait.
  * The data really is ready by then, so the observable result matches; a title
- * that depends on the APC *not* having run yet would notice. Queue it properly
- * if one turns up.
+ * that depends on the APC *not* having run yet would notice. A per-thread
+ * deferred queue drained at alertable waits was tried for Halo's map streamer
+ * and made no difference (it still issues one 14 KB batch and stops), so it was
+ * dropped rather than risk changing this shared path for the other titles.
  */
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 
+static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
+                            uint32_t iostatus)
+{
+    /* The APC can be game code or a kernel export. Halo's XAPI passes the
+     * latter -- 0xFE0000FC, one of our own synthetic thunk VAs -- so the recomp
+     * dispatch correctly fails to find it and the kernel fallback is the one
+     * that matters. Checking only recomp_lookup left it undelivered. */
+    recomp_func_t fn = recomp_lookup(apc_routine);
+    if (!fn) fn = recomp_lookup_manual(apc_routine);
+    if (!fn) fn = recomp_lookup_kernel(apc_routine);
+    if (fn) {
+        /* VOID ApcRoutine(PVOID ApcContext, PIO_STATUS_BLOCK, ULONG) */
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
+        fn();
+        g_esp += 12;
+    } else {
+        uint32_t ord = 0;
+        if (apc_routine >= KERNEL_VA_BASE && apc_routine < KERNEL_VA_END) {
+            ord = g_slot_ordinals[(apc_routine - KERNEL_VA_BASE) / 4];
+        }
+        fprintf(stderr, "  [KERNEL] file I/O APC 0x%08X unresolved"
+                " (kernel ordinal %u)\n", apc_routine, ord);
+        fflush(stderr);
+    }
+}
+
+/* Per-thread pending-APC ring. An APC is delivered on the thread that issued
+ * the request, which is also the thread that waits, so thread-local is right. */
 static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
                                     uint32_t apc_context, uint32_t iostatus)
 {
@@ -1507,33 +1593,8 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
         HANDLE ev = bridge_resolve_handle(event_token);
         if (ev) SetEvent(ev);
     }
-
     if (apc_routine) {
-        /* The APC can be game code or a kernel export. Halo's XAPI passes the
-         * latter -- 0xFE0000FC, one of our own synthetic thunk VAs -- so the
-         * recomp dispatch correctly fails to find it and the kernel fallback is
-         * the one that matters. Checking only recomp_lookup left the completion
-         * undelivered and the title waiting on an APC that never ran. */
-        recomp_func_t fn = recomp_lookup(apc_routine);
-        if (!fn) fn = recomp_lookup_manual(apc_routine);
-        if (!fn) fn = recomp_lookup_kernel(apc_routine);
-        if (fn) {
-            /* VOID ApcRoutine(PVOID ApcContext, PIO_STATUS_BLOCK, ULONG) */
-            g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-            g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
-            g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
-            g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
-            fn();
-            g_esp += 12;
-        } else {
-            uint32_t ord = 0;
-            if (apc_routine >= KERNEL_VA_BASE && apc_routine < KERNEL_VA_END) {
-                ord = g_slot_ordinals[(apc_routine - KERNEL_VA_BASE) / 4];
-            }
-            fprintf(stderr, "  [KERNEL] file I/O APC 0x%08X unresolved"
-                    " (kernel ordinal %u)\n", apc_routine, ord);
-            fflush(stderr);
-        }
+        deliver_one_apc(apc_routine, apc_context, iostatus);
     }
 }
 
@@ -2405,6 +2466,10 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 232: return bridge_NtUserIoApcDispatcher;
     case  95: return bridge_KeBugCheck;
     case  96: return bridge_KeBugCheckEx;
+    case 186: return bridge_NtClearEvent;
+    case 205: return bridge_NtPulseEvent;
+    case 225: return bridge_NtSetEvent;
+    case 233: return bridge_NtWaitForSingleObject;
     case 234: return bridge_NtWaitForSingleObjectEx;
     case 238: return bridge_NtYieldExecution;
 
