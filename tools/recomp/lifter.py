@@ -1024,11 +1024,16 @@ class Lifter:
         else:
             return [_fmt_operand_write(ops[0], f"{val} {op_char} {delta}")]
 
-    def _lift_neg(self, insn, ops):
+    def _lift_neg(self, insn, ops, preserve_carry=False):
         if len(ops) < 1:
             return ["/* neg: no operand */"]
         val = _fmt_operand_read(ops[0])
-        return [_fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})")]
+        statements = []
+        if preserve_carry:
+            statements.append(f"_cf = ({val} != 0); /* neg carry */")
+        statements.append(
+            _fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})"))
+        return statements
 
     def _lift_not(self, insn, ops):
         if len(ops) < 1:
@@ -1718,8 +1723,14 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
-        # Lift the instruction normally
-        results = lifter.lift_instruction(insns[i])
+        # NEG sets CF when its operand is nonzero. Preserve that value only
+        # for the adjacent carry consumer that needs it.
+        if (curr.mnemonic == "neg" and i + 1 < len(insns)
+                and insns[i + 1].mnemonic in ("sbb", "adc")):
+            results = lifter._lift_neg(
+                curr, curr.operands, preserve_carry=True)
+        else:
+            results = lifter.lift_instruction(insns[i])
         stmts.extend(results)
 
         # Track flag-setting instructions
