@@ -1723,12 +1723,22 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
-        # NEG sets CF when its operand is nonzero. Preserve that value only
-        # for the adjacent carry consumer that needs it.
-        if (curr.mnemonic == "neg" and i + 1 < len(insns)
-                and insns[i + 1].mnemonic in ("sbb", "adc")):
+        # NEG sets CF when its operand is nonzero. Preserve that value when
+        # a later SBB/ADC consumes it, skipping over EFLAGS-preserving
+        # instructions (e.g. neg eax; push edi; sbb eax, eax).
+        if curr.mnemonic == "neg":
+            j = i + 1
+            while (j < len(insns)
+                    and insns[j].mnemonic in _EFLAGS_PRESERVE
+                    and insns[j].mnemonic != "popfd"
+                    and not insns[j].is_branch
+                    and not insns[j].is_call
+                    and not insns[j].is_ret):
+                j += 1
+            preserve = (j < len(insns)
+                        and insns[j].mnemonic in ("sbb", "adc"))
             results = lifter._lift_neg(
-                curr, curr.operands, preserve_carry=True)
+                curr, curr.operands, preserve_carry=preserve)
         else:
             results = lifter.lift_instruction(insns[i])
         stmts.extend(results)

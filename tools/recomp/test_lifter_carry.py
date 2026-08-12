@@ -40,6 +40,80 @@ class CarryLifterTest(unittest.TestCase):
         self.assertIn("_cf = (eax != 0);", generated)
         self.assertIn("edx = edx + 0 + _cf; /* adc */", generated)
 
+    def test_neg_carry_feeds_sbb_across_push(self):
+        neg = Instruction(0, 2, "neg", "eax", "f7d8")
+        neg.operands = [Operand(type="reg", reg="eax")]
+        push = Instruction(2, 1, "push", "edi", "57")
+        push.operands = [Operand(type="reg", reg="edi")]
+        sbb = Instruction(3, 2, "sbb", "eax, eax", "19c0")
+        sbb.operands = [
+            Operand(type="reg", reg="eax"),
+            Operand(type="reg", reg="eax"),
+        ]
+
+        lifted, _ = lift_basic_block(
+            Lifter(), BasicBlock(start=0, instructions=[neg, push, sbb]))
+        generated = "\n".join(lifted)
+
+        self.assertIn("_cf = (eax != 0);", generated)
+        self.assertIn(
+            "eax = _cf ? 0xFFFFFFFF : 0; /* sbb self (CF extend) */",
+            generated,
+        )
+
+    def test_neg_carry_not_preserved_across_flag_setter(self):
+        neg = Instruction(0, 2, "neg", "eax", "f7d8")
+        neg.operands = [Operand(type="reg", reg="eax")]
+        add = Instruction(2, 3, "add", "ecx, 1", "83c101")
+        add.operands = [
+            Operand(type="reg", reg="ecx"),
+            Operand(type="imm", imm=1),
+        ]
+        sbb = Instruction(5, 2, "sbb", "eax, eax", "19c0")
+        sbb.operands = [
+            Operand(type="reg", reg="eax"),
+            Operand(type="reg", reg="eax"),
+        ]
+
+        lifted, _ = lift_basic_block(
+            Lifter(), BasicBlock(start=0, instructions=[neg, add, sbb]))
+        generated = "\n".join(lifted)
+
+        self.assertNotIn("_cf = (eax != 0);", generated)
+
+    def test_neg_carry_not_preserved_across_branch(self):
+        neg = Instruction(0, 2, "neg", "eax", "f7d8")
+        neg.operands = [Operand(type="reg", reg="eax")]
+        jmp = Instruction(2, 2, "jmp", "0x10", "eb0c")
+        jmp.jump_target = 0x10
+        sbb = Instruction(4, 2, "sbb", "eax, eax", "19c0")
+        sbb.operands = [
+            Operand(type="reg", reg="eax"),
+            Operand(type="reg", reg="eax"),
+        ]
+
+        lifted, _ = lift_basic_block(
+            Lifter(), BasicBlock(start=0, instructions=[neg, jmp, sbb]))
+        generated = "\n".join(lifted)
+
+        self.assertNotIn("_cf = (eax != 0);", generated)
+
+    def test_neg_carry_not_preserved_across_popfd(self):
+        neg = Instruction(0, 2, "neg", "eax", "f7d8")
+        neg.operands = [Operand(type="reg", reg="eax")]
+        popfd = Instruction(2, 1, "popfd", "", "9d")
+        sbb = Instruction(3, 2, "sbb", "eax, eax", "19c0")
+        sbb.operands = [
+            Operand(type="reg", reg="eax"),
+            Operand(type="reg", reg="eax"),
+        ]
+
+        lifted, _ = lift_basic_block(
+            Lifter(), BasicBlock(start=0, instructions=[neg, popfd, sbb]))
+        generated = "\n".join(lifted)
+
+        self.assertNotIn("_cf = (eax != 0);", generated)
+
 
 if __name__ == "__main__":
     unittest.main()
