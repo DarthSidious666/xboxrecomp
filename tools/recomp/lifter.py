@@ -570,9 +570,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── repe cmpsb / repne scasb: string comparison ──
     if "cmps" in flag_setter or "scas" in flag_setter:
         if jcc in ("je", "jz"):
-            return "1 /* strings matched (repe cmpsb) */", desc
+            return "(_flags != 0)", desc
         if jcc in ("jne", "jnz"):
-            return "0 /* strings differed (repe cmpsb) */", desc
+            return "(_flags == 0)", desc
         return None
 
     return None
@@ -1346,9 +1346,29 @@ class Lifter:
                 "{ uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*2) = LO16(eax); }",
                 "edi += ecx * 2; ecx = 0; /* rep stosw */"
             ]
-        if "cmpsb" in m or "cmpsw" in m or "cmpsd" in m:
+        if "cmpsb" in m:
+            continue_on_equal = "repne" not in m and "repnz" not in m
+            stop_condition = "!_flags" if continue_on_equal else "_flags"
+            return [
+                "while (ecx != 0) {",
+                "    _flags = (MEM8(esi) == MEM8(edi));",
+                "    esi++; edi++; ecx--;",
+                f"    if ({stop_condition}) break;",
+                f"}} /* {m} */",
+            ]
+        if "scasb" in m:
+            continue_on_equal = "repne" not in m and "repnz" not in m
+            stop_condition = "!_flags" if continue_on_equal else "_flags"
+            return [
+                "while (ecx != 0) {",
+                "    _flags = (LO8(eax) == MEM8(edi));",
+                "    edi++; ecx--;",
+                f"    if ({stop_condition}) break;",
+                f"}} /* {m} */",
+            ]
+        if "cmpsw" in m or "cmpsd" in m:
             return [f"/* {m} - string compare, ecx iterations */"]
-        if "scasb" in m or "scasw" in m or "scasd" in m:
+        if "scasw" in m or "scasd" in m:
             return [f"/* {m} - string scan, ecx iterations */"]
         return [f"/* {m} */"]
 
@@ -1778,10 +1798,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # repe cmpsb/repne scasb = comparison, sets flags
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
-            if "cmps" in raw_m or "scas" in raw_m:
+            if "cmpsb" in raw_m or "scasb" in raw_m:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
-            elif "cmps" in rest or "scas" in rest:
+            elif "cmpsb" in rest or "scasb" in rest:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
             else:
