@@ -168,15 +168,28 @@ void recomp_icall_fail_log(uint32_t va);
 #define CMP_A(a, b)   ((uint32_t)(a) >  (uint32_t)(b))   /* above */
 
 /* Signed comparison conditions */
-#define CMP_L(a, b)   ((int32_t)(a) <  (int32_t)(b))     /* less (SF!=OF) */
-#define CMP_GE(a, b)  ((int32_t)(a) >= (int32_t)(b))     /* greater or equal */
-#define CMP_LE(a, b)  ((int32_t)(a) <= (int32_t)(b))     /* less or equal */
-#define CMP_G(a, b)   ((int32_t)(a) >  (int32_t)(b))     /* greater */
+/* x86 evaluates the signed conditions at the operand width, not at 32 bits.
+   The generated code passes LO8/HI8/LO16 sub-register reads straight in, and
+   those zero-extend, so recover the width and sign-extend before comparing. */
+#define RECOMP_FLAG_WIDTH(a, b) (sizeof(a) < sizeof(b) ? sizeof(a) : sizeof(b))
+#define RECOMP_SIGNED(value, width) \
+    ((width) == 1u ? (int32_t)(int8_t)(uint8_t)(uint32_t)(value) \
+     : (width) == 2u ? (int32_t)(int16_t)(uint16_t)(uint32_t)(value) \
+     : (int32_t)(uint32_t)(value))
+#define CMP_L(a, b)   (RECOMP_SIGNED(a, RECOMP_FLAG_WIDTH(a, b)) <  \
+                       RECOMP_SIGNED(b, RECOMP_FLAG_WIDTH(a, b)))  /* less */
+#define CMP_GE(a, b)  (RECOMP_SIGNED(a, RECOMP_FLAG_WIDTH(a, b)) >= \
+                       RECOMP_SIGNED(b, RECOMP_FLAG_WIDTH(a, b)))  /* >= */
+#define CMP_LE(a, b)  (RECOMP_SIGNED(a, RECOMP_FLAG_WIDTH(a, b)) <= \
+                       RECOMP_SIGNED(b, RECOMP_FLAG_WIDTH(a, b)))  /* <= */
+#define CMP_G(a, b)   (RECOMP_SIGNED(a, RECOMP_FLAG_WIDTH(a, b)) >  \
+                       RECOMP_SIGNED(b, RECOMP_FLAG_WIDTH(a, b)))  /* > */
 
 /* TEST-based conditions (AND without storing result) */
 #define TEST_Z(a, b)  (((uint32_t)(a) & (uint32_t)(b)) == 0)  /* ZF=1 */
 #define TEST_NZ(a, b) (((uint32_t)(a) & (uint32_t)(b)) != 0)  /* ZF=0 */
-#define TEST_S(a, b)  ((int32_t)((uint32_t)(a) & (uint32_t)(b)) < 0) /* SF=1 */
+#define TEST_S(a, b)  (RECOMP_SIGNED((uint32_t)(a) & (uint32_t)(b), \
+                                     RECOMP_FLAG_WIDTH(a, b)) < 0)  /* SF=1 */
 
 /* ================================================================
  * Arithmetic with carry/overflow detection
