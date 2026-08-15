@@ -322,7 +322,7 @@ def _make_condition(jcc, flag_setter, flag_ops):
         }
         op = fpu_cmp_map.get(jcc)
         if op:
-            return f"(_fpu_cmp {op} 0) /* {flag_setter} */", desc
+            return f"(g_fp_cmp {op} 0) /* {flag_setter} */", desc
         if jcc == "jp":
             return "0 /* fpu: unordered/NaN */", desc
         if jcc == "jnp":
@@ -373,7 +373,8 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc == "jns":
             return f"((int32_t)({lhs} - {rhs}) >= 0)", desc
         if jcc in ("jp", "jnp"):
-            return f"1 /* {jcc} after cmp - parity */", desc
+            sense = "" if jcc == "jp" else "!"
+            return f"{sense}PARITY8({lhs} - {rhs})", desc
         return None
 
     # ── test: flags from (a & b), operands unchanged ──
@@ -391,7 +392,10 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc == "jno":
             return "1", desc
         if jcc in ("jp", "jnp"):
-            return f"1 /* {jcc} after test - parity */", desc
+            # PF is the even-parity of the low byte of the result. The CRT
+            # branches on it after FNSTSW/TEST AH, so compute it.
+            sense = "" if jcc == "jp" else "!"
+            return f"{sense}PARITY8({lhs} & {rhs})", desc
         return None
 
     # ── sub: a = a - b, flags from (a_orig - b) ──
@@ -1643,11 +1647,11 @@ class Lifter:
         if m == "fxch":
             return [f"{{ double _t = fp_top(); fp_top() = fp_st1(); fp_st1() = _t; }} /* fxch */"]
         if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp"):
-            # Set _fpu_cmp for the fcomp/fnstsw/sahf pattern
+            # Set g_fp_cmp for the fcomp/fnstsw/sahf pattern
             source = _fmt_fpu_operand(ops[-1]) if ops else "fp_st1()"
             pops = 2 if m.endswith("pp") else 1 if m.endswith("p") else 0
             pop_code = " fp_pop();" * pops
-            return [f"_fpu_cmp = (fp_top() < {source}) ? -1 : "
+            return [f"g_fp_cmp = (fp_top() < {source}) ? -1 : "
                     f"(fp_top() > {source}) ? 1 : 0;{pop_code}"
                     f" /* {m} {insn.op_str} */"]
         if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi"):
@@ -1655,14 +1659,40 @@ class Lifter:
             # fcompi/fucompi pop st(0) after comparing; fcomi/fucomi do not
             pops = m.endswith("pi") or m.endswith("ip")
             pop_code = " fp_pop();" if pops else ""
-            return [f"_fpu_cmp = (fp_top() < fp_st1()) ? -1 : (fp_top() > fp_st1()) ? 1 : 0;"
+            return [f"g_fp_cmp = (fp_top() < fp_st1()) ? -1 : (fp_top() > fp_st1()) ? 1 : 0;"
                     f"{pop_code} /* {m} */"]
         if m == "fnstsw":
-            return [f"/* fnstsw {insn.op_str} - store FPU status word */"]
+            # C3/C2/C0 occupy bits 14/10/8, which land in AH as 0x40/0x04/
+            # 0x01. The CRT tests AH to classify the preceding compare, so
+            # rebuild them from g_fp_cmp instead of dropping the store.
+            status = ("(uint16_t)(g_fp_cmp < 0 ? 0x0100u :"
+                      " g_fp_cmp > 0 ? 0x0000u : 0x4000u)")
+            if ops and ops[0].type == "mem":
+                return [f"MEM16({_fmt_mem(ops[0])}) = {status};"
+                        f" /* fnstsw {insn.op_str} */"]
+            if ops and ops[0].type == "reg":
+                return [_fmt_set_reg(ops[0].reg, status)
+                        + f" /* fnstsw {insn.op_str} */"]
+            return [f"/* fnstsw {insn.op_str} - no destination operand */"]
         if m == "fnstcw":
-            return [f"/* fnstcw {insn.op_str} - store FPU control word */"]
+            # The CRT reads the control word back to decide whether an
+            # exception is masked, so it must be stored, not dropped.
+            if ops and ops[0].type == "mem":
+                return [f"MEM16({_fmt_mem(ops[0])}) = g_fp_control_word;"
+                        f" /* fnstcw {insn.op_str} */"]
+            if ops and ops[0].type == "reg":
+                return [_fmt_set_reg(ops[0].reg, "g_fp_control_word")
+                        + f" /* fnstcw {insn.op_str} */"]
+            return [f"/* fnstcw {insn.op_str} - no destination operand */"]
         if m == "fldcw":
-            return [f"/* fldcw {insn.op_str} - load FPU control word */"]
+            if ops and ops[0].type == "mem":
+                return [f"g_fp_control_word = MEM16({_fmt_mem(ops[0])});"
+                        f" /* fldcw {insn.op_str} */"]
+            if ops and ops[0].type == "reg":
+                return [f"g_fp_control_word = (uint16_t)"
+                        f"{_fmt_operand_read(ops[0])};"
+                        f" /* fldcw {insn.op_str} */"]
+            return [f"/* fldcw {insn.op_str} - no source operand */"]
         if m == "fldz":
             return [f"fp_push(0.0); /* fldz */"]
         if m == "fld1":

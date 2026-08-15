@@ -113,6 +113,54 @@ class FpuLifterTest(unittest.TestCase):
         self.assertIn("#define SMEM64(addr)", runtime_types)
         self.assertIn("double g_fp_stack[8];", main)
         self.assertIn("uint32_t g_fp_top;", main)
+        self.assertIn("extern uint16_t g_fp_control_word;", runtime_types)
+        self.assertIn("#define PARITY8(value)", runtime_types)
+        self.assertIn("uint16_t g_fp_control_word", main)
+
+    def test_control_word_store_and_load_use_shared_state(self):
+        operand = Operand(type="mem", mem_base="ebp", mem_disp=0xFFFFFFFC,
+                          mem_size=2)
+        store = Instruction(0, 3, "fnstcw", "word ptr [ebp - 4]", "")
+        store.operands = [operand]
+        load = Instruction(0, 3, "fldcw", "word ptr [ebp - 4]", "")
+        load.operands = [operand]
+
+        self.assertEqual(
+            Lifter().lift_instruction(store),
+            ["MEM16(ebp + 0xFFFFFFFCu) = g_fp_control_word;"
+             " /* fnstcw word ptr [ebp - 4] */"],
+        )
+        self.assertEqual(
+            Lifter().lift_instruction(load),
+            ["g_fp_control_word = MEM16(ebp + 0xFFFFFFFCu);"
+             " /* fldcw word ptr [ebp - 4] */"],
+        )
+
+    def test_status_word_store_reports_the_compare_result(self):
+        instruction = Instruction(0, 2, "fnstsw", "ax", "dfe0")
+        instruction.operands = [Operand(type="reg", reg="ax")]
+
+        lifted = Lifter().lift_instruction(instruction)
+
+        self.assertEqual(len(lifted), 1)
+        # The compare can live in a different lifted body than the FNSTSW that
+        # reads it, so the result has to be shared state, not a function local.
+        self.assertIn("g_fp_cmp", lifted[0])
+        self.assertNotIn("_fpu_cmp", lifted[0])
+        self.assertIn("0x4000u", lifted[0])
+        self.assertNotIn("/* fnstsw ax - store FPU status word */", lifted[0])
+
+    def test_compare_writes_the_shared_result(self):
+        instruction = Instruction(0, 4, "fcomp", "qword ptr [ebp + 8]", "dc5d08")
+        instruction.operands = [
+            Operand(type="mem", mem_base="ebp", mem_disp=8, mem_size=8)
+        ]
+
+        lifted = Lifter().lift_instruction(instruction)
+
+        self.assertEqual(len(lifted), 1)
+        self.assertTrue(lifted[0].startswith("g_fp_cmp ="))
+        self.assertNotIn("_fpu_cmp", lifted[0])
 
 
 if __name__ == "__main__":

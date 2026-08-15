@@ -293,15 +293,6 @@ class FunctionTranslator:
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
 
-        # Add _fpu_cmp for FPU compare instructions (both old and new style)
-        has_fpu_cmp = any(insn.mnemonic in ("fcompi", "fcomip", "fucomi",
-                                             "fucompi", "fucomip", "fcomi",
-                                             "fcom", "fcomp", "fcompp",
-                                             "fucom", "fucomp", "fucompp")
-                          for insn in instructions)
-        if has_fpu_cmp:
-            lines.append(f"    int _fpu_cmp = 0; /* FPU compare result: -1/0/1 */")
-
         # SSE/MMX register declarations
         if used_xmm:
             xmm_regs = sorted([r for r in used_xmm if r.startswith("xmm")])
