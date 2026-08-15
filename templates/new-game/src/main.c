@@ -55,6 +55,8 @@
 extern uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern uint32_t g_ebx, g_esi, g_edi;
 extern uint32_t g_seh_ebp;
+double g_fp_stack[8];
+uint32_t g_fp_top;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* ── XBE Constants ─────────────────────────────────────────── */

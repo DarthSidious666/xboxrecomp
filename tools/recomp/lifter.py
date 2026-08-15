@@ -7,7 +7,7 @@ patterns like cmp+jcc) into C statements using the recomp_types.h macros.
 Register model:
   - eax, ebx, ecx, edx, esi, edi, ebp: uint32_t locals
   - esp: uint32_t local (stack pointer)
-  - FPU: double fp_stack[8] with fp_top index
+  - FPU: shared double g_fp_stack[8] with g_fp_top index
 
 Memory model:
   - MEM8/MEM16/MEM32 macros for memory access at flat addresses
@@ -92,7 +92,23 @@ def _mem_accessor(size):
 
 def _smem_accessor(size):
     """Return the signed MEM macro for a given operand size."""
-    return {1: "SMEM8", 2: "SMEM16", 4: "SMEM32"}.get(size, "SMEM32")
+    return {
+        1: "SMEM8", 2: "SMEM16", 4: "SMEM32", 8: "SMEM64",
+    }.get(size, "SMEM32")
+
+
+def _fmt_fpu_operand(op):
+    """Format an x87 memory or stack-register operand for reading."""
+    if op.type == "mem":
+        accessor = "MEMD" if op.mem_size == 8 else "MEMF"
+        return f"{accessor}({_fmt_mem(op)})"
+    if op.type == "reg":
+        name = op.reg or ""
+        if name == "st":
+            return "fp_st(0)"
+        if name.startswith("st(") and name.endswith(")"):
+            return f"fp_st({name[3:-1]})"
+    return None
 
 
 def _fmt_mem(op):
@@ -1555,15 +1571,18 @@ class Lifter:
                     elif ops[0].mem_size == 8:
                         return [f"fp_push(MEMD({_fmt_mem(ops[0])})); /* fld double */"]
                     return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld */"]
+                source = _fmt_fpu_operand(ops[0])
+                if source is not None:
+                    return [f"fp_push({source}); /* fld {insn.op_str} */"]
             return [f"/* fld {insn.op_str} */"]
 
         if m in ("fst", "fstp"):
-            pop = "p" if m == "fstp" else ""
             if len(ops) >= 1 and ops[0].type == "mem":
+                pop = " fp_pop();" if m == "fstp" else ""
                 if ops[0].mem_size == 4:
-                    return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top(); fp_pop{pop}(); /* {m} */"]
+                    return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top();{pop} /* {m} */"]
                 elif ops[0].mem_size == 8:
-                    return [f"MEMD({_fmt_mem(ops[0])}) = fp_top(); fp_pop{pop}(); /* {m} */"]
+                    return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{pop} /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m == "fild":
@@ -1574,23 +1593,44 @@ class Lifter:
 
         if m in ("fist", "fistp"):
             if len(ops) >= 1 and ops[0].type == "mem":
-                mem_acc = _mem_accessor(ops[0].mem_size)
-                return [f"{mem_acc}({_fmt_mem(ops[0])}) = (int32_t)fp_top(); /* {m} */"]
+                size = ops[0].mem_size
+                mem_acc = _smem_accessor(size)
+                int_type = {2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
+                    size, "int32_t")
+                pop = " fp_pop();" if m == "fistp" else ""
+                return [f"{mem_acc}({_fmt_mem(ops[0])}) = "
+                        f"({int_type})llrint(fp_top());{pop} /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m == "fadd":
+            if ops:
+                source = _fmt_fpu_operand(ops[-1])
+                if source is not None:
+                    return [f"fp_top() += {source}; /* fadd {insn.op_str} */"]
             return [f"fp_st1() += fp_top(); fp_pop(); /* fadd */"]
         if m == "faddp":
             return [f"fp_st1() += fp_top(); fp_pop(); /* faddp */"]
         if m == "fsub":
+            if ops:
+                source = _fmt_fpu_operand(ops[-1])
+                if source is not None:
+                    return [f"fp_top() -= {source}; /* fsub {insn.op_str} */"]
             return [f"fp_st1() -= fp_top(); fp_pop(); /* fsub */"]
         if m == "fsubp":
             return [f"fp_st1() -= fp_top(); fp_pop(); /* fsubp */"]
         if m == "fmul":
+            if ops:
+                source = _fmt_fpu_operand(ops[-1])
+                if source is not None:
+                    return [f"fp_top() *= {source}; /* fmul {insn.op_str} */"]
             return [f"fp_st1() *= fp_top(); fp_pop(); /* fmul */"]
         if m == "fmulp":
             return [f"fp_st1() *= fp_top(); fp_pop(); /* fmulp */"]
         if m == "fdiv":
+            if ops:
+                source = _fmt_fpu_operand(ops[-1])
+                if source is not None:
+                    return [f"fp_top() /= {source}; /* fdiv {insn.op_str} */"]
             return [f"fp_st1() /= fp_top(); fp_pop(); /* fdiv */"]
         if m == "fdivp":
             return [f"fp_st1() /= fp_top(); fp_pop(); /* fdivp */"]
@@ -1604,7 +1644,11 @@ class Lifter:
             return [f"{{ double _t = fp_top(); fp_top() = fp_st1(); fp_st1() = _t; }} /* fxch */"]
         if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp"):
             # Set _fpu_cmp for the fcomp/fnstsw/sahf pattern
-            return [f"_fpu_cmp = (fp_top() < fp_st1()) ? -1 : (fp_top() > fp_st1()) ? 1 : 0;"
+            source = _fmt_fpu_operand(ops[-1]) if ops else "fp_st1()"
+            pops = 2 if m.endswith("pp") else 1 if m.endswith("p") else 0
+            pop_code = " fp_pop();" * pops
+            return [f"_fpu_cmp = (fp_top() < {source}) ? -1 : "
+                    f"(fp_top() > {source}) ? 1 : 0;{pop_code}"
                     f" /* {m} {insn.op_str} */"]
         if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi"):
             # These set EFLAGS directly (CF, ZF, PF) from FPU comparison

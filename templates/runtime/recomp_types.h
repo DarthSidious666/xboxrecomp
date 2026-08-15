@@ -100,6 +100,8 @@ extern uint32_t g_ebx, g_esi, g_edi;
  * Similarly, __SEH_epilog reads g_seh_ebp at entry and writes it at exit.
  */
 extern uint32_t g_seh_ebp;
+extern double g_fp_stack[8];
+extern uint32_t g_fp_top;
 
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
@@ -146,6 +148,7 @@ void recomp_icall_fail_log(uint32_t va);
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
 #define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))
 #define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
+#define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
 
 /** Float/double memory access. */
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
