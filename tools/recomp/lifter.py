@@ -336,7 +336,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── comiss/ucomiss: float comparison, sets CF/ZF/PF ──
     if flag_setter in ("comiss", "comisd", "ucomiss", "ucomisd"):
         def _sse_op(op):
-            if op.type == "reg":
+            if op.type == "reg" and op.reg and op.reg.startswith("xmm"):
+                return f"{op.reg}.f[0]"
+            elif op.type == "reg":
                 return op.reg
             elif op.type == "mem":
                 if op.mem_size == 8:
@@ -914,6 +916,7 @@ class Lifter:
 
         # ── SSE (scalar float) ──
         if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps",
+                 "movlhps", "movhlps", "movapd", "movupd",
                  "addss", "subss", "mulss", "divss", "sqrtss",
                  "addsd", "subsd", "mulsd", "divsd", "sqrtsd",
                  "minss", "maxss", "minsd", "maxsd",
@@ -921,7 +924,7 @@ class Lifter:
                  "cvtsi2ss", "cvtss2si", "cvttss2si",
                  "cvtsi2sd", "cvtsd2si", "cvttsd2si",
                  "cvtss2sd", "cvtsd2ss",
-                 "xorps", "xorpd", "andps", "orps",
+                 "xorps", "xorpd", "andps", "orps", "andnps",
                  "movd", "movq",
                  "shufps", "unpcklps", "unpckhps",
                  "addps", "subps", "mulps", "divps",
@@ -1398,10 +1401,21 @@ class Lifter:
         if nops < 1:
             return [f"/* {m}: no operands */"]
 
-        # SSE register names (xmm0-xmm7) are used as float locals
+        def _is_xmm(op):
+            return op.type == "reg" and op.reg and op.reg.startswith("xmm")
+
+        def _is_mmx(op):
+            return (op.type == "reg" and op.reg and op.reg.startswith("mm")
+                    and not op.reg.startswith("xmm"))
+
+        # ── Scalar (lane 0) access ──
+        # movss/addss/... genuinely operate on one 32-bit value, so they read
+        # and write lane 0 explicitly rather than the whole register.
         def _sse_read(op):
-            if op.type == "reg":
-                return op.reg  # xmm0, xmm1, etc.
+            if _is_xmm(op):
+                return f"{op.reg}.f[0]"
+            elif op.type == "reg":
+                return op.reg
             elif op.type == "mem":
                 if op.mem_size == 8:
                     return f"MEMD({_fmt_mem(op)})"
@@ -1411,7 +1425,9 @@ class Lifter:
             return f"/* sse_read? */"
 
         def _sse_write(op, val):
-            if op.type == "reg":
+            if _is_xmm(op):
+                return f"{op.reg}.f[0] = {val};"
+            elif op.type == "reg":
                 return f"{op.reg} = {val};"
             elif op.type == "mem":
                 if op.mem_size == 8:
@@ -1419,20 +1435,101 @@ class Lifter:
                 return f"MEMF({_fmt_mem(op)}) = {val};"
             return f"/* sse_write? */;"
 
+        # ── Packed (128-bit) access ──
+        # A whole-register read yields a RecompXmm value; a whole-register
+        # write is a statement. Memory goes through the guest translation.
+        def _packed_read(op):
+            if _is_xmm(op):
+                return op.reg
+            if op.type == "mem":
+                return f"XMM_MEM({_fmt_mem(op)})"
+            return None
+
+        def _packed_write(op, val):
+            if _is_xmm(op):
+                return f"{op.reg} = {val};"
+            if op.type == "mem":
+                return f"XMM_STORE({_fmt_mem(op)}, {val});"
+            return None
+
+        def _packed_binary(helper):
+            """dst = helper(dst, src) for a two-operand packed op."""
+            if nops < 2:
+                return None
+            a = _packed_read(ops[0])
+            b = _packed_read(ops[1])
+            if a is None or b is None:
+                return None
+            written = _packed_write(ops[0], f"{helper}({a}, {b})")
+            if written is None:
+                return None
+            return [written + f" /* {m} */"]
+
         # ── Moves ──
-        if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps"):
+        # movaps/movups move all 16 bytes. Treating them like movss was the
+        # defect that left every packed value 4 bytes wide.
+        if m in ("movaps", "movups", "movapd", "movupd"):
             if nops >= 2:
+                src = _packed_read(ops[1])
+                if src is not None:
+                    written = _packed_write(ops[0], src)
+                    if written is not None:
+                        return [written + f" /* {m} */"]
+            return [f"/* {m} {insn.op_str} */"]
+
+        # movlps/movhps transfer 8 bytes into or out of one half.
+        if m in ("movlps", "movhps"):
+            half = "LOW" if m == "movlps" else "HIGH"
+            if nops >= 2:
+                if _is_xmm(ops[0]) and ops[1].type == "mem":
+                    return [f"XMM_LOAD_{half}({ops[0].reg}, "
+                            f"{_fmt_mem(ops[1])}); /* {m} */"]
+                if ops[0].type == "mem" and _is_xmm(ops[1]):
+                    return [f"XMM_STORE_{half}({_fmt_mem(ops[0])}, "
+                            f"{ops[1].reg}); /* {m} */"]
+            return [f"/* {m} {insn.op_str} */"]
+
+        if m in ("movlhps", "movhlps"):
+            helper = ("XMM_MOVE_LOW_TO_HIGH" if m == "movlhps"
+                      else "XMM_MOVE_HIGH_TO_LOW")
+            lifted = _packed_binary(helper)
+            if lifted is not None:
+                return lifted
+            return [f"/* {m} {insn.op_str} */"]
+
+        # movss/movsd are scalar. Loading from memory zeroes the upper lanes;
+        # a register-to-register move leaves them untouched.
+        if m in ("movss", "movsd"):
+            if nops >= 2:
+                scalar = ("XMM_SCALAR" if m == "movss"
+                          else "XMM_SCALAR_DOUBLE")
+                if _is_xmm(ops[0]) and ops[1].type == "mem":
+                    return [f"{ops[0].reg} = "
+                            f"{scalar}({_sse_read(ops[1])}); /* {m} */"]
                 src = _sse_read(ops[1])
                 return [_sse_write(ops[0], src) + f" /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
+        # movd moves 32 bits without converting. Into an XMM register it also
+        # zeroes the upper lanes. The generated code redefines memcpy as a
+        # guest-to-guest copy, so the bits are moved through the union instead
+        # of taking the address of a host local.
         if m == "movd":
             if nops >= 2:
-                src = _fmt_operand_read(ops[1]) if ops[1].type != "reg" or not ops[1].reg.startswith("xmm") else _sse_read(ops[1])
-                if ops[0].type == "reg" and ops[0].reg.startswith("xmm"):
-                    return [f"memcpy(&{ops[0].reg}, &{src}, 4); /* movd to xmm */"]
-                else:
-                    return [f"{_fmt_operand_write(ops[0], src)} /* movd */"]
+                if _is_xmm(ops[0]):
+                    if _is_xmm(ops[1]):
+                        src = f"{ops[1].reg}.u[0]"
+                    elif _is_mmx(ops[1]):
+                        src = f"(uint32_t){ops[1].reg}"
+                    else:
+                        src = _fmt_operand_read(ops[1])
+                    return [f"{ops[0].reg} = XMM_SCALAR_BITS({src});"
+                            " /* movd to xmm */"]
+                if _is_xmm(ops[1]):
+                    return [f"{_fmt_operand_write(ops[0], ops[1].reg + '.u[0]')}"
+                            " /* movd */"]
+                src = _fmt_operand_read(ops[1])
+                return [f"{_fmt_operand_write(ops[0], src)} /* movd */"]
             return [f"/* movd {insn.op_str} */"]
 
         # ── Arithmetic ──
@@ -1461,11 +1558,15 @@ class Lifter:
                 return [_sse_write(ops[0], f"({a} > {b} ? {a} : {b})") + f" /* {m} */"]
 
         # ── Packed arithmetic ──
+        # These used to emit a bare comment, so a matrix concatenation built
+        # from shufps + mulps + addps executed as nothing at all.
         if m in ("addps", "subps", "mulps", "divps"):
-            if nops >= 2:
-                c_op = {"addps": "+", "subps": "-", "mulps": "*", "divps": "/"}[m]
-                d, s = _sse_read(ops[0]), _sse_read(ops[1])
-                return [f"/* {m}: {d} {c_op}= {s} (packed 4xfloat) */"]
+            helper = {"addps": "XMM_ADD", "subps": "XMM_SUB",
+                      "mulps": "XMM_MUL", "divps": "XMM_DIV"}[m]
+            lifted = _packed_binary(helper)
+            if lifted is not None:
+                return lifted
+            return [f"/* {m} {insn.op_str} */"]
 
         # ── Conversions ──
         if m == "cvtsi2ss":
@@ -1495,19 +1596,31 @@ class Lifter:
                 return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} - sets EFLAGS */"]
 
         # ── Bitwise ──
+        # Done on the integer lanes: these carry sign-mask and select idioms
+        # (fabs, negate, blend) that are meaningless as float arithmetic.
         if m in ("xorps", "xorpd"):
-            if nops >= 2 and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-                return [_sse_write(ops[0], "0.0f") + f" /* {m} self = zero */"]
-            if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} */"]
-        if m in ("andps", "orps"):
-            if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} */"]
+            if (nops >= 2 and _is_xmm(ops[0]) and _is_xmm(ops[1])
+                    and ops[0].reg == ops[1].reg):
+                return [f"{ops[0].reg} = XMM_ZERO(); /* {m} self = zero */"]
+            lifted = _packed_binary("XMM_XOR")
+            if lifted is not None:
+                return lifted
+            return [f"/* {m} {insn.op_str} */"]
+        if m in ("andps", "orps", "andnps"):
+            helper = {"andps": "XMM_AND", "orps": "XMM_OR",
+                      "andnps": "XMM_ANDN"}[m]
+            lifted = _packed_binary(helper)
+            if lifted is not None:
+                return lifted
+            return [f"/* {m} {insn.op_str} */"]
 
         # ── Packed min/max ──
         if m in ("minps", "maxps"):
-            if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} (packed 4xfloat) */"]
+            helper = "XMM_MIN" if m == "minps" else "XMM_MAX"
+            lifted = _packed_binary(helper)
+            if lifted is not None:
+                return lifted
+            return [f"/* {m} {insn.op_str} */"]
 
         # ── Reciprocal / rsqrt ──
         if m == "rsqrtss":
@@ -1541,13 +1654,22 @@ class Lifter:
 
         # ── Packed comparison ──
         if m in ("cmpneqps", "cmpeqps", "cmpltps", "cmpleps"):
-            if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} (packed compare) */"]
+            helper = {"cmpeqps": "XMM_CMP_EQ", "cmpltps": "XMM_CMP_LT",
+                      "cmpleps": "XMM_CMP_LE", "cmpneqps": "XMM_CMP_NEQ"}[m]
+            lifted = _packed_binary(helper)
+            if lifted is not None:
+                return lifted
+            return [f"/* {m} {insn.op_str} */"]
 
         # ── Move mask ──
+        # This feeds branches, so a hardcoded 0 silently picked one side.
         if m == "movmskps":
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"0 /* movmskps {_sse_read(ops[1])} */")]
+                src = _packed_read(ops[1])
+                if src is not None:
+                    return [_fmt_operand_write(ops[0], f"XMM_MOVEMASK({src})")
+                            + f" /* {m} */"]
+            return [f"/* {m} {insn.op_str} */"]
 
         # ── MMX / integer SIMD ──
         if m in ("pand", "pandn", "por", "pxor", "pcmpgtd"):
@@ -1555,7 +1677,24 @@ class Lifter:
                 return [f"/* {m} {insn.op_str} (MMX/SIMD integer) */"]
 
         # ── Shuffle/unpack ──
-        if m in ("shufps", "unpcklps", "unpckhps"):
+        # shufps is the broadcast in every matrix concatenation.
+        if m == "shufps":
+            if nops >= 3 and ops[2].type == "imm":
+                a = _packed_read(ops[0])
+                b = _packed_read(ops[1])
+                if a is not None and b is not None:
+                    written = _packed_write(
+                        ops[0],
+                        f"XMM_SHUFFLE({a}, {b}, {_fmt_imm(ops[2].imm)})")
+                    if written is not None:
+                        return [written + f" /* {m} */"]
+            return [f"/* {m} {insn.op_str} */"]
+        if m in ("unpcklps", "unpckhps"):
+            helper = ("XMM_UNPACK_LOW" if m == "unpcklps"
+                      else "XMM_UNPACK_HIGH")
+            lifted = _packed_binary(helper)
+            if lifted is not None:
+                return lifted
             return [f"/* {m} {insn.op_str} */"]
 
         return [f"/* SSE: {m} {insn.op_str} */"]
@@ -1638,12 +1777,91 @@ class Lifter:
             return [f"fp_st1() /= fp_top(); fp_pop(); /* fdiv */"]
         if m == "fdivp":
             return [f"fp_st1() /= fp_top(); fp_pop(); /* fdivp */"]
+        # Reverse forms compute source-minus-destination, not the other way
+        # round. There was no case for them, so they fell through to the
+        # bare-comment catch-all below and executed as nothing: fdivr against
+        # the constant 1.0 is the reciprocal inside the vector-normalize
+        # helper, so dropping it turned "v / len" into "v * len".
+        if m == "fsubr":
+            if ops:
+                source = _fmt_fpu_operand(ops[-1])
+                if source is not None:
+                    return [f"fp_top() = {source} - fp_top();"
+                            f" /* fsubr {insn.op_str} */"]
+            return [f"fp_st1() = fp_top() - fp_st1(); fp_pop(); /* fsubr */"]
+        if m == "fsubrp":
+            return [f"fp_st1() = fp_top() - fp_st1(); fp_pop(); /* fsubrp */"]
+        if m == "fdivr":
+            if ops:
+                source = _fmt_fpu_operand(ops[-1])
+                if source is not None:
+                    return [f"fp_top() = {source} / fp_top();"
+                            f" /* fdivr {insn.op_str} */"]
+            return [f"fp_st1() = fp_top() / fp_st1(); fp_pop(); /* fdivr */"]
+        if m == "fdivrp":
+            return [f"fp_st1() = fp_top() / fp_st1(); fp_pop(); /* fdivrp */"]
+        # Integer-memory arithmetic: the operand is a signed integer in
+        # memory, converted to double before the operation.
+        if m in ("fiadd", "fisub", "fisubr", "fimul", "fidiv", "fidivr"):
+            if ops and ops[0].type == "mem":
+                smem = _smem_accessor(ops[0].mem_size)
+                source = f"(double){smem}({_fmt_mem(ops[0])})"
+                op_text = {
+                    "fiadd": f"fp_top() += {source};",
+                    "fisub": f"fp_top() -= {source};",
+                    "fisubr": f"fp_top() = {source} - fp_top();",
+                    "fimul": f"fp_top() *= {source};",
+                    "fidiv": f"fp_top() /= {source};",
+                    "fidivr": f"fp_top() = {source} / fp_top();",
+                }[m]
+                return [op_text + f" /* {m} {insn.op_str} */"]
+            return [f"/* {m} {insn.op_str} - no memory operand */"]
         if m == "fchs":
             return [f"fp_top() = -fp_top(); /* fchs */"]
         if m == "fabs":
             return [f"fp_top() = fabs(fp_top()); /* fabs */"]
         if m == "fsqrt":
             return [f"fp_top() = sqrt(fp_top()); /* fsqrt */"]
+        # Transcendentals. fpatan is the core of the atan2 helper the
+        # view-matrix path calls; dropping it left an unbalanced stack value.
+        if m == "fpatan":
+            return [f"fp_st1() = atan2(fp_st1(), fp_top()); fp_pop();"
+                    f" /* fpatan */"]
+        if m == "fsin":
+            return [f"fp_top() = sin(fp_top()); /* fsin */"]
+        if m == "fcos":
+            return [f"fp_top() = cos(fp_top()); /* fcos */"]
+        if m == "fsincos":
+            return [f"{{ double _s = sin(fp_top()); "
+                    f"fp_top() = cos(fp_top()); fp_push(_s); }} /* fsincos */"]
+        if m == "fptan":
+            return [f"fp_top() = tan(fp_top()); fp_push(1.0); /* fptan */"]
+        if m == "f2xm1":
+            return [f"fp_top() = pow(2.0, fp_top()) - 1.0; /* f2xm1 */"]
+        if m == "fyl2x":
+            return [f"fp_st1() = fp_st1() * log2(fp_top()); fp_pop();"
+                    f" /* fyl2x */"]
+        if m == "fyl2xp1":
+            return [f"fp_st1() = fp_st1() * log2(fp_top() + 1.0); fp_pop();"
+                    f" /* fyl2xp1 */"]
+        if m == "fscale":
+            return [f"fp_top() = fp_top() * pow(2.0, trunc(fp_st1()));"
+                    f" /* fscale */"]
+        if m == "frndint":
+            return [f"fp_top() = rint(fp_top()); /* frndint */"]
+        if m == "fldpi":
+            return [f"fp_push(3.14159265358979323846); /* fldpi */"]
+        if m == "fldl2e":
+            return [f"fp_push(1.44269504088896340736); /* fldl2e */"]
+        if m == "fldl2t":
+            return [f"fp_push(3.32192809488736234787); /* fldl2t */"]
+        if m == "fldlg2":
+            return [f"fp_push(0.30102999566398119521); /* fldlg2 */"]
+        if m == "fldln2":
+            return [f"fp_push(0.69314718055994530942); /* fldln2 */"]
+        if m == "ftst":
+            return [f"g_fp_cmp = (fp_top() < 0.0) ? -1 : "
+                    f"(fp_top() > 0.0) ? 1 : 0; /* ftst */"]
         if m == "fxch":
             return [f"{{ double _t = fp_top(); fp_top() = fp_st1(); fp_st1() = _t; }} /* fxch */"]
         if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp"):
