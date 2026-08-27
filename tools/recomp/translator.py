@@ -307,8 +307,11 @@ class FunctionTranslator:
             xmm_regs = sorted([r for r in used_xmm if r.startswith("xmm")])
             mmx_regs = sorted([r for r in used_xmm if r.startswith("mm")
                                and not r.startswith("xmm")])
-            if xmm_regs:
-                lines.append(f"    float {', '.join(xmm_regs)};")
+            # XMM is architectural state and is declared globally by the
+            # runtime, exactly like the GPRs and the x87 stack. Declaring it
+            # here would shadow that global with a fresh zeroed local, so a
+            # value produced in one block and read in the next - a return
+            # value in xmm0, or a spill straddling a branch - would be lost.
             if mmx_regs:
                 lines.append(f"    uint64_t {', '.join(mmx_regs)};")
 
