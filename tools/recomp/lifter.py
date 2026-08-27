@@ -1199,7 +1199,17 @@ class Lifter:
         elif len(ops) >= 1:
             target = _fmt_operand_read(ops[0])
             # Mark indirect calls for post-processing by _fixup_icall_esp_save
-            return [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
+            #
+            # The target is read into a local BEFORE the return-address push.
+            # On real x86 the memory operand is computed before the push, so
+            # emitting the push first shifts esp by four and every esp-relative
+            # target -- `call dword ptr [esp+8]`, the shape MSVC gives a
+            # callback invoked through a stack argument -- is read four bytes
+            # low and dispatches through the wrong slot.
+            return [f"{{ uint32_t _icall_target = {target}; "
+                    "PUSH32(esp, 0); "
+                    "RECOMP_ICALL_SAFE(_icall_target, _icall_esp); }"
+                    " /* indirect call */"]
         return ["/* call: no target */"]
 
     def _lift_ret(self, insn, ops):
