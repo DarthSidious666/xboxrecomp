@@ -95,9 +95,28 @@ MIN_CC_RUN = 1
 # Function Detection Confidence Scores
 # ============================================================
 
+# Alignment required before decode_at will manufacture an instruction at a
+# direct call target the linear sweep stepped over (see functions.py
+# _pass_call_targets, engine.py decode_at).
+#
+# Only applies to targets with no decoded instruction. Realigning there is
+# creating evidence rather than reading it, so it demands corroboration; a
+# target that already decoded is accepted as before, whatever its alignment.
+#
+# 16 because that is what MSVC emits for a function start, and because two
+# independent measurements landed on it: seeding unaligned indirect-branch
+# targets made Halo 2276 crash earlier (see tools/recomp/icall_feedback.py
+# cmd_seeds), and on Steel Battalion LOC only 61 of 103 realigned targets were
+# 16-aligned while the rest carried the same signature as that garbage --
+# misdecoded call operands inside data, not functions.
+#
+# Set to 1 to disable the check.
+CALL_TARGET_REALIGN_ALIGNMENT = 16
+
 CONFIDENCE_KNOWN = 1.0       # Entry point, known addresses
 CONFIDENCE_PROLOGUE = 0.95   # Standard prologue pattern
 CONFIDENCE_CALL_TARGET = 0.90  # Destination of a call instruction
+CONFIDENCE_TAIL_JUMP = 0.88   # Target of a jmp that leaves its function
 CONFIDENCE_CC_BOUNDARY = 0.85  # After CC padding run following ret
 
 # ============================================================

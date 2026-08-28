@@ -360,6 +360,135 @@ HRESULT d3d8_CreateIndexBufferImpl(UINT Length, DWORD Usage, D3DFORMAT Format, I
 }
 
 /* ================================================================
+ * Surface Implementation
+ *
+ * D3D8Surface was declared in d3d8_internal.h but never built, so both
+ * GetSurfaceLevel and GetBackBuffer returned E_NOTIMPL. Halo checks those:
+ * rasterizer_xbox's texture setup calls rasterizer_error on the failure and
+ * eventually gives up and calls BootToDash, so startup ends before the main
+ * loop.
+ *
+ * A surface here is a view onto a level of an existing texture (or onto a
+ * back buffer) rather than an independent resource -- it borrows the parent's
+ * ID3D11Texture2D and system-memory pointer and does not own them.
+ *
+ * ponytail: no per-level offsetting into sys_mem, so LockRect on level > 0
+ * hands back level 0's bits. Halo locks level 0. Fix when a mip lock appears.
+ * ================================================================ */
+
+static D3D8Surface *surf_from_iface(IDirect3DSurface8 *iface)
+{
+    return (D3D8Surface *)iface;
+}
+
+static HRESULT __stdcall surf_QueryInterface(IDirect3DSurface8 *self,
+                                             const IID *riid, void **ppv)
+{
+    (void)self; (void)riid; (void)ppv;
+    return E_NOINTERFACE;
+}
+
+static ULONG __stdcall surf_AddRef(IDirect3DSurface8 *self)
+{
+    D3D8Surface *s = surf_from_iface(self);
+    return (ULONG)InterlockedIncrement(&s->ref_count);
+}
+
+static ULONG __stdcall surf_Release(IDirect3DSurface8 *self)
+{
+    D3D8Surface *s = surf_from_iface(self);
+    LONG n = InterlockedDecrement(&s->ref_count);
+
+    if (n == 0) {
+        /* The D3D11 texture belongs to the parent resource, not to us. */
+        free(s);
+    }
+    return (ULONG)(n < 0 ? 0 : n);
+}
+
+static HRESULT __stdcall surf_GetDevice(IDirect3DSurface8 *self,
+                                        IDirect3DDevice8 **ppDevice)
+{
+    /* ponytail: the device lives in d3d8_device.c's file-static state and is
+     * not reachable from here. Nothing calls this during bring-up; wire it up
+     * by exporting an accessor if something starts to. */
+    (void)self;
+    if (ppDevice) *ppDevice = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT __stdcall surf_GetDesc(IDirect3DSurface8 *self,
+                                      D3DSURFACE_DESC *pDesc)
+{
+    D3D8Surface *s = surf_from_iface(self);
+
+    if (!pDesc) return E_INVALIDARG;
+    memset(pDesc, 0, sizeof(*pDesc));
+    pDesc->Format = s->format;
+    pDesc->Width  = s->width;
+    pDesc->Height = s->height;
+    pDesc->Pool   = D3DPOOL_DEFAULT;
+    return S_OK;
+}
+
+static HRESULT __stdcall surf_LockRect(IDirect3DSurface8 *self,
+                                       D3DLOCKED_RECT *pLockedRect,
+                                       const RECT *pRect, DWORD Flags)
+{
+    D3D8Surface *s = surf_from_iface(self);
+
+    (void)pRect; (void)Flags;
+    if (!pLockedRect) return E_INVALIDARG;
+    if (!s->sys_mem) return E_FAIL;
+
+    pLockedRect->Pitch = (INT)s->pitch;
+    pLockedRect->pBits = s->sys_mem;
+    return S_OK;
+}
+
+static HRESULT __stdcall surf_UnlockRect(IDirect3DSurface8 *self)
+{
+    D3D8Surface *s = surf_from_iface(self);
+
+    if (s->parent_texture) {
+        s->parent_texture->dirty = TRUE;
+    }
+    return S_OK;
+}
+
+static const IDirect3DSurface8Vtbl g_surface_vtbl = {
+    surf_QueryInterface, surf_AddRef, surf_Release,
+    surf_GetDevice, surf_GetDesc, surf_LockRect, surf_UnlockRect,
+};
+
+static D3D8Surface *surface_create(ID3D11Texture2D *d3d11_texture,
+                                   UINT width, UINT height, D3DFORMAT format,
+                                   BYTE *sys_mem, UINT pitch,
+                                   D3D8Texture *parent)
+{
+    D3D8Surface *s = (D3D8Surface *)calloc(1, sizeof(*s));
+
+    if (!s) return NULL;
+    s->iface.lpVtbl    = &g_surface_vtbl;
+    s->ref_count       = 1;
+    s->d3d11_texture   = d3d11_texture;
+    s->width           = width;
+    s->height          = height;
+    s->format          = format;
+    s->sys_mem         = sys_mem;
+    s->pitch           = pitch;
+    s->parent_texture  = parent;
+    return s;
+}
+
+IDirect3DSurface8 *xbox_d3d8_surface_wrap(ID3D11Texture2D *tex, UINT w, UINT h,
+                                          D3DFORMAT fmt)
+{
+    D3D8Surface *s = surface_create(tex, w, h, fmt, NULL, 0, NULL);
+    return s ? &s->iface : NULL;
+}
+
+/* ================================================================
  * Texture Implementation
  * ================================================================ */
 
@@ -424,8 +553,24 @@ static HRESULT __stdcall tex_GetLevelDesc(IDirect3DTexture8 *self, UINT Level, D
 
 static HRESULT __stdcall tex_GetSurfaceLevel(IDirect3DTexture8 *self, UINT Level, IDirect3DSurface8 **ppSurface)
 {
-    (void)self; (void)Level; (void)ppSurface;
-    return E_NOTIMPL;
+    D3D8Texture *tex = tex_from_iface(self);
+    D3D8Surface *surf;
+    UINT w, h;
+
+    if (!ppSurface) return E_INVALIDARG;
+    *ppSurface = NULL;
+    if (Level >= tex->levels) return E_INVALIDARG;
+
+    w = tex->width  >> Level; if (w < 1) w = 1;
+    h = tex->height >> Level; if (h < 1) h = 1;
+
+    surf = surface_create(tex->d3d11_texture, w, h, tex->d3d8_format,
+                          Level == 0 ? tex->sys_mem : NULL,
+                          Level == 0 ? tex->pitch : 0, tex);
+    if (!surf) return E_OUTOFMEMORY;
+
+    *ppSurface = &surf->iface;
+    return S_OK;
 }
 
 static HRESULT __stdcall tex_LockRect(IDirect3DTexture8 *self, UINT Level, D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD Flags)

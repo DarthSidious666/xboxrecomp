@@ -27,7 +27,7 @@ class FrameBridgeLifterTest(unittest.TestCase):
         self.assertIn("uint32_t _icall_target = MEM32(esp + 0xC)", lifted[0])
         self.assertLess(
             lifted[0].index("uint32_t _icall_target"),
-            lifted[0].index("PUSH32(esp, 0)"))
+            lifted[0].index("PUSH32(esp,"))
         self.assertIn(
             "RECOMP_ICALL_SAFE(_icall_target, _icall_esp)", lifted[0])
 

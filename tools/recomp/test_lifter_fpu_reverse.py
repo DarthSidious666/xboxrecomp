@@ -46,16 +46,16 @@ class FpuReverseFormTest(unittest.TestCase):
 
     def test_forward_forms_keep_their_original_operand_order(self):
         """The reverse cases must not disturb the plain ones."""
-        self.assertIn("fp_top() /= MEMF(eax);",
+        self.assertIn("fp_top() = fp_top() / MEMF(eax);",
                       _lift("fdiv", "dword ptr [eax]", [_mem(base="eax")])[0])
-        self.assertIn("fp_top() -= MEMF(eax);",
+        self.assertIn("fp_top() = fp_top() - MEMF(eax);",
                       _lift("fsub", "dword ptr [eax]", [_mem(base="eax")])[0])
 
     def test_integer_memory_operands_are_read_as_signed_integers(self):
         lifted = _lift("fidiv", "dword ptr [esp + 8]",
                        [_mem(base="esp", disp=8)])
 
-        self.assertIn("fp_top() /= (double)SMEM32(esp + 8);", lifted[0])
+        self.assertIn("fp_top() = fp_top() / (double)SMEM32(esp + 8);", lifted[0])
 
         word = _lift("fisubr", "word ptr [ebx + 0xbc]",
                      [_mem(base="ebx", disp=0xBC, size=2)])

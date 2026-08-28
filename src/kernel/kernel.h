@@ -373,6 +373,16 @@ typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
 #define NonPagedPool    0
 #define PagedPool       1
 
+/* Contiguous / physical memory window. Mapped by xbox_MemoryLayoutInit;
+ * MmAllocateContiguousMemory hands back addresses inside it, and
+ * MmClaimGpuInstanceMemory reports GPU instance memory at its top. Shared so
+ * the layout and the bridges cannot disagree about where it is. */
+#define XBOX_CONTIG_BASE 0x80000000u
+#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
+
+/* Default GPU instance size, used when a caller asks to claim everything. */
+#define XBOX_GPU_INSTANCE_DEFAULT (128u * 1024u)
+
 /* File access masks */
 #define XBOX_FILE_READ_DATA         0x0001
 #define XBOX_FILE_WRITE_DATA        0x0002
@@ -476,6 +486,25 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
+
+/**
+ * Per-title kernel ordinal remap.
+ *
+ * The bridge routes ordinals with one hardcoded table -- the ordinal ABI of the
+ * XDK it was written against (Halo's 3911 / Crimson's 5659). A title built with
+ * a different XDK numbers the same kernel functions differently: Burnout 3's
+ * XDK 5849 has HalRequestSoftwareInterrupt at 49 where the older XDKs have
+ * HalReturnToFirmware. Without this, swapping such a title onto the shared kernel
+ * misroutes it (Burnout 3 exited via HalReturnToFirmware during engine setup).
+ *
+ * `map[title_ordinal] = canonical_ordinal` translates a title's ordinals into
+ * the kernel's canonical space before every routing decision. An entry of 0
+ * (or a title_ordinal past `count`) means identity -- no title needs a real
+ * ordinal 0. Call BEFORE xbox_kernel_bridge_init. A title whose XDK already
+ * matches the kernel calls nothing and gets identity, so existing titles are
+ * unaffected. Generate the map with tools/kernel_audit/gen_ordinal_remap.py.
+ */
+void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
 
 /* ============================================================================
  * Path Translation (kernel_path.c)
@@ -913,19 +942,29 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define SMC_CMD_LED_STATES      0x08    /* LED states */
 #define SMC_CMD_SCRATCH         0x1B    /* Scratch register */
 
-/* ---- EEPROM non-volatile setting indices ---- */
-#define XC_TIMEZONE_BIAS           0x01
-#define XC_TZ_STD_NAME            0x02
-#define XC_TZ_STD_DATE           0x03
-#define XC_TZ_STD_BIAS           0x04
-#define XC_TZ_DLT_NAME           0x05
-#define XC_TZ_DLT_DATE           0x06
-#define XC_TZ_DLT_BIAS           0x07
-#define XC_LANGUAGE               0x08
-#define XC_VIDEO                  0x09
-#define XC_AUDIO                  0x0A
-#define XC_PARENTAL_CONTROL       0x0B
-#define XC_PARENTAL_PASSWORD      0x0C
+/* ---- EEPROM non-volatile setting indices ----
+ *
+ * XC_VALUE_INDEX, as the kernel numbers them. The block from TIMEZONE_BIAS
+ * through the parental-control entries used to be listed one higher than it
+ * actually is, while ONLINE_IP_ADDRESS onward were already right - so a title
+ * asking for 0x0A (parental control: games) was answered with XC_AUDIO's
+ * flags. Halo compares its XBE certificate's GameRatings against that value
+ * and boots to the dashboard when it loses the comparison, which it always
+ * did against 0x00010001.
+ */
+#define XC_TIMEZONE_BIAS          0x00
+#define XC_TZ_STD_NAME            0x01
+#define XC_TZ_DLT_NAME            0x02
+#define XC_TZ_STD_DATE            0x03
+#define XC_TZ_DLT_DATE            0x04
+#define XC_TZ_STD_BIAS            0x05
+#define XC_TZ_DLT_BIAS            0x06
+#define XC_LANGUAGE               0x07
+#define XC_VIDEO                  0x08
+#define XC_AUDIO                  0x09
+#define XC_P_CONTROL_GAMES        0x0A
+#define XC_P_CONTROL_PASSWORD     0x0B
+#define XC_P_CONTROL_MOVIES       0x0C
 #define XC_ONLINE_IP_ADDRESS      0x0D
 #define XC_ONLINE_DNS_ADDRESS     0x0E
 #define XC_ONLINE_DEFAULT_GATEWAY 0x0F
@@ -933,6 +972,10 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_MISC                   0x11
 #define XC_DVD_REGION             0x12
 #define XC_MAX_OS                 0xFF
+
+/* Older spellings kept so existing call sites still build. */
+#define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
+#define XC_PARENTAL_PASSWORD      XC_P_CONTROL_PASSWORD
 
 /* Video standard flags in XC_VIDEO */
 #define XC_VIDEO_FLAGS_WIDESCREEN   0x01

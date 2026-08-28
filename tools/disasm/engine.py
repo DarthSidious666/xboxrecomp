@@ -208,6 +208,66 @@ class DisasmEngine:
 
         return count
 
+    def decode_at(self, addr: int, max_insns: int = 4096) -> int:
+        """
+        Decode a stream starting exactly at `addr`, realigning the sweep.
+
+        linear_sweep decodes each section as one stream and resyncs only by
+        skipping a byte when capstone fails. Where it enters a run of data --
+        a jump table, alignment padding, an embedded constant -- it comes out
+        the far side misaligned and stays that way until it happens to fall
+        back into step. Everything downstream keys off self.instructions, so an
+        address the sweep stepped over simply does not exist: recursive_descent
+        stops dead there (it only reads this dict, it never decodes), and
+        _pass_call_targets drops the candidate.
+
+        That is how Halo 2276 ended up with 46 direct call targets that never
+        became functions. 0x00017AB0 is named in a caller's own call list, is
+        16-aligned, and sits in a 5.7 KB hole between two detected functions --
+        the strongest evidence a function start can have, discarded because a
+        byte-skip upstream put the stream out of phase.
+
+        Decoding stops as soon as it lands on an address already decoded: at
+        that point the streams have converged and the rest is already correct.
+        So this rewrites only the out-of-phase run, not the section.
+
+        Overlapping decodes are left in place rather than evicted. On x86 two
+        valid instruction streams really can share bytes, and the callers that
+        matter walk forward by end_address from a known start, so each follows
+        its own chain. Evicting the old one would corrupt whichever function
+        was already using it.
+
+        Returns the number of instructions newly decoded.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return 0
+        data = self.image.get_section_data(section)
+        if not data:
+            return 0
+
+        offset = addr - section.virtual_addr
+        if offset < 0 or offset >= len(data):
+            return 0
+
+        added = 0
+        for cs_insn in self._cs.disasm(data[offset:], addr):
+            if cs_insn.address != addr and cs_insn.address in self.instructions:
+                break  # resynced with the existing stream
+            if cs_insn.address not in self.instructions:
+                self.instructions[cs_insn.address] = \
+                    self._classify_instruction(cs_insn)
+                added += 1
+            insn = self.instructions[cs_insn.address]
+            if insn.is_terminator:
+                break
+            if added >= max_insns:
+                break
+
+        if added:
+            self._sorted_addrs = None
+        return added
+
     def recursive_descent(self, start_addresses: List[int],
                           section_bounds: List[Tuple[int, int]]) -> Set[int]:
         """
@@ -239,6 +299,18 @@ class DisasmEngine:
 
                 insn = self.instructions.get(addr)
                 if insn is None:
+                    # Tried calling decode_at here to realign, on the theory
+                    # that descent was being truncated by the same out-of-phase
+                    # runs decode_at fixes for call targets. Measured on Halo
+                    # 2276: +138 reachable instructions out of 640k (0.02%),
+                    # zero new functions, and one tail_jump_target lost. Not
+                    # worth the risk of following a bad decode deeper.
+                    #
+                    # It is small because descent starts from function heads the
+                    # sweep already decoded and stops at ret/jmp, so it seldom
+                    # walks into a hole in the first place -- the call-target
+                    # path in _pass_call_targets already catches the cases that
+                    # matter. See docs/technical/ms-fusion-adoption-plan.md.
                     break
 
                 reachable.add(addr)

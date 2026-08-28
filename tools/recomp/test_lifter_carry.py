@@ -18,7 +18,7 @@ class CarryLifterTest(unittest.TestCase):
             Lifter(), BasicBlock(start=0, instructions=[neg, sbb]))
         generated = "\n".join(lifted)
 
-        self.assertIn("_cf = (esi != 0);", generated)
+        self.assertIn("_cf = (int)((esi) != 0);", generated)
         self.assertIn(
             "esi = _cf ? 0xFFFFFFFF : 0; /* sbb self (CF extend) */",
             generated,
@@ -37,8 +37,9 @@ class CarryLifterTest(unittest.TestCase):
             Lifter(), BasicBlock(start=0, instructions=[neg, adc]))
         generated = "\n".join(lifted)
 
-        self.assertIn("_cf = (eax != 0);", generated)
-        self.assertIn("edx = edx + 0 + _cf; /* adc */", generated)
+        self.assertIn("_cf = (int)((eax) != 0);", generated)
+        self.assertIn("+ (uint64_t)_cf;", generated)
+        self.assertIn("edx = (uint32_t)_t;", generated)
 
     def test_neg_carry_feeds_sbb_across_push(self):
         neg = Instruction(0, 2, "neg", "eax", "f7d8")
@@ -55,7 +56,7 @@ class CarryLifterTest(unittest.TestCase):
             Lifter(), BasicBlock(start=0, instructions=[neg, push, sbb]))
         generated = "\n".join(lifted)
 
-        self.assertIn("_cf = (eax != 0);", generated)
+        self.assertIn("_cf = (int)((eax) != 0);", generated)
         self.assertIn(
             "eax = _cf ? 0xFFFFFFFF : 0; /* sbb self (CF extend) */",
             generated,
@@ -79,7 +80,7 @@ class CarryLifterTest(unittest.TestCase):
             Lifter(), BasicBlock(start=0, instructions=[neg, add, sbb]))
         generated = "\n".join(lifted)
 
-        self.assertNotIn("_cf = (eax != 0);", generated)
+        self.assertNotIn("_cf = (int)((eax) != 0);", generated)
 
     def test_neg_carry_not_preserved_across_branch(self):
         neg = Instruction(0, 2, "neg", "eax", "f7d8")
@@ -96,7 +97,7 @@ class CarryLifterTest(unittest.TestCase):
             Lifter(), BasicBlock(start=0, instructions=[neg, jmp, sbb]))
         generated = "\n".join(lifted)
 
-        self.assertNotIn("_cf = (eax != 0);", generated)
+        self.assertNotIn("_cf = (int)((eax) != 0);", generated)
 
     def test_neg_carry_not_preserved_across_popfd(self):
         neg = Instruction(0, 2, "neg", "eax", "f7d8")
@@ -112,7 +113,7 @@ class CarryLifterTest(unittest.TestCase):
             Lifter(), BasicBlock(start=0, instructions=[neg, popfd, sbb]))
         generated = "\n".join(lifted)
 
-        self.assertNotIn("_cf = (eax != 0);", generated)
+        self.assertNotIn("_cf = (int)((eax) != 0);", generated)
 
 
 if __name__ == "__main__":

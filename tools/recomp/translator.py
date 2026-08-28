@@ -47,7 +47,7 @@ def _fixup_icall_esp_save(lines):
     # For each ICALL, determine where to insert the save
     insert_before = set()  # map: line_index → True (insert save before this line)
     for icall_idx in icall_indices:
-        # The ICALL line itself contains "PUSH32(esp, 0); RECOMP_ICALL_SAFE(...)"
+        # The ICALL line itself is "PUSH32(esp, <retva>); RECOMP_ICALL_SAFE(...)"
         # Look backwards for consecutive lines containing PUSH32(esp,
         first_push_idx = icall_idx
         j = icall_idx - 1
@@ -57,6 +57,14 @@ def _fixup_icall_esp_save(lines):
             if not stripped:
                 j -= 1
                 continue
+            # A completed direct call ends the argument run, and must be tested
+            # before the generic PUSH32 check below: a direct call is emitted as
+            # "PUSH32(esp, <retva>); name();" on one line, so it also looks like
+            # an argument push. Treating it as one put the _icall_esp save
+            # *before* the direct call, and an ICALL that then failed rewound
+            # g_esp over a call that had already returned.
+            if '/* call 0x' in stripped:
+                break
             # Check if this is a PUSH32 line (arg push)
             if stripped.startswith('PUSH32(esp,'):
                 first_push_idx = j
@@ -71,8 +79,7 @@ def _fixup_icall_esp_save(lines):
                 'RECOMP_ICALL' in stripped or
                 'return;' in stripped or
                 stripped.startswith('if (') or
-                stripped.startswith('POP32(') or
-                stripped.startswith('PUSH32(esp, 0); sub_')):
+                stripped.startswith('POP32(')):
                 break
             # It's an interleaved computation - skip past it
             j -= 1
@@ -98,7 +105,8 @@ class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
-                 abi_db=None, seh_prolog=None, seh_epilog=None):
+                 abi_db=None, seh_prolog=None, seh_epilog=None,
+                 trace_functions=None):
         """
         xbe_data: bytes - raw XBE file contents
         func_db: dict - addr → function info from functions.json
@@ -112,6 +120,7 @@ class FunctionTranslator:
         self.label_db = label_db or {}
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
+        self.trace_functions = set(trace_functions or ())
         self.disasm = Disassembler()
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
@@ -520,10 +529,19 @@ class FunctionTranslator:
         if has_tail_jump or fallthrough_target is not None:
             used_regs.add("ebp")
 
-        # Ensure ebp tracked if function calls __SEH_prolog or __SEH_epilog
-        # (lifter emits ebp = g_seh_ebp readback after these calls).
-        SEH_FUNCS = {0x00244784, 0x002447BF}
-        if any(insn.call_target in SEH_FUNCS for insn in instructions):
+
+        # Ensure ebp is declared if the function talks to the SEH helpers: the
+        # lifter emits a publish before and a read-back after those calls, both
+        # of which name ebp even in a function that otherwise never touches it.
+        #
+        # These addresses are per-title and detected at startup. They used to be
+        # hardcoded to one game's CRT here, so for every other title the forcing
+        # silently never fired and the generated C failed to compile with
+        # "'ebp': undeclared identifier".
+        seh_funcs = {a for a in (self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG)
+                     if a is not None}
+        if seh_funcs and any(insn.call_target in seh_funcs
+                             for insn in instructions):
             used_regs.add("ebp")
 
         # Build call targets list
@@ -560,6 +578,17 @@ class FunctionTranslator:
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
 
+        # Optional entry trace. Bring-up is mostly "which of these ten init
+        # calls does it not come back from", and answering that by overriding
+        # a function loses the body you were trying to observe.
+        if start in self.trace_functions:
+            lines.append(
+                f'    RECOMP_TRACE_ENTER("{name}", 0x{start:08X});')
+        # Entry tracing shows what went in; it cannot show what came back, and
+        # "this function returns with esi wrong" is exactly the question that
+        # kept coming up. The lifter emits the matching exit trace at each ret.
+        self.lifter.trace_exit_name = name if start in self.trace_functions else None
+
         # ebp is the only callee-saved register declared as a local.
         # ebx, esi, edi are global via #define macros (g_ebx, g_esi, g_edi)
         # and must NOT be declared locally, otherwise the local shadows
@@ -571,6 +600,25 @@ class FunctionTranslator:
         if reg_decls:
             lines.append(f"    uint32_t {', '.join(reg_decls)};")
 
+        # A function with no `push ebp; mov ebp, esp` prologue that still reads
+        # ebp is addressing its *caller's* frame. MSVC emits these for shared
+        # tails and helpers; Halo's CRT float formatting (sub_001DEC07) opens
+        # with `cmp byte ptr [edx+0xe], 5` and goes straight to [ebp-0xa4].
+        #
+        # ebp is a per-function local, so without this it starts as garbage and
+        # every [ebp-N] store lands wherever that points. In Halo that was the
+        # fake TIB at Xbox VA 0: `mov [ebp-0xa2], bx` destroyed fs:[4], and the
+        # next TLS lookup faulted, thousands of calls away from the cause.
+        #
+        # Inherit it instead. Frame-establishing functions publish g_ebp when
+        # they execute `mov ebp, esp` (see the lifter), so the value is the
+        # nearest enclosing frame -- which is exactly what the hardware ebp
+        # would still hold. Deliberately not the same as making ebp global:
+        # that also changes save/restore, and a callee that fails to restore
+        # then corrupts its caller (tried; esp underflowed inside XapiStartup).
+        if "ebp" in used_regs and not self._func_has_prologue(instructions):
+            lines.append("    ebp = g_ebp;  /* frameless: caller's frame */")
+
         # Add _flags variable if function has conditional instructions
         has_conditionals = any(
             insn.is_cond_jump or insn.mnemonic.startswith("set")
@@ -579,11 +627,30 @@ class FunctionTranslator:
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
 
+        # Flag snapshot temporaries: a cmp/test records its operands here,
+        # zero- and sign-extended to the compare's own width, so the branch
+        # tests what the compare actually saw. Declared whenever a cmp/test
+        # exists - the consuming jcc can be in a later basic block, or absent.
+        if any(insn.mnemonic in ("cmp", "test") for insn in instructions):
+            lines.append("    uint32_t _fa = 0, _fb = 0;")
+            lines.append("    int32_t _fas = 0, _fbs = 0;")
+            lines.append("    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;")
+            # Flag snapshot: a cmp/test that is not fused with its jcc records
+            # its operands here, zero- and sign-extended to the compare's own
+            # width, so the branch tests what the compare saw.
+
+
         # Add _cf for carry-dependent instructions (sbb, adc)
         has_carry = any(insn.mnemonic in ("sbb", "adc")
                         for insn in instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
+        # Only functions that consume CF pay for producing it: an adc/sbb
+        # reading a never-written _cf silently drops every carry, which
+        # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
+        # idiom MSVC emits for odd trailing elements.
+        self.lifter.needs_cf = has_carry
+        self.lifter.publishes_ebp = self._func_has_prologue(instructions)
 
         # SSE/MMX register declarations
         if used_xmm:
@@ -667,7 +734,8 @@ class FunctionTranslator:
             lines.append(f"")
 
         # Insert _icall_esp save points before RECOMP_ICALL_SAFE arg pushes.
-        # The pattern is: optional PUSH32 args, then PUSH32(esp, 0); RECOMP_ICALL_SAFE(...).
+        # The pattern is: optional PUSH32 args, then
+        # PUSH32(esp, <retva>); RECOMP_ICALL_SAFE(...).
         # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
         lines = _fixup_icall_esp_save(lines)
 
@@ -762,7 +830,8 @@ class BatchTranslator:
 
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
-                 output_dir=None, seh_prolog=None, seh_epilog=None):
+                 output_dir=None, seh_prolog=None, seh_epilog=None,
+                 trace_functions=None):
         self.xbe_path = xbe_path
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(__file__), "output")
@@ -824,7 +893,8 @@ class BatchTranslator:
         self.translator = FunctionTranslator(
             self.xbe_data, self.func_db, self.label_db,
             self.classification_db, self.abi_db,
-            seh_prolog=seh_prolog, seh_epilog=seh_epilog)
+            seh_prolog=seh_prolog, seh_epilog=seh_epilog,
+            trace_functions=trace_functions)
         self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
 
@@ -974,7 +1044,7 @@ class BatchTranslator:
 
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
-                              prefix="recomp", verbose=False):
+                              prefix="recomp", verbose=False, manual=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -985,6 +1055,12 @@ class BatchTranslator:
           ...
           output_dir/recomp_dispatch.c    - address -> function pointer table
 
+        manual: addresses the project implements by hand. Their bodies are not
+        emitted, so the hand-written definition is the one that links, but they
+        are still declared and still count as defined for stub purposes. This
+        is how a game replaces a recompiled XDK routine (a D3D8 entry point,
+        say) with one that drives the host runtime instead of the hardware.
+
         Returns dict with stats and list of generated files.
         """
         import sys
@@ -993,6 +1069,8 @@ class BatchTranslator:
 
         func_list = [item for item in func_list
                      if item[0] not in self.translator.owned_function_starts]
+        manual = set(manual or ())
+        manual_decls = {}
 
         # Translate all functions first, collecting results
         translations = []
@@ -1008,6 +1086,11 @@ class BatchTranslator:
             if verbose and (i % 500 == 0 or i == len(func_list) - 1):
                 print(f"  [{i+1}/{len(func_list)}] Translating {name}...",
                       file=sys.stderr)
+
+            if addr in manual:
+                # Hand-written elsewhere: declare it, emit nothing.
+                manual_decls[addr] = name
+                continue
 
             code = self.translator.translate_function(addr, func_info)
             if code:
@@ -1029,12 +1112,14 @@ class BatchTranslator:
         # reported and written to their own file rather than hidden among the
         # translated chunks.
         defined = {name for _, name, _ in translations}
+        defined |= set(manual_decls.values())   # hand-written, but defined
         unresolved = {
             addr: name
             for addr, name in self.translator.lifter.referenced_calls.items()
             if name not in defined
         }
         stats["unresolved_stubs"] = len(unresolved)
+        stats["manual_functions"] = len(manual_decls)
 
         # Generate header with all forward declarations
         header_path = os.path.join(output_dir, header_name)
@@ -1053,6 +1138,13 @@ class BatchTranslator:
         for addr, name, _ in translations:
             decl = self._make_declaration(addr, name)
             header_lines.append(f"{decl};")
+
+        if manual_decls:
+            header_lines.append("")
+            header_lines.append("/* Hand-written overrides (defined by the project) */")
+            for addr in sorted(manual_decls):
+                header_lines.append(
+                    f"void {manual_decls[addr]}(void);  /* 0x{addr:08X} */")
 
         if unresolved:
             header_lines.append("")
@@ -1110,9 +1202,23 @@ class BatchTranslator:
                 f'#include "{header_name}"',
                 "",
             ]
+            stub_lines.append(
+                "/* Each stub consumes the return address its caller pushed,")
+            stub_lines.append(
+                " * exactly as a real 'ret' would. An empty body leaves esp 4 bytes")
+            stub_lines.append(
+                " * low, and the caller then reads every subsequent stack slot off by")
+            stub_lines.append(
+                " * one - which surfaces far from here, as corrupted callee-saved")
+            stub_lines.append(
+                " * registers or a garbage local. Args are not popped: the callee's")
+            stub_lines.append(
+                " * stdcall byte count is unknown, and cdecl is the safer guess. */")
+            stub_lines.append("")
             for addr in sorted(unresolved):
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ /* 0x{addr:08X}: not detected */ }}"
+                    f"void {unresolved[addr]}(void) {{ g_esp += 4; "
+                    f"/* 0x{addr:08X}: not detected */ }}"
                 )
             stub_lines.append("")
 
@@ -1150,6 +1256,7 @@ class BatchTranslator:
             "#define RECOMP_DISPATCH_H",
             f'#include "{header_name}"',
             '#include <stddef.h>',
+            '#include <stdlib.h>',
             "",
             "/* Generic function pointer type */",
             "typedef void (*recomp_func_t)(void);",
@@ -1165,16 +1272,75 @@ class BatchTranslator:
         for addr, name, _ in translations:
             lines.append(f"    {{ 0x{addr:08X}u, (recomp_func_t){name} }},")
 
+        addrs = [addr for addr, _, _ in translations]
+        flat_base = min(addrs) if addrs else 0
+        flat_span = (max(addrs) - flat_base + 1) if addrs else 0
+
         lines.extend([
             "};",
             "",
             f"static const size_t g_recomp_table_size = "
             f"{len(translations)};",
             "",
-            "/* Binary search for a function by Xbox VA */",
+            "/* ----------------------------------------------------------------",
+            " * Flat, directly-indexed dispatch.",
+            " *",
+            " * Microsoft's recompiler resolves an indirect branch with a single",
+            " * `jmp qword ptr [r9 + r8*8]` -- one indexed load off a table keyed",
+            " * by guest address, no compare and no miss path. This is that, in C.",
+            " *",
+            " * The binary search below is still here and still correct. It runs",
+            " * ~log2(n) iterations per indirect call, which for this title is",
+            f" * about {max(1, len(translations).bit_length())} branches every time the game calls through a",
+            " * vtable. The flat table turns that into a bounds check and a load.",
+            " *",
+            " * Costs 8 bytes per byte of guest code span. Allocated with calloc so",
+            " * the untouched middle stays uncommitted rather than resident.",
+            " *",
+            " * recomp_dispatch_init() is optional by design: if it is never called,",
+            " * or the allocation fails, recomp_lookup silently keeps using the",
+            " * binary search. Nothing else in the program has to know. That is also",
+            " * why this does not pre-fill manual overrides -- they cannot be",
+            " * enumerated portably, so RECOMP_ICALL still consults",
+            " * recomp_lookup_manual first and this only replaces the search it used",
+            " * to fall through to. Behaviour is identical by construction.",
+            " * ---------------------------------------------------------------- */",
+            "",
+            f"static const uint32_t g_flat_base = 0x{flat_base:08X}u;",
+            f"static const uint32_t g_flat_span = 0x{flat_span:08X}u;",
+            "static recomp_func_t *g_flat_table = NULL;",
+            "",
+            "int recomp_dispatch_init(void)",
+            "{",
+            "    size_t i;",
+            "    if (g_flat_table) return 1;          /* already built */",
+            "    if (!g_flat_span) return 0;",
+            "    g_flat_table = (recomp_func_t *)calloc(g_flat_span,",
+            "                                           sizeof(recomp_func_t));",
+            "    if (!g_flat_table) return 0;         /* keep the binary search */",
+            "    for (i = 0; i < g_recomp_table_size; i++) {",
+            "        g_flat_table[g_recomp_table[i].xbox_va - g_flat_base] =",
+            "            g_recomp_table[i].func;",
+            "    }",
+            "    return 1;",
+            "}",
+            "",
+            "size_t recomp_dispatch_flat_bytes(void)",
+            "{",
+            "    return g_flat_table ? (size_t)g_flat_span * sizeof(recomp_func_t) : 0;",
+            "}",
+            "",
+            "/* Flat index when built, binary search otherwise. */",
             "recomp_func_t recomp_lookup(uint32_t xbox_va)",
             "{",
-            "    size_t lo = 0, hi = g_recomp_table_size;",
+            "    size_t lo, hi;",
+            "    if (g_flat_table) {",
+            "        uint32_t off = xbox_va - g_flat_base;",
+            "        /* Unsigned: a VA below the base wraps to a huge offset and is",
+            "         * rejected by the same compare, so no separate lower bound. */",
+            "        return (off < g_flat_span) ? g_flat_table[off] : NULL;",
+            "    }",
+            "    lo = 0; hi = g_recomp_table_size;",
             "    while (lo < hi) {",
             "        size_t mid = lo + (hi - lo) / 2;",
             "        if (g_recomp_table[mid].xbox_va < xbox_va)",

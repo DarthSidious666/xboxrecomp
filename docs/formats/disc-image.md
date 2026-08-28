@@ -26,7 +26,26 @@ Xbox games ship on proprietary DVD discs that use the **XDVDFS** (Xbox DVD File 
 
 ## Extraction Tools
 
-### xdvdfs (Recommended)
+### tools.xiso (in-tree, recommended)
+
+Implements the subset of XDVDFS this pipeline needs, so getting the XBE out of a disc
+image does not require a Rust toolchain or a prebuilt binary as step one.
+
+```bash
+py -3 -m tools.xiso ls     game.iso
+py -3 -m tools.xiso get    game.iso default.xbe -o game/
+py -3 -m tools.xiso unpack game.iso -o extracted/
+```
+
+The partition base is found by probing for the magic at each known offset (bare game
+partition, redump-style video-partition-first, and two others) rather than being inferred
+from the file size. Directory entries are walked per-sector instead of by following the
+binary tree's left/right links, so a padded or malformed link cannot silently drop a
+subtree -- losing a file quietly is worse than being slow.
+
+Not implemented: writing, the video partition, timestamps. Nothing in the pipeline reads them.
+
+### xdvdfs (external)
 
 A Rust-based tool for reading and extracting Xbox disc images.
 

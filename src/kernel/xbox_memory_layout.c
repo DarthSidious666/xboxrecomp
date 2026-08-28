@@ -37,6 +37,14 @@ static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
 
+/* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
+size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
+
+void xbox_SetTotalRam(size_t bytes)
+{
+    g_xbox_total_ram = bytes;
+}
+
 /* File mapping handle for the Xbox memory region.
  * Using CreateFileMapping + MapViewOfFileEx allows mirror views to alias
  * the same physical pages as the base region, so writes to mirror addresses
@@ -46,6 +54,191 @@ static HANDLE g_mapping_handle = NULL;
 
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
+/* Contiguous / physical memory window (see MemoryLayoutInit).
+ * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
+ * the same numbers for MmClaimGpuInstanceMemory. */
+static void *g_contig_memory = NULL;
+
+/* NV2A GPU register aperture (see MemoryLayoutInit). Backed as plain RAM so
+ * that D3D8 code linked into the title can poke it without faulting. */
+#define XBOX_NV2A_BASE 0xFD000000u
+#define XBOX_NV2A_SIZE (16u * 1024u * 1024u)
+static void *g_nv2a_memory = NULL;
+
+/* MCPX southbridge register span: APU 0xFE800000 through NIC 0xFEF00000. */
+#define XBOX_MCPX_BASE 0xFE800000u
+#define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
+static void *g_mcpx_memory = NULL;
+static HANDLE g_nv2a_ack_thread = NULL;
+static volatile LONG g_nv2a_ack_stop = 0;
+
+/*
+ * NV2A busy-bit acknowledgement.
+ *
+ * D3D8 talks to the GPU through set-a-bit / wait-for-hardware-to-clear-it
+ * handshakes. Against plain RAM the bit is set and nothing ever clears it, so
+ * the title spins forever. Halo hangs in the push-buffer kick at 0x001EF930:
+ *
+ *     mov  [eax+0x100410], edx     ; set 0x10000
+ *   L: test [eax+0x100410], 0x10000
+ *     jne  L                       ; wait for the GPU
+ *
+ * Clearing those bits from a thread is not a hack around the handshake, it is
+ * the handshake: on hardware the GPU clears them asynchronously, which is
+ * exactly what this does. Work that would have been submitted is being done by
+ * the D3D11 layer instead, so acknowledging immediately is honest.
+ *
+ * Only registers listed here are touched. Blanket-zeroing the aperture would
+ * also wipe registers holding real state.
+ *
+ * ponytail: table-driven, extend as more handshakes turn up. A spin on a bit
+ * that is not listed still hangs -- run the title and the watchdog sample will
+ * name the register.
+ */
+static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
+    { 0x100410, 0x00010000u },  /* PFB flush kick, Halo 0x001EF930 */
+
+    /* Interrupt status registers. These are write-1-to-clear on hardware, so
+     * an ISR "clearing" one writes the pending bit back -- against plain RAM
+     * that sets it instead, the interrupt stays pending forever, and the
+     * service routine re-enters until the stack is gone. Halo dies exactly
+     * that way: CMiniport::ServiceGrInterrupt writes 0x1000 to PGRAPH_INTR to
+     * acknowledge, reads it back still pending, and recurses into a native
+     * stack overflow.
+     *
+     * Holding them at zero is correct rather than convenient: nothing here
+     * ever raises a GPU interrupt, so "none pending" is the truth. */
+    { 0x000100, 0xFFFFFFFFu },  /* PMC_INTR_0    */
+    { 0x001100, 0xFFFFFFFFu },  /* PBUS_INTR_0   */
+    { 0x002100, 0xFFFFFFFFu },  /* PFIFO_INTR_0  */
+    { 0x400100, 0xFFFFFFFFu },  /* PGRAPH_INTR   */
+    { 0x600100, 0xFFFFFFFFu },  /* PCRTC_INTR_0  */
+};
+
+/*
+ * Bits that must always read as SET. The mirror image of the table above:
+ * where an interrupt-pending bit is false because nothing raises interrupts,
+ * a queue-empty bit is true because nothing is queued.
+ *
+ * Halo's CMiniport::TilingUpdateIdle spins until the PFIFO caches report
+ * empty (0x001F5CD1). Zeroed RAM says "not empty" forever, so tile setup
+ * during CDevice::InitializeFrameBuffers never completes.
+ *
+ * Note 0x003220 is deliberately absent -- that one exits on the bit being
+ * CLEAR, which zeroed memory already gives.
+ */
+static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
+    { 0x002400, 0x00000010u },  /* PFIFO_RUNOUT_STATUS  LOW_MARK (empty) */
+    { 0x003214, 0x00000010u },  /* PFIFO_CACHE1_STATUS  LOW_MARK (empty) */
+};
+
+/*
+ * PFIFO channel DMA pointers. Software writes DMA_PUT and spins until the GPU
+ * advances DMA_GET to match -- "you have consumed everything I submitted".
+ * Halo's wait is at 0x001F3948:
+ *
+ *   L: call BusyLoop
+ *      ecx = [[dev+0x2304] + 0x44]   ; DMA_GET
+ *      edx = [dev]                   ; DMA_PUT
+ *      test (edx ^ ecx), 0xfffffff
+ *      jne L
+ *
+ * [dev+0x2304] is 0xFD800000, so the channel's USER area sits at aperture
+ * offset 0x800000 and the two pointers are at +0x40 / +0x44. Copying PUT to
+ * GET is the acknowledgement; the commands are not executed from the push
+ * buffer here -- the D3D11 layer draws -- so reporting them consumed is the
+ * truthful answer.
+ *
+ * This was written once, removed, and restored. It was removed because
+ * [dev+0x2304] read as 0x0080F7FF, i.e. no register to acknowledge -- but that
+ * garbage was a downstream symptom of ordinal 47 having no stdcall arg size,
+ * which walked esp 8 bytes off and made D3D initialise the DMA channel with
+ * `this` = 1. With that fixed the pointer is correct and so is this.
+ */
+#define NV2A_USER_DMA_PUT 0x800040u
+#define NV2A_USER_DMA_GET 0x800044u
+
+/*
+ * Free-running counters in the MCPX aperture.
+ *
+ * Some hardware registers are clocks, not flags: software reads them and waits
+ * until the value passes a target. Against zeroed RAM the value never moves and
+ * the wait is forever. DirectSound's CMcpxCore::SetupVoiceProcessor spins on
+ * the APU sample counter at 0xFE820010 exactly this way, which is where Halo
+ * stopped once input initialisation started working.
+ *
+ * Ticking it is the honest model: on hardware this counter advances on its own
+ * whether or not anything is listening.
+ *
+ * ponytail: the rate is "as fast as this thread loops", not 48 kHz. Nothing
+ * paces audio off it yet. Derive it from a real clock if timing starts to
+ * matter.
+ */
+static const uint32_t MCPX_COUNTERS[] = {
+    0x020010,   /* APU GP sample counter, DirectSound SetupVoiceProcessor */
+};
+
+static void *g_mcpx_regs = NULL;
+
+static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            if (*r & NV2A_ACK[i].busy_mask) {
+                *r &= ~NV2A_ACK[i].busy_mask;
+            }
+        }
+        for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
+            if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
+                *r |= NV2A_IDLE[i].idle_mask;
+            }
+        }
+        {
+            volatile uint32_t *put =
+                (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            volatile uint32_t *get =
+                (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
+            if (*get != *put) {
+                *get = *put;
+            }
+        }
+        if (g_mcpx_regs) {
+            for (size_t i = 0; i < sizeof(MCPX_COUNTERS) / sizeof(MCPX_COUNTERS[0]); i++) {
+                volatile uint32_t *c =
+                    (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]);
+                *c += 1;
+            }
+        }
+
+        /* Advance KeTickCount. It was written once at init and left frozen,
+         * which silently breaks every timeout that polls it: Halo's DHCP setup
+         * waits on a tick deadline that never arrives and spins forever bringing
+         * up XNet. A live clock is also just the truth -- KeTickCount ticks on
+         * hardware whether or not anyone is asleep. GetTickCount() shares the
+         * millisecond unit, so the rate matches. */
+        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                               + g_memory_offset) = GetTickCount();
+
+        Sleep(0);  /* yield; the waiter is spinning on another core */
+    }
+    return 0;
+}
+
+static void xbox_Nv2aAckStart(void)
+{
+    g_nv2a_ack_stop = 0;
+    g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
+                                     g_nv2a_memory, 0, NULL);
+    if (g_nv2a_ack_thread) {
+        fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
+                sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
+    }
+}
 
 /* Separate allocation for Xbox kernel address space (0x80010000+).
  * Some RenderWare code reads the kernel PE header to detect features. */
@@ -55,11 +248,24 @@ static void *g_kernel_memory = NULL;
 ptrdiff_t g_xbox_mem_offset = 0;
 
 /* Global registers for recompiled code (via recomp_types.h) */
-uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
-uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
+RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
-uint32_t g_seh_ebp = 0;
+RECOMP_TLS uint32_t g_seh_ebp = 0;
+RECOMP_TLS double g_fp_stack[8];
+RECOMP_TLS int g_fp_top = 0;
+/* x87 control and status. The reset default masks every exception and
+ * rounds to nearest, which is what the CRT expects before _control87. */
+RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
+RECOMP_TLS int g_fp_cmp = 0;
+
+/* SSE. 128 bits of architectural state, per-thread like the rest. */
+RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
+RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+/* Last frame established by `mov ebp, esp`. Read by frameless functions
+ * that address their caller's frame through ebp. */
+RECOMP_TLS uint32_t g_ebp = 0;
 
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};
@@ -82,8 +288,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * This includes low memory (KPCR at 0x0-0xFF) which game code reads
      * from, the XBE sections, and the simulated stack.
      */
-    /* Map the full 64MB Xbox address space (covers all sections + stack + heap) */
-    g_memory_size = XBOX_TOTAL_RAM;
+    /* Map the full Xbox address space (covers all sections + stack + heap).
+     * Size is runtime-configurable: retail 64 MB, devkit debug builds 128 MB. */
+    g_memory_size = g_xbox_total_ram;
 
     /*
      * Create a file mapping backed by the page file.
@@ -390,6 +597,125 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
+     * Contiguous / physical memory window at 0x80000000.
+     *
+     * MmAllocateContiguousMemory hands back addresses in this window: physical
+     * page P is visible at 0x80000000 + P. Titles that pin buffers at fixed
+     * physical addresses then use the whole range, so it has to be backed for
+     * its full length - Halo pins 3.4 MB at 0x61000 and 22 MB at 0x3A6000, and
+     * with only the fake kernel page mapped here a write walked off the end of
+     * it a few pages in.
+     *
+     * Deliberately NOT a view of the 64 MB RAM mapping. On hardware this window
+     * aliases physical RAM, but we load the XBE image into the low addresses of
+     * that same region, so aliasing would put a title's pinned pools on top of
+     * its own code. Separate storage costs an extra mapping and behaves
+     * correctly; nothing here depends on the aliasing.
+     *
+     * Reserved before the kernel page below, which lives inside it.
+     */
+    {
+        uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
+        g_contig_memory = VirtualAlloc(
+            (LPVOID)contig_native,
+            XBOX_CONTIG_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE
+        );
+        if (g_contig_memory) {
+            fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X\n",
+                    XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE);
+        } else {
+            fprintf(stderr, "  WARNING: contiguous window at 0x%08X failed "
+                    "(error %lu); pinned physical allocations will fault\n",
+                    XBOX_CONTIG_BASE, GetLastError());
+        }
+    }
+
+    /*
+     * NV2A hardware register aperture at 0xFD000000 (16 MB).
+     *
+     * The GPU's registers are memory-mapped here on real hardware. A title
+     * that only calls D3D never notices, but the D3D8 library is linked into
+     * the XBE rather than provided by the kernel, so once execution is inside
+     * it the register pokes are just loads and stores in recompiled code.
+     * Halo faults reading 0xFD001804 during rasterizer_preinitialize, a few
+     * instructions after Direct3DCreate8 returns.
+     *
+     * Backed as ordinary zeroed RAM. That is enough to get through
+     * initialisation, and reads returning zero are the benign answer for the
+     * status and capability registers touched here.
+     *
+     * ponytail: plain memory, no register semantics. A spin loop waiting for
+     * a bit to *set* would hang rather than fault -- if that shows up, the fix
+     * is to bridge the D3D8 entry point that owns the loop, not to start
+     * emulating NV2A. Nothing has needed that yet.
+     */
+    {
+        uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
+        g_nv2a_memory = VirtualAlloc(
+            (LPVOID)nv2a_native,
+            XBOX_NV2A_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE
+        );
+        if (g_nv2a_memory) {
+            fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
+                    "0x%08X (zeroed, no register semantics)\n",
+                    XBOX_NV2A_SIZE / (1024 * 1024), XBOX_NV2A_BASE);
+        } else {
+            fprintf(stderr, "  WARNING: NV2A aperture at 0x%08X failed "
+                    "(error %lu); D3D register access will fault\n",
+                    XBOX_NV2A_BASE, GetLastError());
+        }
+    }
+
+    /*
+     * MCPX device apertures.
+     *
+     * The NV2A block above is not the only hardware the title touches
+     * directly. The southbridge devices live higher up:
+     *
+     *   0xFE800000  APU (audio processing unit)
+     *   0xFEC00000  AC97
+     *   0xFED00000  USB0 / USB1
+     *   0xFEF00000  NIC
+     *
+     * Halo faults reading 0xFED00000 during input initialisation -- the XDK's
+     * USB code talks to the host controller's registers rather than going
+     * through a driver. Back the whole span as plain RAM for the same reason
+     * the NV2A aperture is backed: a read of zero is survivable, a fault is
+     * not.
+     *
+     * ponytail: no register semantics anywhere in here. If something spins
+     * waiting for a bit to set, extend the NV2A ack thread's table rather than
+     * emulating the device.
+     */
+    {
+        uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
+        g_mcpx_memory = VirtualAlloc(
+            (LPVOID)mcpx_native,
+            XBOX_MCPX_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE
+        );
+        g_mcpx_regs = g_mcpx_memory;
+        if (g_mcpx_memory) {
+            fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
+                    "0x%08X (APU/AC97/USB/NIC, zeroed)\n",
+                    XBOX_MCPX_SIZE / (1024 * 1024), XBOX_MCPX_BASE);
+        } else {
+            fprintf(stderr, "  WARNING: MCPX aperture at 0x%08X failed "
+                    "(error %lu); USB/audio register access will fault\n",
+                    XBOX_MCPX_BASE, GetLastError());
+        }
+    }
+
+    if (g_nv2a_memory) {
+        xbox_Nv2aAckStart();
+    }
+
+    /*
      * Allocate a page at Xbox kernel address space (0x80010000).
      *
      * RenderWare's Xbox driver code (xbcache.c) reads MEM32(0x8001003C)
@@ -403,12 +729,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         #define XBOX_KERNEL_BASE 0x80010000u
         #define KERNEL_PAGE_SIZE 4096
         uintptr_t kernel_native = XBOX_KERNEL_BASE + g_memory_offset;
-        g_kernel_memory = VirtualAlloc(
-            (LPVOID)kernel_native,
-            KERNEL_PAGE_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
+        /* Already committed if the contiguous window above succeeded -
+         * 0x80010000 sits inside it - so just use that storage. */
+        g_kernel_memory = g_contig_memory
+            ? (void *)kernel_native
+            : VirtualAlloc((LPVOID)kernel_native, KERNEL_PAGE_SIZE,
+                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (g_kernel_memory) {
             /* Zero-fill then set e_lfanew = 0x80 (offset to PE header).
              * With the rest zeroed, NumberOfSections = 0 and the INIT
@@ -427,8 +753,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     /* Initialize the dynamic heap. */
     fprintf(stderr, "  Heap: %u MB at Xbox VA 0x%08X-0x%08X\n",
-            XBOX_HEAP_SIZE / (1024 * 1024), XBOX_HEAP_BASE,
-            XBOX_HEAP_BASE + XBOX_HEAP_SIZE);
+            (unsigned)((XBOX_HEAP_TOP - XBOX_HEAP_BASE) / (1024 * 1024)),
+            XBOX_HEAP_BASE, XBOX_HEAP_TOP);
 
     /*
      * Map mirror views of the 64 MB region.
@@ -472,11 +798,50 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     return TRUE;
 }
 
+/*
+ * Make every RAM mirror read-only, for finding writes that reach low memory
+ * through an alias.
+ *
+ * Xbox RAM is visible at 28 virtual addresses that alias the same pages, so a
+ * store to 0x04000004 changes Xbox VA 4 without ever touching VA 4. Both a
+ * page-protection watchpoint and a DR0 hardware watchpoint on VA 4 therefore
+ * report nothing while the memory demonstrably changes -- which is exactly
+ * what happened chasing Halo's fs:[4] corruption.
+ *
+ * Debug aid, not part of normal startup: a title that legitimately writes
+ * through a mirror will fault here too, and the fault address names the alias
+ * and the code.
+ */
+void xbox_ProtectMirrorsForDebug(void)
+{
+    int n = 0;
+    for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
+        DWORD old;
+        if (g_mirror_views[m] &&
+            VirtualProtect(g_mirror_views[m], g_memory_size,
+                           PAGE_READONLY, &old)) {
+            n++;
+        }
+    }
+    fprintf(stderr, "  Mirrors: %d/%d made read-only (debug)\n",
+            n, XBOX_NUM_MIRRORS);
+}
+
 void xbox_MemoryLayoutShutdown(void)
 {
     if (g_kernel_memory) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
+    }
+    if (g_nv2a_ack_thread) {
+        InterlockedExchange(&g_nv2a_ack_stop, 1);
+        WaitForSingleObject(g_nv2a_ack_thread, 1000);
+        CloseHandle(g_nv2a_ack_thread);
+        g_nv2a_ack_thread = NULL;
+    }
+    if (g_nv2a_memory) {
+        VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
+        g_nv2a_memory = NULL;
     }
     /* Unmap mirror views first */
     for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
@@ -525,6 +890,44 @@ static uint32_t g_heap_next = XBOX_HEAP_BASE;
 
 static int g_heap_alloc_count = 0;
 
+/* Block table backing xbox_HeapFree. A bump pointer alone never reclaims,
+ * which is fine for a title that allocates once and fatal for a debug build
+ * that churns. Flat array rather than an intrusive list: allocations come back
+ * in bump order, so index order is address order and coalescing is a
+ * neighbour check. */
+#define XBOX_HEAP_MAX_BLOCKS 65536
+static struct { uint32_t addr; uint32_t size; uint8_t free; }
+    g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
+static int g_heap_block_count = 0;
+
+/*
+ * Simulated stacks for spawned threads.
+ *
+ * The main thread owns the top of the XBOX_STACK region and grows down; worker
+ * stacks are carved from the bottom upward so the two cannot meet until the
+ * whole 8 MB is gone. Xbox VAs, not host memory: recompiled code addresses its
+ * stack through MEM32() like any other Xbox pointer.
+ */
+#define XBOX_THREAD_STACK_SIZE  (512 * 1024)
+#define XBOX_MAX_THREAD_STACKS  8
+
+static int g_thread_stacks_used = 0;
+
+uint32_t xbox_AllocThreadStack(void)
+{
+    uint32_t base;
+
+    if (g_thread_stacks_used >= XBOX_MAX_THREAD_STACKS) {
+        return 0;
+    }
+    base = XBOX_STACK_BASE +
+           (uint32_t)g_thread_stacks_used * XBOX_THREAD_STACK_SIZE;
+    g_thread_stacks_used++;
+
+    /* Top of the slice, 16-byte aligned, growing down. */
+    return base + XBOX_THREAD_STACK_SIZE - 16;
+}
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
@@ -537,14 +940,61 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
      * resulting in zero-size allocations. With a bump allocator, these all
      * return the same address, causing overlapping structures. Enforce a
      * minimum of 4096 bytes so each allocation gets its own memory. */
-    if (size < 4096) size = 4096;
+    if (size < 16) size = 16;
+
+    /* Reuse a freed block first. Without this the heap only ever grows: Halo's
+     * debug build allocates and releases heavily through init, exhausted all
+     * 48 MB in 4,726 allocations, and its second D3D CreateDevice then failed
+     * with E_OUTOFMEMORY -- which the title reports by clearing
+     * global_d3d_device, so the rasterizer asserts and startup stops. */
+    for (int i = 0; i < g_heap_block_count; i++) {
+        if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size) {
+            continue;
+        }
+        if (g_heap_blocks[i].addr & (alignment - 1)) {
+            continue;   /* wrong alignment for this request */
+        }
+        g_heap_blocks[i].free = 0;
+        result = g_heap_blocks[i].addr;
+        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+        return result;
+    }
 
     /* Align the next pointer */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
-    if (result + size > XBOX_HEAP_BASE + XBOX_HEAP_SIZE) {
+    if (result + size > XBOX_HEAP_TOP) {
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
-                size, g_heap_next - XBOX_HEAP_BASE, XBOX_HEAP_SIZE);
+                size, g_heap_next - XBOX_HEAP_BASE,
+                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
+        /* Who ate the heap? Group live blocks by size -- an exhausted heap is
+         * nearly always one request size repeated, and the count names it. */
+        {
+            static int dumped = 0;
+            static struct { uint32_t size; int n; } hist[256];
+            if (!dumped) {
+                int used = 0;
+                dumped = 1;
+                for (int i = 0; i < g_heap_block_count; i++) {
+                    int j = 0;
+                    if (g_heap_blocks[i].free || !g_heap_blocks[i].size) continue;
+                    while (j < used && hist[j].size != g_heap_blocks[i].size) j++;
+                    if (j == used) {
+                        if (used == 256) continue;   /* ponytail: 256 distinct sizes is plenty */
+                        hist[used].size = g_heap_blocks[i].size;
+                        hist[used++].n = 0;
+                    }
+                    hist[j].n++;
+                }
+                for (int j = 0; j < used; j++) {
+                    if ((uint64_t)hist[j].n * hist[j].size < 1024 * 1024) continue;
+                    fprintf(stderr, "  [HEAP] %d live blocks of %u bytes (%u KB)\n",
+                            hist[j].n, hist[j].size,
+                            (unsigned)((uint64_t)hist[j].n * hist[j].size / 1024));
+                }
+                fflush(stderr);
+            }
+        }
         return 0;
     }
 
@@ -553,19 +1003,69 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     /* Zero-fill the allocated block (Xbox memory is always zeroed) */
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
 
+    if (g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
+        g_heap_blocks[g_heap_block_count].addr = result;
+        g_heap_blocks[g_heap_block_count].size = size;
+        g_heap_blocks[g_heap_block_count].free = 0;
+        g_heap_block_count++;
+    }
+
     g_heap_alloc_count++;
-    fprintf(stderr, "  [HEAP] #%d: size=%u align=%u → 0x%08X..0x%08X (used %u/%u)\n",
-            g_heap_alloc_count, size, alignment, result, result + size,
-            g_heap_next - XBOX_HEAP_BASE, XBOX_HEAP_SIZE);
-    fflush(stderr);
+    /* Rate-limited: a debug title makes thousands of these and the log is a
+     * diagnostic, not a transaction record. */
+    if (g_heap_alloc_count <= 32 || (g_heap_alloc_count % 512) == 0) {
+        fprintf(stderr, "  [HEAP] #%d: size=%u align=%u → 0x%08X..0x%08X (used %u/%u)\n",
+                g_heap_alloc_count, size, alignment, result, result + size,
+                g_heap_next - XBOX_HEAP_BASE,
+                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
+        fflush(stderr);
+    }
 
     return result;
 }
 
 void xbox_HeapFree(uint32_t xbox_va)
 {
-    /* No-op for bump allocator */
-    (void)xbox_va;
+    static int frees = 0, matched = 0;
+
+    if (!xbox_va) {
+        return;
+    }
+    frees++;
+    if (frees <= 8) {
+        fprintf(stderr, "  [HEAP] free #%d va=0x%08X blocks=%d\n",
+                frees, xbox_va, g_heap_block_count);
+        fflush(stderr);
+    }
+    for (int i = 0; i < g_heap_block_count; i++) {
+        if (g_heap_blocks[i].addr != xbox_va || g_heap_blocks[i].free) {
+            continue;
+        }
+        g_heap_blocks[i].free = 1;
+        if (++matched % 512 == 0) {
+            fprintf(stderr, "  [HEAP] frees=%d matched=%d blocks=%d\n",
+                    frees, matched, g_heap_block_count);
+            fflush(stderr);
+        }
+
+        /* Coalesce with neighbours. Blocks are recorded in bump order, so
+         * index order is address order and adjacency is a simple end==start
+         * test. Keeps large contiguous requests satisfiable after a lot of
+         * small churn. */
+        if (i + 1 < g_heap_block_count && g_heap_blocks[i + 1].free &&
+            g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[i + 1].addr) {
+            g_heap_blocks[i].size += g_heap_blocks[i + 1].size;
+            g_heap_blocks[i + 1].size = 0;
+            g_heap_blocks[i + 1].addr = 0;
+        }
+        if (i > 0 && g_heap_blocks[i - 1].free &&
+            g_heap_blocks[i - 1].addr + g_heap_blocks[i - 1].size == g_heap_blocks[i].addr) {
+            g_heap_blocks[i - 1].size += g_heap_blocks[i].size;
+            g_heap_blocks[i].size = 0;
+            g_heap_blocks[i].addr = 0;
+        }
+        return;
+    }
 }
 
 HANDLE xbox_GetMappingHandle(void)

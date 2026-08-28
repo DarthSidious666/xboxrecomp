@@ -15,6 +15,7 @@
 
 ### Recent Changes
 
+- **Recompiler fall-through fix** — When the disassembler splits a straight-line run of code into separate functions at an internal branch target, the last function often ends by *falling through* into the next one (its last instruction is an ordinary op, not `ret`/`jmp`) — which x86 executes. The lifter dropped that edge, so the C body just ended and silently skipped the next function's shared epilogue: an esp leak that corrupted callee-saved registers. **4,587 / 35,286 functions in Burnout 3** had this shape. The lifter now emits the fall-through as an explicit tail call. See `tools/recomp/test_fallthrough.py`.
 - **Cross-Platform / Linux Port** — Platform abstraction layer with an **OpenGL D3D8 backend** alongside the Windows D3D11 path, POSIX path handling, and Linux build deps (`tools/linux/install_deps.sh`). Builds with GCC/Clang.
 - **`ghidra_naming` Tool (optional)** — Headless Ghidra FidDb pass recovers real CRT/XDK symbol names from a stripped XBE and merges them into `functions.json`, so generated C uses meaningful names instead of `sub_XXXXXXXX`. The core pipeline still needs no disassembler. See `tools/ghidra_naming/`.
 - **`--seed-functions`** — Iterative disasm mode: seed the function database from known/recovered entry points for fuller coverage on stripped binaries.
@@ -27,7 +28,7 @@
 - **Texture Unswizzling** — Xbox Z-order (Morton code) swizzled textures converted to linear D3D11 layout. Optimized masked-increment algorithm from xemu.
 - **NV2A PGRAPH→D3D11 Translator** — Push buffer method interception and D3D11 rendering (upstreamed from Burnout 3).
 - **EEPROM / AV Pack / SMBus** — Games can query region, language, video standard, AV pack type, and hardware info.
-- **Games in progress** — Burnout 3 (**playable**: menus, tracks, physics, audio), Xbox Dashboard (VRML+JS scene-engine bring-up), Wreckless (debugging), Blood Wake (scaffolded).
+- **Games in progress** — Burnout 3 (**honest recompiler-driven bring-up in progress**: clean recompiled code reaches engine/RenderWare init; an earlier "playable" build leaned on hand-written menu/render scaffolding that is being replaced with recompiled code), Halo (kernel + x87 bring-up), Xbox Dashboard (VRML+JS scene-engine bring-up), Wreckless (debugging), Blood Wake (scaffolded).
 
 ---
 
@@ -101,8 +102,8 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 | **xbox_kernel** | Custom | Xbox kernel → Win32 (115 of the kernel's 366 ordinals resolved, 55 with dedicated bridges: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
 | **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
-| **xbox_apu** | xemu | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
-| **xbox_nv2a** | xemu+Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
+| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
+| **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
 | **xbox_input** | Custom | Xbox gamepad → XInput |
 
 ### Building the Libraries
@@ -285,6 +286,9 @@ xboxrecomp/
 - [SEH and Exception Handling](docs/technical/seh-handling.md) — Structured exception handling in recompiled code
 - [Lessons Learned](docs/technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
 - [Gap Analysis vs xemu](docs/technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
+- [Microsoft's Own Recompiler](docs/technical/ms-fusion-recompiler.md) — White-room analysis of Ficl/Fission: pipeline, address map, HLE boundary **(NEW)**
+- [Ficl/Fission Codegen Teardown](docs/technical/ms-fusion-codegen-teardown.md) — IDA/Hex-Rays teardown of both their translators, and how it reframes our roadmap **(NEW)**
+- [Burnout 3 Reunification](docs/technical/burnout3-reunification.md) — bringing the origin title back onto the extracted toolkit: what's done, and the threading gate that makes the runtime a merge not a swap **(NEW)**
 
 ### Xbox Formats
 - [XBE File Format](docs/formats/xbe.md) — Xbox executable format reference
@@ -439,21 +443,27 @@ A: C is portable, debuggable, and the compiler optimizes it for you. You can rea
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+**MIT** — see [LICENSE](LICENSE). Third-party components keep their original
+licence:
 
-Two subsystems are not MIT and are not ours: the MCPX APU sources under
-`src/apu/` and `src/nv2a/nv2a_regs.h` were extracted from
-[xemu](https://github.com/xemu-project/xemu) and remain LGPL-2.1-or-later,
-copyright espes, Jannik Vogel and Matt Borgerson. They keep their own licence
-and their own notices. [NOTICE](NOTICE) lists every such file with the
-copyright it carries, and [LICENSES/LGPL-2.1.txt](LICENSES/LGPL-2.1.txt) is
-the verbatim licence text — shipping it alongside those files is an LGPL
-requirement, not a courtesy.
+| Component | Licence | Copyright |
+|---|---|---|
+| the MCPX APU sources in `src/apu/` | LGPL-2.1-or-later | espes; Jannik Vogel; Matt Borgerson |
+| `src/nv2a/nv2a_regs.h` | LGPL-2.1-or-later | espes; Jannik Vogel |
+| everything else | MIT | sp00nz and contributors |
 
-The LGPL expressly permits linking from MIT or proprietary code; that is what
-distinguishes it from the GPL. What it asks in return is that the notices
-stay, the source stays available, and a user can relink against a modified
-version. Distributing this repository, source included, satisfies that.
+The APU and the NV2A register definitions were extracted from
+[xemu](https://github.com/xemu-project/xemu) and are that project's work, not
+ours. LGPL-2.1 expressly permits linking them from MIT or proprietary code, so
+a recompiled game is unaffected; what it asks is that the notices stay, the
+source stays available, and users can relink against a modified library.
+[LICENSES/LGPL-2.1.txt](LICENSES/LGPL-2.1.txt) is the verbatim licence text —
+shipping it alongside those files is a requirement, not a courtesy.
+
+Not every file under `src/apu/` and `src/nv2a/` is xemu-derived. See
+[NOTICE](NOTICE) for the exact list, each with the copyright it actually
+carries — including algorithms we implemented ourselves but learned from xemu,
+credited there even where no licence obligation attaches.
 
 ## Contributors
 

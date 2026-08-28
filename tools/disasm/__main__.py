@@ -70,20 +70,28 @@ def main():
         "--seed-functions",
         action="append",
         default=None,
+        metavar="JSON",
         help="JSON file with additional function entry points to seed the detector. "
              "Format: array of objects with 'start' field (hex address string). "
-             "May be repeated to merge seed sets.",
+             "Use identified_functions.json from func_id to feed back vtable thunks, "
+             "or icall_targets.json from tools.recomp.icall_feedback to feed back "
+             "measured indirect-branch targets. "
+             "Repeatable: pass it once per file. Hand-maintained seed lists and "
+             "machine-generated ones stay separate files rather than being merged "
+             "into each other.",
     )
 
     args = parser.parse_args()
 
     try:
         extra = [s.strip() for s in args.extra_sections.split(",")] if args.extra_sections else []
-        seed_funcs = [
-            addr
-            for path in (args.seed_functions or [])
-            for addr in _load_seed_functions(path)
-        ]
+        seed_funcs = []
+        for _seed_path in (args.seed_functions or []):
+            _got = _load_seed_functions(_seed_path)
+            seed_funcs.extend(_got)
+            if args.verbose:
+                print(f"  Seed file {_seed_path}: {len(_got)} addresses")
+        seed_funcs = sorted(set(seed_funcs))
         disassembler = Disassembler(
             xbe_path=args.xbe_path,
             analysis_json=args.analysis_json,

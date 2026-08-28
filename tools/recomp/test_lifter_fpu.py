@@ -13,7 +13,7 @@ class FpuLifterTest(unittest.TestCase):
 
         self.assertEqual(
             Lifter().lift_instruction(instruction),
-            ["fp_push(fp_st(0)); /* fld st(0) */"],
+            ["{ double _t = fp_top(); fp_push(_t); } /* fld st(0) */"],
         )
 
     def test_fst_does_not_pop_and_fstp_does(self):
@@ -62,7 +62,7 @@ class FpuLifterTest(unittest.TestCase):
 
         self.assertEqual(
             Lifter().lift_instruction(instruction),
-            ["fp_top() /= MEMF(0x123456); "
+            ["fp_top() = fp_top() / MEMF(0x123456); "
              "/* fdiv dword ptr [0x00123456] */"],
         )
 
@@ -72,7 +72,7 @@ class FpuLifterTest(unittest.TestCase):
 
         self.assertEqual(
             Lifter().lift_instruction(instruction),
-            ["fp_top() *= fp_st(1); /* fmul st(1) */"],
+            ["fp_top() = fp_top() * fp_st1(); /* fmul st(1) */"],
         )
 
     def test_translated_functions_share_runtime_fpu_state(self):
@@ -108,14 +108,14 @@ class FpuLifterTest(unittest.TestCase):
             root / "templates" / "new-game" / "src" / "main.c"
         ).read_text()
 
-        self.assertIn("extern double g_fp_stack[8];", runtime_types)
-        self.assertIn("extern uint32_t g_fp_top;", runtime_types)
+        self.assertIn("extern RECOMP_TLS double g_fp_stack[8];", runtime_types)
+        self.assertIn("extern RECOMP_TLS int g_fp_top;", runtime_types)
         self.assertIn("#define SMEM64(addr)", runtime_types)
-        self.assertIn("double g_fp_stack[8];", main)
-        self.assertIn("uint32_t g_fp_top;", main)
-        self.assertIn("extern uint16_t g_fp_control_word;", runtime_types)
-        self.assertIn("#define PARITY8(value)", runtime_types)
-        self.assertIn("uint16_t g_fp_control_word", main)
+        self.assertIn("extern RECOMP_TLS double g_fp_stack[8];", main)
+        self.assertIn("extern RECOMP_TLS int g_fp_top;", main)
+        self.assertIn("extern RECOMP_TLS uint16_t g_fp_control_word;", runtime_types)
+        self.assertIn("#define RECOMP_PARITY8(x)", runtime_types)
+        self.assertIn("extern RECOMP_TLS uint16_t g_fp_control_word;", main)
 
     def test_control_word_store_and_load_use_shared_state(self):
         operand = Operand(type="mem", mem_base="ebp", mem_disp=0xFFFFFFFC,
@@ -147,7 +147,8 @@ class FpuLifterTest(unittest.TestCase):
         # reads it, so the result has to be shared state, not a function local.
         self.assertIn("g_fp_cmp", lifted[0])
         self.assertNotIn("_fpu_cmp", lifted[0])
-        self.assertIn("0x4000u", lifted[0])
+        self.assertIn("0x40u", lifted[0])
+        self.assertIn("<< 8", lifted[0])
         self.assertNotIn("/* fnstsw ax - store FPU status word */", lifted[0])
 
     def test_compare_writes_the_shared_result(self):

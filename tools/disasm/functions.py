@@ -9,6 +9,7 @@ Implements multi-pass function detection with confidence scoring:
 5. Cross-validation and overlap resolution
 """
 
+import bisect
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -79,6 +80,11 @@ class FunctionDetector:
         # Final function list
         self.functions: Dict[int, Function] = {}
 
+        # Tail-jump targets landing inside another function: addr -> that
+        # function's end. Kept out of self._candidates so they cannot truncate
+        # the function they land in.
+        self._alias_entries: Dict[int, int] = {}
+
     def detect_all(self, sections: Optional[List[SectionInfo]] = None) -> int:
         """
         Run all detection passes and build the function database.
@@ -108,6 +114,29 @@ class FunctionDetector:
 
         # Pass 5: Build functions from candidates
         self._build_functions(sections)
+
+        # Pass 6: Tail-jump targets. A function reached only by "jmp" and never
+        # by "call" is invisible to every pass above, so it is emitted as a stub
+        # that returns without unwinding the frame its jumping caller built --
+        # silently corrupting the simulated stack for everything upstream. Halo
+        # had 127 of these; one of them (the CRT two-arg error handler) leaked
+        # 0x24 bytes per call and turned a 6-iteration init loop into 21,938
+        # allocations that exhausted the heap.
+        #
+        # Needs the bodies from pass 5 to tell a tail jump from an ordinary
+        # intra-function branch, so it runs after and rebuilds. Iterate: a newly
+        # found function can itself tail-jump somewhere new.
+        for _round in range(8):
+            before = len(self._candidates)
+            if not self._pass_tail_jump_targets(sections):
+                break
+            print(f"  tail-jump pass {_round}: "
+                  f"+{len(self._candidates) - before} standalone, "
+                  f"{len(self._alias_entries)} aliases")
+            self.functions.clear()
+            self._build_functions(sections)
+
+        self._build_alias_entries()
 
         # Populate call graph
         self._build_call_graph()
@@ -227,16 +256,128 @@ class FunctionDetector:
                 code_ranges.add(addr)
 
         call_targets = self.engine.get_call_targets()
+        realigned = unaligned = 0
         for target in call_targets:
-            # Verify target is in a code section and has a decoded instruction
-            if target in self.engine.instructions:
-                section = self.image.get_section_at_va(target)
-                if section and section.executable:
-                    self._add_candidate(
-                        target,
-                        config.CONFIDENCE_CALL_TARGET,
-                        "call_target"
-                    )
+            section = self.image.get_section_at_va(target)
+            if not (section and section.executable):
+                continue
+            # A direct call to an executable address is the strongest evidence
+            # of a function start there is -- stronger than a prologue match,
+            # which is a guess about bytes. It used to be discarded whenever the
+            # linear sweep had stepped over that exact address, which happens
+            # wherever the sweep passes through data and comes out of phase.
+            # Decode there instead of dropping the candidate; see
+            # Engine.decode_at. On Halo 2276 this is 46 functions that were
+            # becoming `g_esp += 4` no-op stubs.
+            if target not in self.engine.instructions:
+                # Manufacturing an instruction here is creating evidence, not
+                # reading it, so require corroboration. A call operand decoded
+                # out of data produces a plausible-looking in-section address
+                # that is almost never aligned; a real MSVC function start
+                # almost always is. Targets that already decoded are untouched,
+                # whatever their alignment -- that is pre-existing behaviour.
+                if target % config.CALL_TARGET_REALIGN_ALIGNMENT:
+                    unaligned += 1
+                    continue
+                if self.engine.decode_at(target):
+                    realigned += 1
+                else:
+                    continue  # genuinely undecodable: not code
+            self._add_candidate(
+                target,
+                config.CONFIDENCE_CALL_TARGET,
+                "call_target"
+            )
+        if realigned or unaligned:
+            print(f"  Realigned {realigned} call targets the sweep stepped over"
+                  f" ({unaligned} rejected as unaligned)")
+
+    def _pass_tail_jump_targets(self, sections: List[SectionInfo]) -> bool:
+        """
+        Pass 6: Add the target of every unconditional jmp that leaves the body
+        of the function containing it.
+
+        Returns True if any new candidate was added.
+        """
+        bodies = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bodies]
+        added = False
+
+        for insn in self.engine.instructions.values():
+            if not insn.is_jump or insn.is_cond_jump:
+                continue
+            target = insn.jump_target
+            if target is None or target in self._candidates:
+                continue
+            if target not in self.engine.instructions:
+                continue
+
+            # The jump is a tail jump only if it leaves its own function.
+            i = bisect.bisect_right(starts, insn.address) - 1
+            if i < 0:
+                continue
+            body_start, body_end = bodies[i]
+            if insn.address >= body_end:
+                continue            # not inside any known function
+            if body_start <= target < body_end:
+                continue            # ordinary intra-function branch
+
+            section = self.image.get_section_at_va(target)
+            if section is None or not section.executable:
+                continue
+
+            # Does the target land inside some *other* function? The CRT does
+            # this constantly -- _startOneArgErrorHandling jumps into the middle
+            # of _startTwoArgErrorHandling to share its tail. Registering that
+            # address as an ordinary candidate would truncate the function it
+            # lands in, breaking the very code it wanted to reach. Record it as
+            # an alias entry instead: same end address, translated separately.
+            j = bisect.bisect_right(starts, target) - 1
+            if j >= 0 and bodies[j][0] < target < bodies[j][1]:
+                if target not in self._alias_entries:
+                    self._alias_entries[target] = bodies[j][1]
+                    added = True
+                continue
+
+            self._add_candidate(target, config.CONFIDENCE_TAIL_JUMP,
+                                "tail_jump_target")
+            added = True
+
+        return added
+
+    def _build_alias_entries(self) -> None:
+        """
+        Emit a Function for each tail-jump target that lands inside another
+        function, running from the target to that function's end.
+
+        The overlap is deliberate: the translator produces a second body for the
+        shared tail, which costs a little code size and makes the entry point
+        callable. The alternative -- a stub that returns immediately -- silently
+        skips the epilogue and leaks the caller's frame.
+        """
+        for addr, end in sorted(self._alias_entries.items()):
+            if addr in self.functions:
+                continue
+            insns = self.engine.get_instructions_in_range(addr, end)
+            if not insns:
+                continue
+            section = self.image.get_section_at_va(addr)
+            sec_name = section.name if section else ""
+            label = self.labels.get(addr)
+            name = label.name if label else f"sub_{addr:08X}"
+            if not label:
+                self.labels.auto_name_function(
+                    addr, sec_name, config.CONFIDENCE_TAIL_JUMP)
+            self.functions[addr] = Function(
+                start=addr,
+                end=end,
+                name=name,
+                section=sec_name,
+                confidence=config.CONFIDENCE_TAIL_JUMP,
+                detection_method="tail_jump_alias",
+                num_instructions=len(insns),
+                has_prologue=False,
+            )
 
     def _build_functions(self, sections: List[SectionInfo]) -> None:
         """
@@ -322,7 +463,8 @@ class FunctionDetector:
         Walks forward from start, tracking the furthest reachable point
         through fall-through and internal jumps.
         """
-        max_addr = start
+        max_addr = start   # exclusive end of the code decoded so far
+        max_target = start  # highest branch target that must be *inside* it
         addr = start
 
         # Upper bound
@@ -339,16 +481,37 @@ class FunctionDetector:
             if end > max_addr:
                 max_addr = end
 
-            # Track internal forward jumps to extend function bounds
-            if insn.is_cond_jump and insn.jump_target is not None:
+            # Track internal forward jumps to extend function bounds.
+            #
+            # Unconditional jumps count too, not just conditional ones. A body
+            # ending in "jmp <forward>" - the tail of an if/else, or a jump
+            # over an interleaved block - otherwise hit the break below with
+            # max_addr still short of the target, truncating the function
+            # mid-body. Everything past the cut then looked like separate code,
+            # and the function's own jump targets became calls to empty stubs.
+            #
+            # `upper` is already clamped to the next known function start, so a
+            # target inside these bounds is internal rather than a tail call.
+            # is_jump and is_cond_jump are mutually exclusive; is_branch is both.
+            if insn.is_branch and insn.jump_target is not None:
                 target = insn.jump_target
-                if start <= target < upper and target > max_addr:
+                if start <= target < upper and target > max_target:
                     # This jump goes forward within bounds, extend
-                    max_addr = target
+                    max_target = target
 
             if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
-                # Check if we've covered all internal jump targets
-                if addr + insn.size >= max_addr:
+                # Stop only once we have decoded *past* every internal branch
+                # target. A target is an address that must be inside the
+                # function, so landing exactly on it is not coverage -- the
+                # instruction there still has to be decoded. Using the target
+                # as an exclusive end cut functions off at their own
+                # out-of-line tail: MSVC routinely emits "jmp <backward>" and
+                # then parks a conditional branch's target after it. Halo's
+                # get_edge_vertex ended at the branch target, so the tail was
+                # lifted as a separate function and the jump to it became a
+                # tail call that returned without running the epilogue --
+                # leaking the whole 28-byte frame on every call.
+                if insn.end_address > max_target:
                     break
                 # There might be more code after (jumped over)
                 addr = insn.end_address
