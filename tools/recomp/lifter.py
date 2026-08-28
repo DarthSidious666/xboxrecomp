@@ -605,8 +605,10 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
     if target is None:
         return f"if ({cond_expr}) {{ /* {jcc}: {desc} - indirect */ }}"
     if lifter and lifter._is_external_target(target):
+        # Conditional tail call: same frame bridge as the unconditional tail
+        # jmp in _lift_jmp, applied only on the taken path.
         name = lifter._call_target_name(target)
-        return (f"if ({cond_expr}) {{ {name}(); return; }}"
+        return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; {name}(); return; }}"
                 f" /* {jcc}: {desc} */")
     return f"if ({cond_expr}) goto loc_{target:08X}; /* {jcc}: {desc} */"
 
@@ -750,6 +752,7 @@ class Lifter:
             seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
         self.SEH_PROLOG = seh_prolog
         self.SEH_EPILOG = seh_epilog
+        self.jump_table_targets = {}
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.
@@ -1196,7 +1199,17 @@ class Lifter:
         elif len(ops) >= 1:
             target = _fmt_operand_read(ops[0])
             # Mark indirect calls for post-processing by _fixup_icall_esp_save
-            return [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
+            #
+            # The target is read into a local BEFORE the return-address push.
+            # On real x86 the memory operand is computed before the push, so
+            # emitting the push first shifts esp by four and every esp-relative
+            # target -- `call dword ptr [esp+8]`, the shape MSVC gives a
+            # callback invoked through a stack argument -- is read four bytes
+            # low and dispatches through the wrong slot.
+            return [f"{{ uint32_t _icall_target = {target}; "
+                    "PUSH32(esp, 0); "
+                    "RECOMP_ICALL_SAFE(_icall_target, _icall_esp); }"
+                    " /* indirect call */"]
         return ["/* call: no target */"]
 
     def _lift_ret(self, insn, ops):
@@ -1248,7 +1261,9 @@ class Lifter:
         if not op.mem_disp or not (op.mem_index or op.mem_base):
             return []
         table_va = op.mem_disp
-        targets = self._read_jump_table(table_va)
+        targets = self.jump_table_targets.get(table_va)
+        if targets is None:
+            targets = self._read_jump_table(table_va)
         if not targets:
             return []
         # Check that ALL targets are within the current function
@@ -1290,7 +1305,7 @@ class Lifter:
             if target:
                 if self._is_external_target(target):
                     name = self._call_target_name(target)
-                    return [f"if ({cond}) {{ {name}(); return; }} /* {jcc} */"]
+                    return [f"if ({cond}) {{ g_seh_ebp = ebp; {name}(); return; }} /* {jcc} */"]
                 return [f"if ({cond}) goto loc_{target:08X}; /* {jcc} */"]
             return [f"/* {jcc} - no target */"]
 
@@ -1299,7 +1314,7 @@ class Lifter:
         if target:
             if self._is_external_target(target):
                 name = self._call_target_name(target)
-                return [f"if (_flags /* {jcc}: {desc} */) {{ {name}(); return; }}"]
+                return [f"if (_flags /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
             return [f"if (_flags /* {jcc}: {desc} */) goto loc_{target:08X};"]
         return [f"/* {jcc}: {desc} - no target */"]
 
