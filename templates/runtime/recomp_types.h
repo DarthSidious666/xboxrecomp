@@ -255,6 +255,8 @@ void recomp_trace_esp(const char *name, const char *tag);
  * being the unordered form) and the header stays portable.
  * ================================================================ */
 
+#ifndef RECOMP_XMM_DEFINED
+#define RECOMP_XMM_DEFINED
 typedef union RecompXmm {
     float    f[4];
     double   d[2];
@@ -262,6 +264,7 @@ typedef union RecompXmm {
     int32_t  i[4];
     uint64_t q[2];
 } RecompXmm;
+#endif
 
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;

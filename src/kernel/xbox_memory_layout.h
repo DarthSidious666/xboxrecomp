@@ -167,6 +167,22 @@ void xbox_ProtectMirrorsForDebug(void);
 #  define RECOMP_TLS _Thread_local
 #endif
 
+/* SSE register storage, shared with the generated code. Defined in both this
+ * header and templates/runtime/recomp_types.h -- a translation unit can end up
+ * including both, so the guard keeps that from being a redefinition. Keep the
+ * two identical: the generated code and the runtime have to agree on the
+ * layout, and nothing else checks. */
+#ifndef RECOMP_XMM_DEFINED
+#define RECOMP_XMM_DEFINED
+typedef union RecompXmm {
+    float    f[4];
+    double   d[2];
+    uint32_t u[4];
+    int32_t  i[4];
+    uint64_t q[2];
+} RecompXmm;
+#endif
+
 #define XBOX_STACK_SIZE     (8 * 1024 * 1024)
 
 /** Base VA of the stack area (above last XBE section). */
