@@ -68,17 +68,22 @@ def main():
     )
     parser.add_argument(
         "--seed-functions",
+        action="append",
         default=None,
         help="JSON file with additional function entry points to seed the detector. "
              "Format: array of objects with 'start' field (hex address string). "
-             "Use identified_functions.json from func_id to feed back vtable thunks.",
+             "May be repeated to merge seed sets.",
     )
 
     args = parser.parse_args()
 
     try:
         extra = [s.strip() for s in args.extra_sections.split(",")] if args.extra_sections else []
-        seed_funcs = _load_seed_functions(args.seed_functions) if args.seed_functions else []
+        seed_funcs = [
+            addr
+            for path in (args.seed_functions or [])
+            for addr in _load_seed_functions(path)
+        ]
         disassembler = Disassembler(
             xbe_path=args.xbe_path,
             analysis_json=args.analysis_json,

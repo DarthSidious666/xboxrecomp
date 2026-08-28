@@ -439,11 +439,37 @@ A: C is portable, debuggable, and the compiler optimizes it for you. You can rea
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
+
+Two subsystems are not MIT and are not ours: the MCPX APU sources under
+`src/apu/` and `src/nv2a/nv2a_regs.h` were extracted from
+[xemu](https://github.com/xemu-project/xemu) and remain LGPL-2.1-or-later,
+copyright espes, Jannik Vogel and Matt Borgerson. They keep their own licence
+and their own notices. [NOTICE](NOTICE) lists every such file with the
+copyright it carries, and [LICENSES/LGPL-2.1.txt](LICENSES/LGPL-2.1.txt) is
+the verbatim licence text — shipping it alongside those files is an LGPL
+requirement, not a courtesy.
+
+The LGPL expressly permits linking from MIT or proprietary code; that is what
+distinguishes it from the GPL. What it asks in return is that the notices
+stay, the source stays available, and a user can relink against a modified
+version. Distributing this repository, source included, satisfies that.
+
+## Contributors
+
+xboxrecomp is built by more than one person. See
+**[CONTRIBUTORS.md](CONTRIBUTORS.md)** for who did what — including the people
+who never sent a patch and still moved the project further than a patch would
+have, by finding the wall everyone else was about to hit.
+
+Thank you, all of you.
 
 ## Credits
 
 Built with [Claude Code](https://claude.ai) (Anthropic) — proving that AI-assisted systems programming can tackle problems previously considered impractical.
+
+Human contributors are credited in [CONTRIBUTORS.md](CONTRIBUTORS.md); the
+third-party code we build on is credited in [NOTICE](NOTICE).
 
 ## References
 

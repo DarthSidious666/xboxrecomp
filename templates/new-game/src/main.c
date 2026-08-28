@@ -55,6 +55,16 @@
 extern uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern uint32_t g_ebx, g_esi, g_edi;
 extern uint32_t g_seh_ebp;
+double g_fp_stack[8];
+uint32_t g_fp_top;
+/* x87 reset default: all exceptions masked, round to nearest. */
+uint16_t g_fp_control_word = 0x037fu;
+int g_fp_cmp;
+/* SSE state. Global for the same reason the volatile GPRs are: one guest
+ * routine can lift to several C functions, and a value written in one
+ * body is read in the next. */
+RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
+RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* ── XBE Constants ─────────────────────────────────────────── */
