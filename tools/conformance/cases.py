@@ -284,4 +284,16 @@ CASES = [
          ["test ax, ax", "setns al", "movzx eax, al"], _PAIRS),
     Case("js_cmp_i8", "sign flag after an 8-bit cmp, which truncates first",
          ["cmp al, cl", "sets al", "movzx eax, al"], _PAIRS),
+
+    # bt/btr/bts/btc are 386 instructions, so real Xbox code has them. They
+    # were unhandled until the corpus lifted the CRT's float-to-int helper,
+    # which uses btr to clear a rounding-control bit of the x87 control word.
+    Case("bt_read", "bt sets CF from the selected bit",
+         ["bt eax, ecx", "sbb eax, eax"], _PAIRS),
+    Case("btr_clear", "btr reads the bit and then clears it",
+         ["btr eax, 5"], _PAIRS),
+    Case("bts_set", "bts sets it", ["bts eax, 5"], _PAIRS),
+    Case("btc_flip", "btc complements it", ["btc eax, 5"], _PAIRS),
+    Case("btr_reg", "btr with a register bit index, which is taken mod 32",
+         ["btr eax, ecx"], _PAIRS),
 ]

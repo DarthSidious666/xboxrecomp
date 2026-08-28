@@ -232,65 +232,83 @@ def main_with_args(argv):
 
 
 def _run_corpus(vcvars, workdir, runtime_inc, args):
-    """Phase two: real C functions, compiled, lifted, and compared."""
+    """Phase two: real C functions -- compiled, linked, lifted, compared."""
+    nl = chr(10)
     fns = [f for f in CORPUS if not args.k or args.k in f["name"]]
     if not fns:
         return 0
-    src = "\n".join(f["source"] for f in fns)
     with open(os.path.join(workdir, "corpus.c"), "w") as f:
         f.write("/* corpus: compiled with the target compiler, then lifted "
-                "back */\n" + src + "\n")
-    # /O2 on purpose: the point is to lift what the optimiser really emits.
-    #
+                "back out of the linked image */" + nl
+                + "#define EXP __declspec(dllexport)" + nl
+                + nl.join(fn["source"] for fn in fns) + nl)
+
     # /arch:IA32 because the Xbox CPU is a Pentium III -- SSE1, no SSE2. Modern
     # MSVC defaults to SSE2 and puts doubles in XMM, which no real Xbox binary
     # contains, so without this the corpus would test instructions the target
-    # cannot execute and skip the x87 paths that every Xbox title actually uses.
-    r = _cl(vcvars, workdir, "/c /O2 /GS- /arch:IA32 /FAc /Facorpus.cod corpus.c")
+    # cannot execute and skip the x87 paths every Xbox title actually uses.
+    r = _cl(vcvars, workdir, "/c /O2 /GS- /arch:IA32 corpus.c")
     if r.returncode != 0:
-        print("corpus compile failed:\n" + r.stdout + r.stderr, file=sys.stderr)
-        return 1
-    with open(os.path.join(workdir, "corpus.cod"), errors="replace") as f:
-        cod = f.read()
-
-    prepared, skipped = [], []
-    for fn in fns:
-        code, text = corpus_run.function_bytes(cod, fn["name"])
-        sym = corpus_run._SYMBOLIC.search(text)
-        if sym:
-            # An unlinked .obj still has zero where the linker will patch, so
-            # these bytes cannot be lifted honestly. Say so rather than compare
-            # against nonsense.
-            skipped.append((fn["name"], sym.group(0).strip()))
-            continue
-        prepared.append((fn, corpus_run.lift_function(code, fn["name"])))
-        if args.verbose:
-            print(f"  {fn['name']:<14} {len(code):>4} bytes  "
-                  f"{len(prepared[-1][1].splitlines()):>4} C lines")
-
-    if skipped:
-        print("\nSkipped (needs a relocation the .obj has not resolved):",
+        print("corpus compile failed:" + nl + r.stdout + r.stderr,
               file=sys.stderr)
-        for name, why in skipped:
-            print(f"  {name:<14} references {why}", file=sys.stderr)
-
-    if not prepared:
         return 1
+
+    # Linked, at a fixed base with relocations stripped, so every address in
+    # the image is final and the harness can map it where it was built for.
+    link = subprocess.run(
+        f'"{vcvars}" >nul 2>&1 && link /NOLOGO /DLL /NOENTRY /OUT:corpus.dll '
+        f'/MAP:corpus.map /BASE:0x{corpus_run.IMAGE_BASE:08X} /FIXED '
+        f'/INCREMENTAL:NO corpus.obj kernel32.lib',
+        cwd=workdir, shell=True, capture_output=True, text=True)
+    if link.returncode != 0:
+        print("corpus link failed:" + nl + link.stdout + link.stderr,
+              file=sys.stderr)
+        return 1
+
+    with open(os.path.join(workdir, "corpus.dll"), "rb") as f:
+        dll = f.read()
+    with open(os.path.join(workdir, "corpus.map"), errors="replace") as f:
+        mp = f.read()
+
+    lifted, sections, base, missing, addr_of, unlifted = corpus_run.lift_all(
+        dll, mp, ["_" + fn["name"] for fn in fns])
+    if missing:
+        print(nl + "Not found in the linked image (inlined away?): "
+              + ", ".join(missing), file=sys.stderr)
+    entries = [fn for fn in fns if "_" + fn["name"] not in missing]
+    if not entries:
+        return 1
+    wanted = {"_" + fn["name"] for fn in entries}
+    if args.verbose:
+        for sym, body in lifted:
+            mark = " " if sym in wanted else "*"
+            print(f"  {mark} {sym:<22} {len(body.splitlines()):>5} C lines")
+        print("  (* reached by a call from a corpus function, lifted too)")
+
+    if unlifted:
+        print(nl + "Instructions that lifted to a comment (silent no-ops, so "
+              "the comparison below cannot see them):", file=sys.stderr)
+        for fname, lines in sorted(unlifted.items()):
+            print(f"  {fname}", file=sys.stderr)
+            for line in lines:
+                print(f"      {line}", file=sys.stderr)
+
     with open(os.path.join(workdir, "corpus_harness.c"), "w") as f:
-        f.write(corpus_run.harness_source(prepared))
+        f.write(corpus_run.harness_source(entries, lifted, dll, sections, base, addr_of))
     r = _cl(vcvars, workdir,
             f'/W3 /I"{runtime_inc}" corpus_harness.c corpus.obj '
             f'/Fecorpus_harness.exe')
     if r.returncode != 0:
-        print("corpus harness build failed:\n" + r.stdout + r.stderr,
+        print("corpus harness build failed:" + nl + r.stdout + r.stderr,
               file=sys.stderr)
         return 1
     run = subprocess.run([os.path.join(workdir, "corpus_harness.exe")],
                          capture_output=True, text=True)
     print(run.stdout.strip())
     if run.returncode < 0 or run.returncode > 1:
-        print(f"\ncorpus harness terminated abnormally: exit {run.returncode} "
-              f"(0x{run.returncode & 0xFFFFFFFF:08X})", file=sys.stderr)
+        print(nl + f"corpus harness terminated abnormally: exit "
+              f"{run.returncode} (0x{run.returncode & 0xFFFFFFFF:08X})",
+              file=sys.stderr)
         return 1
     return run.returncode
 

@@ -531,6 +531,15 @@ linked, ran, and was wrong, with no lifter warning anywhere.
   - **`js`/`jns` evaluated the sign at 32 bits**, so after an 8- or 16-bit
     `test` every value with the top bit set looked positive. The same width bug
     the signed compares had; these two were missed at the time.
+  - **`bt`/`btr`/`bts`/`btc` were unhandled** — 386 instructions, lifted to a
+    comment, so the bit was silently left alone. Surfaced once the corpus began
+    lifting the CRT's float-to-int helper, which uses `btr` on the x87 control
+    word.
+
+  The corpus lifts from a **linked image**, so jump tables, `.rdata` float
+  constants and calls to CRT helpers all work — `__allmul` is lifted and
+  verified alongside the corpus itself. Totals: **2,583 snippet vectors and 211
+  whole-function vectors**.
 
 ### v0.5.0 — *"Fall-Through"* (July 2026)
 

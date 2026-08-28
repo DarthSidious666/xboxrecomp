@@ -936,6 +936,30 @@ class Lifter:
         if m == "bswap" and nops >= 1 and ops[0].type == "reg":
             r = _fmt_reg(ops[0].reg)
             return [f"{r} = BSWAP32({r}); /* bswap */"]
+        # ── Bit test and modify ──
+        # 386 instructions, so real Xbox code has them. The CRT's float-to-int
+        # helper uses `btr` to clear a rounding-control bit of the x87 control
+        # word, which is exactly the _control87 shape. Unhandled, they lifted to
+        # a comment and the bit was silently left alone.
+        if m in ("bt", "btr", "bts", "btc") and nops >= 2:
+            dst, bit = ops[0], ops[1]
+            index = (f"({_fmt_imm(bit.imm)})" if bit.type == "imm"
+                     else f"({_fmt_operand_read(bit)} & 31)")
+            value = _fmt_operand_read(dst)
+            out = []
+            if self.needs_cf:
+                out.append(f"_cf = (int)(({value} >> {index}) & 1u);"
+                           f" /* {m}: CF = bit */")
+            update = {"btr": f"{value} & ~(1u << {index})",
+                      "bts": f"{value} | (1u << {index})",
+                      "btc": f"{value} ^ (1u << {index})"}.get(m)
+            if update:
+                out.append(_fmt_operand_write(dst, f"({update})")
+                           + f" /* {m} */")
+            elif not out:
+                out.append(f"/* bt {insn.op_str}: no CF consumer */")
+            return out
+
         if m == "int3":
             return ["__debugbreak(); /* int3 */"]
         if m in ("leave",):

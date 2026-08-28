@@ -167,10 +167,29 @@ Snippets test instructions someone thought to write down. `corpus.py` tests
 what the optimiser actually emits.
 
 Each entry is a C function. The runner compiles the corpus with **`/O2 /GS-
-/arch:IA32`**, pulls each function's bytes out of the listing, lifts them
-through the real `FunctionTranslator` — not just the lifter, so frame handling,
-labels and block layout are exercised too — and then runs the lifted C against
-the original compiled function over the same arguments.
+/arch:IA32`**, **links it** into a DLL at a fixed base with relocations
+stripped, lifts each function out of the linked image through the real
+`FunctionTranslator` — not just the lifter, so frame handling, labels and block
+layout are exercised too — and runs the lifted C against the original compiled
+function over the same arguments.
+
+Linking is what makes this work on real code. In an unlinked `.obj` every
+reference outside the function is still zero, waiting for the linker, so
+lifting those bytes gives confident nonsense. In the linked image the addresses
+are final: a jump table, a float constant in `.rdata` and a call to a CRT
+helper are all just numbers. That is also the shape a real XBE arrives in, so
+the pipeline is the same one a port uses rather than a special case.
+
+The harness maps the image at the address it was linked for with
+`VirtualAlloc`, so a guest address is a host address, `g_xbox_mem_offset` stays
+zero, and the lifted code reads the real `.rdata` bytes.
+
+**Callees are lifted too.** A corpus function that calls `__allmul` needs
+`__allmul` lifted, so the runner follows every direct call *and tail jump* out
+of a function and lifts what it reaches — which is exactly what a real port
+does with the CRT rather than a special case here. Anything still referenced
+and undefined gets a stub that reports itself and fails the run, so a call that
+went nowhere can never pass silently.
 
 `/arch:IA32` matters. The Xbox CPU is a Pentium III: SSE1, no SSE2. Modern MSVC
 defaults to SSE2 and puts doubles in XMM, which no real Xbox binary contains,
@@ -182,14 +201,13 @@ stack, right to left, under a return address — `__cdecl`, which is what the
 recompiler's generated code already assumes. Setting that up is part of the
 point: it exercises the real calling path.
 
-**Only leaf functions with no external references.** Anything referring outside
-the function becomes a relocation, and in an unlinked `.obj` those bytes are
-still zero — lifting them produces confident nonsense. The runner refuses such
-a function by inspecting its listing (a `call _name`, an `OFFSET`, a `__real@`
-literal in `.rdata`) and says which symbol disqualified it, rather than
-trusting the corpus to stay well-behaved. `c_mul64` and `c_int2dbl` are skipped
-for exactly this reason: MSVC lowers 64-bit multiply and float-to-int through
-CRT helpers.
+Every corpus function is `__declspec(dllexport)`, or `/O2` would inline it into
+its only caller and leave nothing to lift.
+
+The runner reports any instruction that lifted to a bare comment. Those are
+**invisible to the comparison** — an unhandled instruction usually leaves the
+result register alone, so the two sides can agree while the lift does nothing.
+That report is what diagnosed the float-to-int gap below.
 
 ## What phase two found
 
@@ -217,13 +235,34 @@ Both were found by a single corpus function: an eight-iteration loop over
 iteration becoming `test dl, dl` + `jns`. No snippet in phase one produced that
 shape, because nobody thought to write it.
 
+**`bt` / `btr` / `bts` / `btc` were unhandled.** 386 instructions, so real Xbox
+code has them, and they lifted to a comment — the bit was silently left alone.
+Found once the corpus started lifting the CRT's float-to-int helper, which uses
+`btr` to clear a rounding-control bit of the x87 control word. That is the
+`_control87` shape, not an exotic one.
+
+## A divergence worth naming
+
+Float-to-int is deliberately **not** in the corpus. MSVC lowers it to
+`__ftol2`, whose modern LIBCMT implementation branches on `__isa_available`
+and, on the fast path, uses `fisttp` — an **SSE3** instruction. The Xbox is a
+Pentium III: no SSE3, and its XDK CRT's `__ftol` is plain x87.
+
+Comparing against the host's helper would measure this machine's CPU dispatch
+rather than the lifter, and the two sides cannot even agree on which branch to
+take: the native side has a CRT that ran its startup, while the lifted side
+reads the image's initial value for that variable.
+
+This is recorded rather than papered over, and the unlifted-instruction report
+will say so if such a function is ever pulled in again. `__allmul` — 64-bit
+multiply — has no such problem and *is* lifted and verified.
+
 ## Extending it
 
 Add a case to `cases.py`, or a function to `corpus.py`. Worth going after next:
 
-- **Relocations**, so corpus functions may reference `.rdata` and call CRT
-  helpers. That needs the `.obj`'s relocation table applied against a mapped
-  data section, and it would unlock float constants, jump tables and the
-  `__allmul`/`__ftol2` helpers every real title is full of.
-- **Switch statements**, which is the same problem: the jump table lives in
-  `.rdata` and reaches it through a relocation.
+- **A real XBE**, rather than a DLL we built. The pipeline is now the same
+  shape, so the remaining work is mapping a title's sections and picking
+  functions with known-good expected behaviour to compare against.
+- **Indirect calls through data** — vtables and function-pointer tables, which
+  is where a real bring-up spends most of its time.
