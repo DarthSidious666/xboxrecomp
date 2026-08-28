@@ -519,6 +519,18 @@ linked, ran, and was wrong, with no lifter warning anywhere.
     `adc`/`sbb` read kept whatever the last arithmetic left in it.
   - **`fnstsw` did not model TOP** (status bits 11–13, AH bits 3–5) and the
     `ax` form wrote only AH rather than all of AX.
+- **Whole-function conformance** — a second phase compiles a C corpus with
+  `/O2 /arch:IA32` (Pentium III: SSE1, no SSE2, like the real hardware), lifts
+  the machine code back through the full `FunctionTranslator`, and runs it
+  against the original. Testing what the optimiser emits rather than what
+  someone thought to write down found two more:
+  - **Flag state followed address order, not control flow.** A `jcc` consuming
+    a `cmp` from a non-adjacent block inherited the flags of whatever sat above
+    it in memory — usually an `add`, which clobbers them. State now propagates
+    along predecessor edges, and only when every predecessor agrees.
+  - **`js`/`jns` evaluated the sign at 32 bits**, so after an 8- or 16-bit
+    `test` every value with the top bit set looked positive. The same width bug
+    the signed compares had; these two were missed at the time.
 
 ### v0.5.0 — *"Fall-Through"* (July 2026)
 

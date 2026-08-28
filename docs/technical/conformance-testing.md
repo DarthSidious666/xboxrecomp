@@ -161,12 +161,69 @@ recording because both would have produced confident false reports:
   dropped instruction is precisely the failure this tool exists to catch, so
   having it in the harness was worse than not having the harness.
 
+## Phase two: whole functions
+
+Snippets test instructions someone thought to write down. `corpus.py` tests
+what the optimiser actually emits.
+
+Each entry is a C function. The runner compiles the corpus with **`/O2 /GS-
+/arch:IA32`**, pulls each function's bytes out of the listing, lifts them
+through the real `FunctionTranslator` — not just the lifter, so frame handling,
+labels and block layout are exercised too — and then runs the lifted C against
+the original compiled function over the same arguments.
+
+`/arch:IA32` matters. The Xbox CPU is a Pentium III: SSE1, no SSE2. Modern MSVC
+defaults to SSE2 and puts doubles in XMM, which no real Xbox binary contains,
+so without it the corpus tests instructions the target cannot execute and skips
+the x87 paths every Xbox title actually uses.
+
+The lifted function is `void f(void)` and takes its arguments off the guest
+stack, right to left, under a return address — `__cdecl`, which is what the
+recompiler's generated code already assumes. Setting that up is part of the
+point: it exercises the real calling path.
+
+**Only leaf functions with no external references.** Anything referring outside
+the function becomes a relocation, and in an unlinked `.obj` those bytes are
+still zero — lifting them produces confident nonsense. The runner refuses such
+a function by inspecting its listing (a `call _name`, an `OFFSET`, a `__real@`
+literal in `.rdata`) and says which symbol disqualified it, rather than
+trusting the corpus to stay well-behaved. `c_mul64` and `c_int2dbl` are skipped
+for exactly this reason: MSVC lowers 64-bit multiply and float-to-int through
+CRT helpers.
+
+## What phase two found
+
+**Flag state followed address order, not control flow.** This is the big one.
+`FunctionTranslator` threaded the `cmp`/`test` state from one block to the next
+in *address* order. That is only right for fall-through. An optimising compiler
+routinely lets a `jcc` consume a comparison from a block that is not its
+neighbour in memory — and the block that *is* its neighbour often ends in an
+`add`, which clobbers flags. The condition then came out as a plausible-looking
+test of the wrong thing. Flag state now propagates along predecessor edges, and
+only when every predecessor agrees; a block whose predecessors disagree, or
+whose predecessor is a not-yet-walked back edge, gets no inherited state and
+falls back rather than guessing.
+
+**`js` / `jns` evaluated the sign at 32 bits.** SF is the sign bit of the result
+at the *operand's* width. `test dl, dl; jns` asks about bit 7, but the lifted
+condition tested the zero-extended byte as an `int32`, so `0x80`–`0xFF` looked
+positive and the branch went the same way every time. Exactly the defect the
+width-aware `CMP_L`/`CMP_G` fixed for the signed compares — `js`/`jns` were
+simply missed at the time. `cmp` has the same issue, since it must truncate the
+difference before taking its sign.
+
+Both were found by a single corpus function: an eight-iteration loop over
+`((a>>i)&1)`, which `/O2` unrolls into `test dl, 1<<i` + `je`, with the last
+iteration becoming `test dl, dl` + `jns`. No snippet in phase one produced that
+shape, because nobody thought to write it.
+
 ## Extending it
 
-Add a case to `cases.py`. The two directions worth going next:
+Add a case to `cases.py`, or a function to `corpus.py`. Worth going after next:
 
-- **Whole functions.** Compile a corpus of C with a 32-bit MSVC, lift the
-  result, and compare against the same source compiled natively — ps3recomp's
-  `lift_selftest.py` shape. That exercises what an optimising compiler actually
-  emits (register allocation, branch layout, CRT idioms) rather than sequences
-  someone thought to write down.
+- **Relocations**, so corpus functions may reference `.rdata` and call CRT
+  helpers. That needs the `.obj`'s relocation table applied against a mapped
+  data section, and it would unlock float constants, jump tables and the
+  `__allmul`/`__ftol2` helpers every real title is full of.
+- **Switch statements**, which is the same problem: the jump table lives in
+  `.rdata` and reaches it through a relocation.

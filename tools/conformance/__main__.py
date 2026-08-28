@@ -30,6 +30,8 @@ import tempfile
 
 from .cases import CASES
 from .harness import (MARK, _MARK_BYTES, harness_source, native_source)
+from . import corpus_run
+from .corpus import CORPUS
 
 _WHY = {c["name"]: c["why"] for c in CASES}
 _TOL = {c["name"]: c.get("tol", 0.0) for c in CASES}
@@ -136,6 +138,8 @@ def main_with_args(argv):
     ap.add_argument("--keep", action="store_true",
                     help="keep the generated C and listing for inspection")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--only", choices=("snippets", "corpus"),
+                    help="run only one of the two phases (default: both)")
     args = ap.parse_args(argv)
 
     vcvars = _find_vcvars()
@@ -145,7 +149,7 @@ def main_with_args(argv):
         return 2
 
     cases = [c for c in CASES if not args.k or args.k in c["name"]]
-    if not cases:
+    if not cases and args.only != "corpus":
         print(f"no cases match {args.k!r}", file=sys.stderr)
         return 2
 
@@ -155,6 +159,13 @@ def main_with_args(argv):
     workdir = tempfile.mkdtemp(prefix="xboxrecomp-conf-")
     if args.verbose or args.keep:
         print(f"workdir: {workdir}")
+
+    if args.only == "corpus":
+        rc = _run_corpus(vcvars, workdir, runtime_inc, args)
+        if not args.keep:
+            import shutil
+            shutil.rmtree(workdir, ignore_errors=True)
+        return rc
 
     # 1. MSVC assembles the snippets and tells us the exact bytes.
     with open(os.path.join(workdir, "native.c"), "w") as f:
@@ -207,10 +218,81 @@ def main_with_args(argv):
             for d in dropped:
                 print(f"      {d.strip()}")
 
+    rc = run.returncode or (1 if unlifted else 0)
+
+    if args.only != "snippets":
+        rc = _run_corpus(vcvars, workdir, runtime_inc, args) or rc
+
     if not args.keep:
         import shutil
         shutil.rmtree(workdir, ignore_errors=True)
-    return run.returncode or (1 if unlifted else 0)
+    return rc
+
+
+
+
+def _run_corpus(vcvars, workdir, runtime_inc, args):
+    """Phase two: real C functions, compiled, lifted, and compared."""
+    fns = [f for f in CORPUS if not args.k or args.k in f["name"]]
+    if not fns:
+        return 0
+    src = "\n".join(f["source"] for f in fns)
+    with open(os.path.join(workdir, "corpus.c"), "w") as f:
+        f.write("/* corpus: compiled with the target compiler, then lifted "
+                "back */\n" + src + "\n")
+    # /O2 on purpose: the point is to lift what the optimiser really emits.
+    #
+    # /arch:IA32 because the Xbox CPU is a Pentium III -- SSE1, no SSE2. Modern
+    # MSVC defaults to SSE2 and puts doubles in XMM, which no real Xbox binary
+    # contains, so without this the corpus would test instructions the target
+    # cannot execute and skip the x87 paths that every Xbox title actually uses.
+    r = _cl(vcvars, workdir, "/c /O2 /GS- /arch:IA32 /FAc /Facorpus.cod corpus.c")
+    if r.returncode != 0:
+        print("corpus compile failed:\n" + r.stdout + r.stderr, file=sys.stderr)
+        return 1
+    with open(os.path.join(workdir, "corpus.cod"), errors="replace") as f:
+        cod = f.read()
+
+    prepared, skipped = [], []
+    for fn in fns:
+        code, text = corpus_run.function_bytes(cod, fn["name"])
+        sym = corpus_run._SYMBOLIC.search(text)
+        if sym:
+            # An unlinked .obj still has zero where the linker will patch, so
+            # these bytes cannot be lifted honestly. Say so rather than compare
+            # against nonsense.
+            skipped.append((fn["name"], sym.group(0).strip()))
+            continue
+        prepared.append((fn, corpus_run.lift_function(code, fn["name"])))
+        if args.verbose:
+            print(f"  {fn['name']:<14} {len(code):>4} bytes  "
+                  f"{len(prepared[-1][1].splitlines()):>4} C lines")
+
+    if skipped:
+        print("\nSkipped (needs a relocation the .obj has not resolved):",
+              file=sys.stderr)
+        for name, why in skipped:
+            print(f"  {name:<14} references {why}", file=sys.stderr)
+
+    if not prepared:
+        return 1
+    with open(os.path.join(workdir, "corpus_harness.c"), "w") as f:
+        f.write(corpus_run.harness_source(prepared))
+    r = _cl(vcvars, workdir,
+            f'/W3 /I"{runtime_inc}" corpus_harness.c corpus.obj '
+            f'/Fecorpus_harness.exe')
+    if r.returncode != 0:
+        print("corpus harness build failed:\n" + r.stdout + r.stderr,
+              file=sys.stderr)
+        return 1
+    run = subprocess.run([os.path.join(workdir, "corpus_harness.exe")],
+                         capture_output=True, text=True)
+    print(run.stdout.strip())
+    if run.returncode < 0 or run.returncode > 1:
+        print(f"\ncorpus harness terminated abnormally: exit {run.returncode} "
+              f"(0x{run.returncode & 0xFFFFFFFF:08X})", file=sys.stderr)
+        return 1
+    return run.returncode
 
 
 def main():

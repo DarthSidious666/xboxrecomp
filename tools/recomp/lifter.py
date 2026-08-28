@@ -396,14 +396,24 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"1 /* {jcc}: ordered */", desc
         return None
 
+    # SF is the sign bit of the result at the OPERAND's width, not at 32 bits.
+    # `test dl, dl; jns` asks about bit 7; evaluating the zero-extended byte as
+    # an int32 makes 0x80..0xFF look positive and the branch always goes the
+    # same way. Same defect the signed compares had before the width-aware
+    # CMP_L/CMP_G landed -- js/jns were simply missed at the time.
+    _sf_width = _operand_width(flag_ops[0]) if flag_ops else None
+    if _sf_width is None and len(flag_ops) > 1:
+        _sf_width = _operand_width(flag_ops[1])
+    _sf_cast = {1: "(int8_t)", 2: "(int16_t)"}.get(_sf_width, "(int32_t)")
+
     # ── cmp: flags from (a - b), operands unchanged ──
     if flag_setter == "cmp":
         if cmp_macro:
             return f"{cmp_macro}({lhs}, {rhs})", desc
         if jcc == "js":
-            return f"((int32_t)({lhs} - {rhs}) < 0)", desc
+            return f"({_sf_cast}(({lhs}) - ({rhs})) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t)({lhs} - {rhs}) >= 0)", desc
+            return f"({_sf_cast}(({lhs}) - ({rhs})) >= 0)", desc
         if jcc == "jp":
             return f"RECOMP_PARITY8(({lhs}) - ({rhs}))", desc
         if jcc == "jnp":
@@ -417,9 +427,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if cmp_macro:
             return f"{cmp_macro}({lhs} & {rhs}, 0)", desc
         if jcc == "js":
-            return f"((int32_t)({lhs} & {rhs}) < 0)", desc
+            return f"({_sf_cast}(({lhs}) & ({rhs})) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t)({lhs} & {rhs}) >= 0)", desc
+            return f"({_sf_cast}(({lhs}) & ({rhs})) >= 0)", desc
         if jcc == "jo":
             return "0", desc  # OF=0 after test
         if jcc == "jno":

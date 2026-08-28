@@ -721,7 +721,26 @@ class FunctionTranslator:
                 for t in switch_targets:
                     label_addrs.add(t)
 
-        flag_state = None
+        # Which blocks can reach each block. Flag state has to follow control
+        # flow, not address order: an optimising compiler routinely lets a jcc
+        # consume a `cmp` from a block that is not its immediate predecessor in
+        # memory. Threading the state linearly then hands that jcc the flags of
+        # whatever instruction happens to sit above it -- silently, and with a
+        # perfectly plausible-looking condition.
+        preds = {bb.start: set() for bb in blocks}
+        for i, bb in enumerate(blocks):
+            last = bb.instructions[-1] if bb.instructions else None
+            if last is None:
+                continue
+            if last.jump_target in preds:
+                preds[last.jump_target].add(bb.start)
+            # A conditional jump also falls through; ret and an unconditional
+            # jmp do not.
+            leaves = last.is_ret or last.mnemonic in ("jmp", "int3", "ud2", "hlt")
+            if not leaves and i + 1 < len(blocks):
+                preds[blocks[i + 1].start].add(bb.start)
+
+        out_state = {}
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -732,11 +751,25 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Propagate flag state from previous block (fallthrough path).
-            # This handles patterns like: test eax,eax / ja X / jb Y
-            # where jb uses the same flags as ja from the preceding block.
-            stmts, flag_state = lift_basic_block(
-                self.lifter, bb, flag_state=flag_state)
+            # Inherit the flag state only when every predecessor agrees on it.
+            # Blocks are walked in address order, so a back edge's predecessor
+            # may not be computed yet -- treat that as unknown rather than
+            # guessing, which costs a fallback condition and never a wrong one.
+            sources = preds[bb.start]
+            if bb.start == start or not sources:
+                incoming = None
+            elif all(p in out_state for p in sources):
+                states = [out_state[p] for p in sources]
+                incoming = states[0]
+                for other in states[1:]:
+                    if other != incoming:
+                        incoming = None
+                        break
+            else:
+                incoming = None
+
+            stmts, out_state[bb.start] = lift_basic_block(
+                self.lifter, bb, flag_state=incoming)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
 

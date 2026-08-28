@@ -271,4 +271,17 @@ CASES = [
          _SSE, "sse"),
     Case("sse_zero_idiom", "xorps xmm,xmm is the zeroing idiom",
          ["movaps xmm0, xmmword ptr [eax]", "xorps xmm0, xmm0"], _SSE, "sse"),
+
+    # SF is the sign bit at the operand's width. Evaluating an 8- or 16-bit
+    # test as int32 makes 0x80..0xFF look positive, so the branch goes the same
+    # way regardless -- found by the whole-function corpus, kept here so the
+    # unit-level suite catches it too.
+    Case("jns_i8", "jns after an 8-bit test reads bit 7, not bit 31",
+         ["test al, al", "setns al", "movzx eax, al"], _PAIRS),
+    Case("js_i8", "js after an 8-bit test",
+         ["test al, cl", "sets al", "movzx eax, al"], _PAIRS),
+    Case("jns_i16", "jns after a 16-bit test reads bit 15",
+         ["test ax, ax", "setns al", "movzx eax, al"], _PAIRS),
+    Case("js_cmp_i8", "sign flag after an 8-bit cmp, which truncates first",
+         ["cmp al, cl", "sets al", "movzx eax, al"], _PAIRS),
 ]
