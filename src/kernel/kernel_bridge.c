@@ -2542,7 +2542,18 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* case 175: bridge_MmLockUnlockBufferPages */
     /* case 180: bridge_MmQueryAllocationSize */
     /* case 192: bridge_NtCreateMutant */
-    /* case 224: bridge_NtResumeThread */
+    /* Routed. Checked against the memory-model warning above rather than
+     * assumed mechanical: NtResumeThread takes a handle token and writes a
+     * 4-byte suspend count through an optional out-parameter. Guest ULONG and
+     * host ULONG are both 4 bytes, XBOX_TO_NATIVE already maps NULL to NULL,
+     * and xbox_NtResumeThread checks the pointer before writing. Nothing
+     * allocates, frees, or hands back a host pointer -- which is what
+     * disqualified IoCreateDevice and ExFreePool.
+     *
+     * Halo 2276 calls this immediately before its first camera frustum build;
+     * unbridged it returned 0 (STATUS_SUCCESS) without resuming anything, so a
+     * thread the title had created suspended never started. */
+    case 224: return bridge_NtResumeThread;
     /* case 250: bridge_ObfDereferenceObject */
     /* case 252: bridge_PhyGetLinkState */
     /* case 253: bridge_PhyInitialize */
