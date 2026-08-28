@@ -570,9 +570,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── repe cmpsb / repne scasb: string comparison ──
     if "cmps" in flag_setter or "scas" in flag_setter:
         if jcc in ("je", "jz"):
-            return "1 /* strings matched (repe cmpsb) */", desc
+            return "(_flags != 0)", desc
         if jcc in ("jne", "jnz"):
-            return "0 /* strings differed (repe cmpsb) */", desc
+            return "(_flags == 0)", desc
         return None
 
     return None
@@ -1027,11 +1027,16 @@ class Lifter:
         else:
             return [_fmt_operand_write(ops[0], f"{val} {op_char} {delta}")]
 
-    def _lift_neg(self, insn, ops):
+    def _lift_neg(self, insn, ops, preserve_carry=False):
         if len(ops) < 1:
             return ["/* neg: no operand */"]
         val = _fmt_operand_read(ops[0])
-        return [_fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})")]
+        statements = []
+        if preserve_carry:
+            statements.append(f"_cf = ({val} != 0); /* neg carry */")
+        statements.append(
+            _fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})"))
+        return statements
 
     def _lift_not(self, insn, ops):
         if len(ops) < 1:
@@ -1356,9 +1361,29 @@ class Lifter:
                 "{ uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*2) = LO16(eax); }",
                 "edi += ecx * 2; ecx = 0; /* rep stosw */"
             ]
-        if "cmpsb" in m or "cmpsw" in m or "cmpsd" in m:
+        if "cmpsb" in m:
+            continue_on_equal = "repne" not in m and "repnz" not in m
+            stop_condition = "!_flags" if continue_on_equal else "_flags"
+            return [
+                "while (ecx != 0) {",
+                "    _flags = (MEM8(esi) == MEM8(edi));",
+                "    esi++; edi++; ecx--;",
+                f"    if ({stop_condition}) break;",
+                f"}} /* {m} */",
+            ]
+        if "scasb" in m:
+            continue_on_equal = "repne" not in m and "repnz" not in m
+            stop_condition = "!_flags" if continue_on_equal else "_flags"
+            return [
+                "while (ecx != 0) {",
+                "    _flags = (LO8(eax) == MEM8(edi));",
+                "    edi++; ecx--;",
+                f"    if ({stop_condition}) break;",
+                f"}} /* {m} */",
+            ]
+        if "cmpsw" in m or "cmpsd" in m:
             return [f"/* {m} - string compare, ecx iterations */"]
-        if "scasb" in m or "scasw" in m or "scasd" in m:
+        if "scasw" in m or "scasd" in m:
             return [f"/* {m} - string scan, ecx iterations */"]
         return [f"/* {m} */"]
 
@@ -1733,8 +1758,24 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
-        # Lift the instruction normally
-        results = lifter.lift_instruction(insns[i])
+        # NEG sets CF when its operand is nonzero. Preserve that value when
+        # a later SBB/ADC consumes it, skipping over EFLAGS-preserving
+        # instructions (e.g. neg eax; push edi; sbb eax, eax).
+        if curr.mnemonic == "neg":
+            j = i + 1
+            while (j < len(insns)
+                    and insns[j].mnemonic in _EFLAGS_PRESERVE
+                    and insns[j].mnemonic != "popfd"
+                    and not insns[j].is_branch
+                    and not insns[j].is_call
+                    and not insns[j].is_ret):
+                j += 1
+            preserve = (j < len(insns)
+                        and insns[j].mnemonic in ("sbb", "adc"))
+            results = lifter._lift_neg(
+                curr, curr.operands, preserve_carry=preserve)
+        else:
+            results = lifter.lift_instruction(insns[i])
         stmts.extend(results)
 
         # Track flag-setting instructions
@@ -1772,10 +1813,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # repe cmpsb/repne scasb = comparison, sets flags
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
-            if "cmps" in raw_m or "scas" in raw_m:
+            if "cmpsb" in raw_m or "scasb" in raw_m:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
-            elif "cmps" in rest or "scas" in rest:
+            elif "cmpsb" in rest or "scasb" in rest:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
             else:
