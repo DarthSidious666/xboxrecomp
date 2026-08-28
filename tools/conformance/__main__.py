@@ -30,7 +30,7 @@ import tempfile
 
 from .cases import CASES
 from .harness import (MARK, _MARK_BYTES, harness_source, native_source)
-from . import corpus_run
+from . import corpus_run, xbe_run
 from .corpus import CORPUS
 
 _WHY = {c["name"]: c["why"] for c in CASES}
@@ -140,6 +140,11 @@ def main_with_args(argv):
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--only", choices=("snippets", "corpus"),
                     help="run only one of the two phases (default: both)")
+    ap.add_argument("--xbe", metavar="PATH",
+                    help="also lift functions out of a real title and run them "
+                         "against their own machine code")
+    ap.add_argument("--xbe-limit", type=int, default=40,
+                    help="how many candidate functions to take (default 40)")
     args = ap.parse_args(argv)
 
     vcvars = _find_vcvars()
@@ -159,6 +164,13 @@ def main_with_args(argv):
     workdir = tempfile.mkdtemp(prefix="xboxrecomp-conf-")
     if args.verbose or args.keep:
         print(f"workdir: {workdir}")
+
+    if args.xbe:
+        rc = _run_xbe(vcvars, workdir, runtime_inc, args)
+        if not args.keep:
+            import shutil
+            shutil.rmtree(workdir, ignore_errors=True)
+        return rc
 
     if args.only == "corpus":
         rc = _run_corpus(vcvars, workdir, runtime_inc, args)
@@ -309,6 +321,47 @@ def _run_corpus(vcvars, workdir, runtime_inc, args):
         print(nl + f"corpus harness terminated abnormally: exit "
               f"{run.returncode} (0x{run.returncode & 0xFFFFFFFF:08X})",
               file=sys.stderr)
+        return 1
+    return run.returncode
+
+
+
+
+def _run_xbe(vcvars, workdir, runtime_inc, args):
+    """Phase three: a real title's own functions, lifted and run against it."""
+    nl = chr(10)
+    from tools.recomp.disasm import Disassembler
+
+    data, sections, base = xbe_run.load(args.xbe)
+    cands = xbe_run.find_candidates(data, sections, args.xbe_limit,
+                                    Disassembler()._cs)
+    if not cands:
+        print("found no self-contained functions to compare", file=sys.stderr)
+        return 1
+    lifted, rejected = xbe_run.lift(data, sections, cands)
+    print(f"{os.path.basename(args.xbe)}: {len(cands)} candidates, "
+          f"{len(lifted)} comparable, {len(rejected)} rejected")
+    if rejected and args.verbose:
+        for va, why in rejected:
+            print(f"  rejected sub_{va:08X}: {why[0]}", file=sys.stderr)
+    if not lifted:
+        return 1
+
+    with open(os.path.join(workdir, "xbe_harness.c"), "w") as f:
+        f.write(xbe_run.harness_source(os.path.abspath(args.xbe), sections,
+                                       lifted))
+    r = _cl(vcvars, workdir,
+            f'/W3 /EHa /I"{runtime_inc}" xbe_harness.c /Fexbe_harness.exe')
+    if r.returncode != 0:
+        print("xbe harness build failed:" + nl + r.stdout + r.stderr,
+              file=sys.stderr)
+        return 1
+    run = subprocess.run([os.path.join(workdir, "xbe_harness.exe")],
+                         capture_output=True, text=True)
+    print(run.stdout.strip())
+    if run.returncode < 0 or run.returncode > 1:
+        print(nl + f"xbe harness terminated abnormally: exit {run.returncode} "
+              f"(0x{run.returncode & 0xFFFFFFFF:08X})", file=sys.stderr)
         return 1
     return run.returncode
 

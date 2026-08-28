@@ -257,12 +257,84 @@ This is recorded rather than papered over, and the unlifted-instruction report
 will say so if such a function is ever pulled in again. `__allmul` — 64-bit
 multiply — has no such problem and *is* lifted and verified.
 
+## Phase three: a real title
+
+```
+py -3 -m tools.conformance --xbe "path/to/default.xbe"
+```
+
+The corpus tests code *we* compiled. This tests the code a title actually
+shipped — and the oracle gets better again, because Xbox code is 32-bit x86 and
+this harness is a 32-bit x86 process. The game's machine code is not merely
+liftable, it is **executable**. Map the XBE where it was linked for, call one
+of its functions directly, run the lifted C over the same arguments, compare.
+
+No game files are needed to run the rest of the suite, and none are included
+here; the phase only runs when you point it at an XBE you own.
+
+### Choosing what is safe to call
+
+Executing arbitrary game code in your own process is not automatically safe, so
+candidates are selected mechanically rather than by hand. A function qualifies
+only if:
+
+- it opens with `push ebp; mov ebp, esp` and ends in a plain `ret` — **not**
+  `ret imm16`, because a stdcall callee cleans a number of argument bytes we
+  would have to guess, and guessing wrong corrupts the caller's stack;
+- it contains no `call`, so nothing reaches the kernel, the CRT, or an
+  address outside the image;
+- every memory operand is either esp/ebp-relative (its own frame and
+  arguments) or an absolute address inside a mapped section — so it cannot
+  dereference an argument we invented;
+- no `fs:` access (SEH), no string operations (they walk esi/edi as pointers),
+  nothing privileged;
+- and nothing in it lifts to a bare comment, since an unhandled instruction is
+  a silent no-op the comparison cannot see.
+
+Both calls still run under an exception guard, and the native side is wrapped
+in `pushad`/`popad` so a function that fails to restore a callee-saved register
+fails its comparison rather than corrupting the harness.
+
+On Burnout 3 that is 17 functions out of 1,671 prologue sites. Strict, but the
+17 are genuinely verifiable, which nothing else in the pipeline can say.
+
+### Both sides start from the same state
+
+Two things had to be equalised before the comparison meant anything, and both
+were the harness's fault rather than the lifter's:
+
+- **The integer registers.** A `void` function never writes `eax`, so the
+  native side returned whatever the caller happened to leave there while the
+  lifted side began at zero. The call now enters with every GPR zeroed, which
+  needs an indirect call through a global so `eax` itself can be cleared.
+- **The x87 stack.** Plenty of this era's maths helpers take their argument in
+  `st(0)` rather than on the call stack, and an empty stack is *not* neutral:
+  the hardware yields the indefinite value where the model yields `0.0`. Both
+  sides are now given the same value in `st(0)`. Without it, a Burnout 3
+  float-to-int helper "failed" on every vector over an input neither side had
+  been handed.
+
+The register names also have to be uncovered around the inline assembly:
+`RECOMP_GENERATED_CODE` makes `eax` mean `g_eax` in that translation unit, and
+the rewrite reaches into `__asm` blocks too.
+
+### Results
+
+| Title | Comparable functions | Vectors | Mismatches |
+|---|---|---|---|
+| Burnout 3: Takedown | 17 | 29 | 0 |
+| Conker: Live & Reloaded | 34 | 42 | 0 |
+| Crimson Skies | 9 | 23 | 0 |
+| Blood Wake | 6 | 22 | 0 |
+
 ## Extending it
 
 Add a case to `cases.py`, or a function to `corpus.py`. Worth going after next:
 
-- **A real XBE**, rather than a DLL we built. The pipeline is now the same
-  shape, so the remaining work is mapping a title's sections and picking
-  functions with known-good expected behaviour to compare against.
+- **Widen the candidate filter.** "No calls, no pointer arguments" is what
+  makes 1,671 prologue sites collapse to 17. Supplying a scratch buffer as a
+  pointer argument, and allowing calls to other candidates, would unlock a
+  large fraction of a title's leaf maths — the same closure trick the corpus
+  already uses for CRT helpers.
 - **Indirect calls through data** — vtables and function-pointer tables, which
   is where a real bring-up spends most of its time.

@@ -547,8 +547,18 @@ linked, ran, and was wrong, with no lifter warning anywhere.
 
   The corpus lifts from a **linked image**, so jump tables, `.rdata` float
   constants and calls to CRT helpers all work — `__allmul` is lifted and
-  verified alongside the corpus itself. Totals: **2,583 snippet vectors and 211
-  whole-function vectors**.
+  verified alongside the corpus itself.
+- **Conformance against a real title** (`--xbe path/to/default.xbe`) — Xbox
+  code is 32-bit x86 and the harness is a 32-bit x86 process, so a game's own
+  machine code can be *executed* as the oracle: map the XBE where it was linked
+  for, call one of its functions, run the lifted C over the same arguments, and
+  compare. Candidates are picked mechanically (no calls, no invented pointers,
+  plain `ret`, nothing lifting to a comment), so what gets compared is provably
+  safe to run. Verified clean on Burnout 3, Conker, Crimson Skies and Blood
+  Wake. No game files are included or needed for the rest of the suite.
+
+  Totals: **2,583 snippet vectors, 211 whole-function vectors**, plus per-title
+  runs.
 
 ### v0.5.0 — *"Fall-Through"* (July 2026)
 
