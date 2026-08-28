@@ -52,9 +52,15 @@
 
 /* ── Global register state (defined in xbox_memory_layout.c) ── */
 
-extern uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern uint32_t g_ebx, g_esi, g_edi;
-extern uint32_t g_seh_ebp;
+/* RECOMP_TLS is not optional here. The runtime defines these thread-local, and
+ * a plain `extern` referencing a __declspec(thread) variable does not resolve
+ * to the calling thread's copy -- it resolves to the image's TLS template. The
+ * host side then writes g_esp somewhere the generated code never reads, so the
+ * guest starts with every register at zero and faults immediately, having
+ * apparently ignored the setup that visibly ran. */
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+extern RECOMP_TLS uint32_t g_seh_ebp;
 /* x87 and SSE state. Global for the same reason the volatile GPRs are: one
  * guest routine can lift to several C functions, so a value written in one
  * body is read in the next. Defined in xbox_memory_layout.c like the rest of
