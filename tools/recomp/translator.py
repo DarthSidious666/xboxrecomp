@@ -13,6 +13,7 @@ Produces compilable C code using recomp_types.h macros.
 
 import bisect
 import json
+import glob
 import os
 import struct
 
@@ -1206,6 +1207,21 @@ class BatchTranslator:
         generated_files = [header_path]
         chunks = [translations[i:i+chunk_size]
                   for i in range(0, len(translations), chunk_size)]
+
+        # Remove chunk files a previous, larger run left behind. Projects glob
+        # gen/*.c into their build, so a stale chunk keeps compiling: it still
+        # defines the functions it held last time, and the build fails with a
+        # wall of "redefinition; different basic types" pointing at generated
+        # code that looks perfectly correct. Nothing else cleans them, and the
+        # count only has to shrink once -- which it does the first time a
+        # detector fix changes how many functions are found.
+        for stale in sorted(glob.glob(os.path.join(output_dir,
+                                                   f"{prefix}_[0-9][0-9][0-9][0-9].c"))):
+            index = int(os.path.basename(stale)[len(prefix) + 1:-2])
+            if index >= len(chunks):
+                os.remove(stale)
+                if verbose:
+                    print(f"  removed stale chunk {os.path.basename(stale)}")
 
         for ci, chunk in enumerate(chunks):
             c_path = os.path.join(output_dir, f"{prefix}_{ci:04d}.c")
