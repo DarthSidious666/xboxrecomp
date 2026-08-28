@@ -60,6 +60,17 @@ _FP = [
     (1e10, 3.0), (1e-10, 3.0), (65536.0, 256.0),
 ]
 
+# Only for the cases that mask fnstsw down to the condition codes. The
+# status word's low byte carries the exception flags -- invalid is set by
+# a NaN compare -- and those are not modelled, so a case comparing the
+# whole of ax would diverge on bits that have nothing to do with the
+# comparison it is testing.
+_FP_NAN = [
+    (float('nan'), 1.0), (1.0, float('nan')),
+    (float('nan'), float('nan')), (1.0, 2.0), (2.0, 1.0),
+    (1.0, 1.0), (float('inf'), 1.0), (-0.0, 0.0),
+]
+
 # Four-float lanes for the SSE cases. Lane 0 usually differs from lanes 1-3 so
 # a scalar-only lift shows up as three wrong lanes rather than a wrong answer,
 # and the last two rows carry NaN and the signed zeroes for the compare and
@@ -296,4 +307,16 @@ CASES = [
     Case("btc_flip", "btc complements it", ["btc eax, 5"], _PAIRS),
     Case("btr_reg", "btr with a register bit index, which is taken mod 32",
          ["btr eax, ecx"], _PAIRS),
+
+    # An x87 compare against a NaN is unordered: C3, C2 and C0 all set. The
+    # model reported "equal", so `fucompp; fnstsw ax; test ah,44h; jp` -- how
+    # this era's CRT asks "is this a NaN" -- answered no every time. Found by
+    # running Crimson Skies' own float classification against itself.
+    Case("fpu_nan_unordered",
+         "comparing a value with itself is the isnan idiom; NaN is unordered",
+         ["fld qword ptr [eax]", "fld qword ptr [eax]", "fucompp",
+          "fnstsw ax", "and eax, 04500h"], _FP_NAN, "fpu"),
+    Case("fpu_nan_vs_number", "NaN against an ordinary value is also unordered",
+         ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fucompp",
+          "fnstsw ax", "and eax, 04500h"], _FP_NAN, "fpu"),
 ]

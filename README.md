@@ -557,8 +557,15 @@ linked, ran, and was wrong, with no lifter warning anywhere.
   safe to run. Verified clean on Burnout 3, Conker, Crimson Skies and Blood
   Wake. No game files are included or needed for the rest of the suite.
 
-  Totals: **2,583 snippet vectors, 211 whole-function vectors**, plus per-title
-  runs.
+  It found that **`fnstsw` did not model C2, the unordered bit**. An x87 compare
+  against a NaN sets C3, C2 and C0 together, and `fucompp; fnstsw ax; test
+  ah,44h; jp` is how this era's CRT asks "is this a NaN" — reporting "equal"
+  answered *no* every time, sending every float classification in a title down
+  the wrong branch. Found by running Crimson Skies' own float classification
+  against itself.
+
+  Totals: **2,599 snippet vectors, 211 whole-function vectors**, plus per-title
+  runs (Burnout 3: 37 functions / 161 vectors clean).
 
 ### v0.5.0 — *"Fall-Through"* (July 2026)
 

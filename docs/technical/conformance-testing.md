@@ -272,31 +272,75 @@ of its functions directly, run the lifted C over the same arguments, compare.
 No game files are needed to run the rest of the suite, and none are included
 here; the phase only runs when you point it at an XBE you own.
 
-### Choosing what is safe to call
+### Choosing what to call
 
-Executing arbitrary game code in your own process is not automatically safe, so
-candidates are selected mechanically rather than by hand. A function qualifies
-only if:
+A function qualifies if it ends in a plain `ret` — **not** `ret imm16`, since a
+stdcall callee cleans argument bytes we would have to guess — has no indirect
+branch, no `fs:` access, no string operation (they walk esi/edi for a count in
+ecx, and a garbage count is not a fault, it is a very long memcpy), nothing
+privileged, and nothing that lifts to a bare comment.
 
-- it opens with `push ebp; mov ebp, esp` and ends in a plain `ret` — **not**
-  `ret imm16`, because a stdcall callee cleans a number of argument bytes we
-  would have to guess, and guessing wrong corrupts the caller's stack;
-- it contains no `call`, so nothing reaches the kernel, the CRT, or an
-  address outside the image;
-- every memory operand is either esp/ebp-relative (its own frame and
-  arguments) or an absolute address inside a mapped section — so it cannot
-  dereference an argument we invented;
-- no `fs:` access (SEH), no string operations (they walk esi/edi as pointers),
-  nothing privileged;
-- and nothing in it lifts to a bare comment, since an unhandled instruction is
-  a silent no-op the comparison cannot see.
+**Pointer arguments are supplied, not refused.** Some arguments are pointers
+into a scratch buffer both sides see identically. Refusing every function that
+dereferences an argument was what kept the comparable set tiny; handing them a
+buffer makes them testable, and the buffer is compared afterwards so a function
+that *writes* is checked on what it wrote, not just what it returned.
 
-Both calls still run under an exception guard, and the native side is wrapped
-in `pushad`/`popad` so a function that fails to restore a callee-saved register
-fails its comparison rather than corrupting the harness.
+**Callees are lifted too.** Seeding only from `push ebp; mov ebp, esp` finds the
+framed functions and stops; an FPO callee has no such prologue, so its caller
+used to be dropped for calling into the unknown — which is most of them. A
+direct `call` target is a function start by definition, so those are followed,
+and a function is admissible only once its whole call tree is. Extending a
+function's extent past its first `ret` matters too: stopping there truncates
+anything with a block below the exit, which then looks like it jumps outside
+itself.
 
-On Burnout 3 that is 17 functions out of 1,671 prologue sites. Strict, but the
-17 are genuinely verifiable, which nothing else in the pipeline can say.
+On Burnout 3 that took the comparable set from **17 to 37**, out of 1,617
+functions decoded.
+
+### Surviving hostile code
+
+Executing a title's code with arguments it never expected cannot be made safe
+in-process — a function can corrupt whatever it likes before any handler sees
+it. Several things bound the damage:
+
+- both calls run under an exception guard, and the native side is wrapped in
+  `pushad`/`popad`;
+- the native call runs below a 32 KB gap in the stack, walked a page at a time.
+  Jumping straight past leaves the guard page unhit and the first write below
+  it faults in a way Windows cannot deliver — the process dies before any
+  handler runs, which looks exactly like the lifted code crashing. Switching to
+  a private stack buffer does not work either: an exception whose `esp` is
+  outside the thread's stack cannot be unwound, and the process dies with
+  `STATUS_BAD_STACK`;
+- the image is restored from a pristine copy before every run, so a write
+  cannot leak into the next run or into the other side of this one;
+- and when something still brings the harness down, the runner reads the
+  progress markers, quarantines the casualty, and re-runs. That converges in a
+  few passes and costs no recompile.
+
+### Both sides start from the same state
+
+Four things had to be equalised, and every one of them produced a convincing
+false failure first:
+
+- **The integer registers.** A `void` function never writes `eax`, so the native
+  side returned whatever the caller left there. The call now enters with every
+  GPR zeroed, which needs an indirect call so `eax` itself can be cleared.
+- **The x87 stack.** Many of this era's maths helpers take their argument in
+  `st(0)`, and an empty stack is not neutral: the hardware yields the indefinite
+  value where the model yields `0.0`.
+- **The x87 control word.** `finit` resets it to the hardware default, while the
+  model holds `0x027F`. Any function that reads it — the `_control87` family —
+  then reports a different answer for reasons unrelated to lifting.
+- **The stacks themselves**, both filled with `0xCD`. A function reading an
+  uninitialised local would otherwise see this process's leftovers on one side
+  and ours on the other. Poisoning both means such a function faults on the
+  poison and is skipped, rather than producing a mismatch that looks real.
+
+The guest register names also have to be uncovered around the inline assembly:
+`RECOMP_GENERATED_CODE` makes `eax` mean `g_eax` in that translation unit, and
+the rewrite reaches into `__asm` blocks too.
 
 ### Both sides start from the same state
 
@@ -320,21 +364,31 @@ the rewrite reaches into `__asm` blocks too.
 
 ### Results
 
-| Title | Comparable functions | Vectors | Mismatches |
+| Title | Comparable | Vectors | Mismatches |
 |---|---|---|---|
-| Burnout 3: Takedown | 17 | 29 | 0 |
-| Conker: Live & Reloaded | 34 | 42 | 0 |
-| Crimson Skies | 9 | 23 | 0 |
-| Blood Wake | 6 | 22 | 0 |
+| Burnout 3: Takedown | 37 | 161 | 0 |
+| Blood Wake | 39 | 44 | 0 |
+| Crimson Skies | 35 | 227 | 2 functions, open |
+
+**What it found.** `fnstsw` did not model **C2**, the unordered bit. An x87
+compare against a NaN sets C3, C2 and C0 together, and `fucompp; fnstsw ax;
+test ah, 44h; jp` is how this era's CRT asks "is this a NaN". Reporting
+"equal" answered *no* every time, so every float classification in a title took
+the wrong branch. The lifter's own comment had assumed non-NaN maths; Crimson
+Skies' float classification is the counter-example, and it found itself.
+
+Two Crimson Skies functions still diverge and are **not yet explained** — one on
+a byte it writes into the scratch buffer, one on its return value. They are
+real signals, not known-benign, and are the next thing to chase.
 
 ## Extending it
 
 Add a case to `cases.py`, or a function to `corpus.py`. Worth going after next:
 
-- **Widen the candidate filter.** "No calls, no pointer arguments" is what
-  makes 1,671 prologue sites collapse to 17. Supplying a scratch buffer as a
-  pointer argument, and allowing calls to other candidates, would unlock a
-  large fraction of a title's leaf maths — the same closure trick the corpus
-  already uses for CRT helpers.
+- **The two open Crimson Skies divergences**, above.
+- **The x87 status word's low byte** — the exception flags. A NaN compare sets
+  the invalid flag, which the model does not track, so any case comparing the
+  whole of `ax` rather than just the condition codes diverges on bits unrelated
+  to what it is testing.
 - **Indirect calls through data** — vtables and function-pointer tables, which
   is where a real bring-up spends most of its time.

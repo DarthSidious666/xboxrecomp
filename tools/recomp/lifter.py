@@ -2236,7 +2236,7 @@ class Lifter:
             # at render_cameras.c:458. Compare first (rhs may be fp_st1()), then pop.
             npop = 2 if m.endswith("pp") else (1 if m.endswith("p") else 0)
             pops = " fp_pop();" * npop
-            return [f"g_fp_cmp = (fp_top() < {rhs}) ? -1 : (fp_top() > {rhs}) ? 1 : 0;"
+            return [f"g_fp_cmp = RECOMP_FCMP(fp_top(), {rhs});"
                     f"{pops} /* {m} {insn.op_str} */"]
         if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi"):
             # These set EFLAGS directly (CF, ZF, PF) from FPU comparison
@@ -2244,7 +2244,7 @@ class Lifter:
             pops = m.endswith("pi") or m.endswith("ip")
             pop_code = " fp_pop();" if pops else ""
             rhs = self._fcom_rhs(ops)
-            return [f"g_fp_cmp = (fp_top() < {rhs}) ? -1 : (fp_top() > {rhs}) ? 1 : 0;"
+            return [f"g_fp_cmp = RECOMP_FCMP(fp_top(), {rhs});"
                     f"{pop_code} /* {m} */"]
         if m == "fnstsw":
             # `fnstsw ax` after an FPU compare is half of the pre-SSE float
@@ -2259,8 +2259,13 @@ class Lifter:
             # out made `fnstsw ax` disagree with the hardware on every AH read
             # taken while the stack was non-empty. The exception-flag byte (AL)
             # we do not model and it is zero after masked, clean operations.
+            # C3/C2/C0 as the hardware sets them: unordered is C3|C2|C0, and
+            # `test ah, 0x44; jp` -- the standard isnan idiom -- reads exactly
+            # those two bits. Reporting equal for a NaN compare sends every
+            # float classification in a title down the wrong branch.
             status = ("(uint16_t)(((g_fp_top & 7u) << 11) |"
-                      " (g_fp_cmp < 0 ? 0x0100u :"
+                      " (g_fp_cmp == 2 ? 0x4500u :"
+                      " g_fp_cmp < 0 ? 0x0100u :"
                       " g_fp_cmp > 0 ? 0x0000u : 0x4000u))")
             if insn.op_str.strip() in ("ax", "eax"):
                 # `fnstsw ax` writes the whole of AX, not just AH.

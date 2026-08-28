@@ -149,6 +149,13 @@ extern RECOMP_TLS uint32_t g_ebp;
 extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
 
+/* Result of an x87 compare, in the shape the status word wants:
+ *   -1 less, 0 equal, 1 greater, 2 unordered (either operand is NaN).
+ * The unordered case is not a curiosity: `fucompp` of a value with itself
+ * followed by `test ah, 0x44; jp` is how this era's CRT asks "is this a NaN",
+ * and collapsing it to "equal" answers no every time. */
+#define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)
+
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
  * ================================================================ */

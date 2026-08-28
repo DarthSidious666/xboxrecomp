@@ -333,32 +333,61 @@ def _run_xbe(vcvars, workdir, runtime_inc, args):
     from tools.recomp.disasm import Disassembler
 
     data, sections, base = xbe_run.load(args.xbe)
-    cands = xbe_run.find_candidates(data, sections, args.xbe_limit,
-                                    Disassembler()._cs)
-    if not cands:
+    entries, needed, closure = xbe_run.find_candidates(
+        data, sections, args.xbe_limit, Disassembler()._cs)
+    if not entries:
         print("found no self-contained functions to compare", file=sys.stderr)
         return 1
-    lifted, rejected = xbe_run.lift(data, sections, cands)
-    print(f"{os.path.basename(args.xbe)}: {len(cands)} candidates, "
-          f"{len(lifted)} comparable, {len(rejected)} rejected")
+    lifted, rejected = xbe_run.lift(data, sections, needed)
+    have = {va for va, _, _ in lifted}
+    # An entry is only usable if everything it calls lifted cleanly too.
+    callable_ = [row for row in lifted
+                 if row[0] in closure and closure[row[0]] <= have]
+    print(f"{os.path.basename(args.xbe)}: {len(entries)} entry points, "
+          f"{len(needed)} functions in their call closure, "
+          f"{len(callable_)} comparable, {len(rejected)} rejected")
     if rejected and args.verbose:
         for va, why in rejected:
             print(f"  rejected sub_{va:08X}: {why[0]}", file=sys.stderr)
-    if not lifted:
+    if not callable_:
         return 1
 
     with open(os.path.join(workdir, "xbe_harness.c"), "w") as f:
         f.write(xbe_run.harness_source(os.path.abspath(args.xbe), sections,
-                                       lifted))
+                                       lifted, callable_))
     r = _cl(vcvars, workdir,
             f'/W3 /EHa /I"{runtime_inc}" xbe_harness.c /Fexbe_harness.exe')
     if r.returncode != 0:
         print("xbe harness build failed:" + nl + r.stdout + r.stderr,
               file=sys.stderr)
         return 1
-    run = subprocess.run([os.path.join(workdir, "xbe_harness.exe")],
-                         capture_output=True, text=True)
-    print(run.stdout.strip())
+    # Re-run, quarantining whatever brought the harness down, until it gets
+    # through. A title's code given arguments it never expected can corrupt the
+    # process before any handler runs; the only reliable way to survive that is
+    # to find out which function did it and leave that one out.
+    exe = os.path.join(workdir, "xbe_harness.exe")
+    skips, run = [], None
+    for _ in range(40):
+        cmd = [exe, os.path.abspath(args.xbe)]
+        if skips:
+            cmd.append(",".join(f"{va:08X}" for va in skips))
+        run = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        started = re.findall(r"@RUN ([0-9A-Fa-f]{8})", run.stdout)
+        if run.returncode in (0, 1):
+            break
+        if not started:
+            break
+        casualty = int(started[-1], 16)
+        if casualty in skips:
+            break
+        skips.append(casualty)
+
+    print(nl.join(l for l in run.stdout.splitlines()
+                  if not l.startswith("@RUN ")).strip())
+    if skips:
+        print(nl + f"{len(skips)} function(s) crashed the harness and were "
+              f"quarantined: "
+              + ", ".join(f"sub_{va:08X}" for va in skips), file=sys.stderr)
     if run.returncode < 0 or run.returncode > 1:
         print(nl + f"xbe harness terminated abnormally: exit {run.returncode} "
               f"(0x{run.returncode & 0xFFFFFFFF:08X})", file=sys.stderr)
