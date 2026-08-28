@@ -360,11 +360,19 @@ That's it for the core pipeline — no IDA, no Ghidra, no proprietary tools. Jus
 ### Running the tests
 
 ```
-py -3 -m pytest tools/
+py -3 -m pytest tools/       # unit tests
+py -3 -m tools.conformance   # differential: lifted C vs the real CPU
 ```
 
-Fast, and needs no game files — the lifter tests assemble real byte sequences
-and check the C that comes out. If you fix a lift, add the case.
+The unit tests are fast and need no game files. The conformance suite goes
+further: it assembles each snippet with MSVC, lifts the resulting bytes, then
+runs the lifted C *and the original instructions* over the same inputs and
+requires them to agree. Because we target x86 and run on x86, the host CPU is
+the oracle — no model to be wrong. See
+[Conformance Testing](docs/technical/conformance-testing.md). It needs a 32-bit
+MSVC, and is skipped rather than failed where there isn't one.
+
+If you fix a lift, add the case.
 
 The runtime libraries (C) use:
 - MSVC (Visual Studio 2022) or MinGW-w64
@@ -496,7 +504,14 @@ linked, ran, and was wrong, with no lifter warning anywhere.
   copyright it actually carries.
 - **The test suite actually runs.** A bare import in `tools/symbols` aborted
   pytest collection for the whole tree, so `pytest tools/` executed nothing.
-  Now 140 tests.
+  Now 141 tests.
+- **Differential conformance testing** (`tools/conformance`) — assembles each
+  snippet with MSVC, lifts the bytes, and runs the lifted C against the original
+  instructions on the real CPU over 1,560 input vectors. Adapted from
+  ps3recomp's methodology, but stronger here: it targets x86 and runs on x86, so
+  the oracle is the hardware rather than a model of it. Found `stc`/`clc`/`cmc`
+  unimplemented — the carry a following `adc`/`sbb` read kept whatever the last
+  arithmetic left in it.
 
 ### v0.5.0 — *"Fall-Through"* (July 2026)
 

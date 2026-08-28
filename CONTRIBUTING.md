@@ -104,10 +104,11 @@ Every Xbox game has its own asset formats. If you reverse-engineer a texture for
 The Python side of the toolchain has a test suite. Run it before opening a PR:
 
 ```
-py -3 -m pytest tools/
+py -3 -m pytest tools/       # unit tests
+py -3 -m tools.conformance   # differential: lifted C vs the real CPU
 ```
 
-It is fast and needs no game files — the lifter tests assemble real byte
+The unit tests are fast and need no game files — the lifter tests assemble real byte
 sequences and check the C that comes out. If you fix a lift, add the case.
 
 Running a game is still manual:

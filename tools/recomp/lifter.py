@@ -978,6 +978,18 @@ class Lifter:
         if m.startswith("f"):
             return self._lift_fpu(insn, m, ops)
 
+        # ── Explicit carry-flag manipulation ──
+        # MSVC emits these around the multi-word arithmetic helpers, and around
+        # the "return a bool in CF" idiom. They were unhandled, so the flag the
+        # following adc/sbb reads kept whatever the last arithmetic left in it.
+        # Only worth emitting when something downstream consumes CF -- that is
+        # also the only time the enclosing function declares _cf.
+        if m in ("stc", "clc", "cmc"):
+            if not self.needs_cf:
+                return [f"/* {m}: no adc/sbb in this function consumes CF */"]
+            expr = {"stc": "1", "clc": "0", "cmc": "!_cf"}[m]
+            return [f"_cf = {expr}; /* {m} */"]
+
         # ── Unhandled ──
         return [f"/* TODO: {m} {insn.op_str} */"]
 
