@@ -102,12 +102,54 @@ Two details matter, and both were got wrong on the first attempt:
 The rule underneath both: if the harness does not drive the lifter exactly as
 the recompiler does, it is testing a path that does not ship.
 
+## Comparing x87 and SSE
+
+The integer cases compare `eax`. The other two kinds compare architectural
+state, because that is where their bugs live.
+
+**x87** compares the **stack depth** as well as the values. Most x87 bugs this
+project has had were pop-count bugs rather than arithmetic bugs — a handler
+that forgets to pop leaks a slot, everything after it reads `st(i)` one off,
+and the *first* value still looks right. Depth comes from the status word's
+TOP field on the native side and from `g_fp_top` on the lifted side; both
+start at zero after `finit`, and both decrement on push, so they track.
+
+The x87 precision control is set to **double (53-bit)** rather than the
+hardware default of extended (64-bit). Our model holds the stack as C
+`double`, so at extended precision the hardware carries more bits than the
+model can and add/sub/mul/div/sqrt disagree in the last place for reasons that
+have nothing to do with lifting. At PC=53 those five are correctly rounded on
+both sides and must match **bit-exactly**.
+
+That leaves the transcendentals, where the x87's polynomial and libm's are
+genuinely different implementations. Those cases carry an explicit `tol`. This
+is the whitelist pillar: the divergence is real, it is named per case rather
+than hidden behind a blanket tolerance, and a wrong *answer* still fails.
+
+**SSE** compares all eight XMM registers as raw bytes, lane by lane — the
+whole point, since modelling XMM as a scalar float made `movaps` move 4 of 16
+bytes and nothing noticed. Comparison is bit-exact, including `-0.0` vs `0.0`,
+which is precisely the difference a mis-implemented `MINPS` tie-break gets
+wrong.
+
 ## What it found
 
-On the first complete run, one genuine gap: `stc` / `clc` / `cmc` were
-unhandled and lifted to `/* TODO: stc */`, so the carry flag a following
-`adc`/`sbb` read kept whatever the last arithmetic had left in it. MSVC emits
-these around multi-word arithmetic and the "return a bool in CF" idiom.
+**`stc` / `clc` / `cmc` were unhandled** and lifted to `/* TODO: stc */`, so
+the carry a following `adc`/`sbb` read kept whatever the last arithmetic left
+in it. MSVC emits these around multi-word arithmetic and the "return a bool in
+CF" idiom.
+
+**`fxch st(i)` was a silent no-op.** Capstone reports `fxch` with *both*
+operands — `(st(0), st(i))` — and it is the only x87 form that does; `fadd`,
+`fcom`, `fld` and `fstp` all arrive with the explicit register alone. The
+handler read operand 0, got the implicit `st(0)`, and emitted a swap of st0
+with itself. Every `fxch` in every title did nothing.
+
+**`fnstsw` did not model TOP.** The status word carries TOP in bits 11–13,
+which land in AH bits 3–5, and we model TOP — it is `g_fp_top`. Leaving it out
+made `fnstsw ax` disagree with the hardware on every read taken while the
+stack was non-empty. The `ax` form was also only writing AH, while the
+instruction writes all of AX.
 
 It also found two bugs in *itself* before finding that one, which is worth
 recording because both would have produced confident false reports:
@@ -123,10 +165,6 @@ recording because both would have produced confident false reports:
 
 Add a case to `cases.py`. The two directions worth going next:
 
-- **x87 and SSE.** The mechanism is the same, but the harness has to capture
-  and compare the FPU stack and XMM registers rather than just `eax`. This is
-  where the v0.6.0 merge made the most semantic decisions with the least
-  execution behind them.
 - **Whole functions.** Compile a corpus of C with a 32-bit MSVC, lift the
   result, and compare against the same source compiled natively — ps3recomp's
   `lift_selftest.py` shape. That exercises what an optimising compiler actually

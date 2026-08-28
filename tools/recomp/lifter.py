@@ -2175,8 +2175,13 @@ class Lifter:
             # hardcoded to st1, so fxch st(2)/st(3)/st(4) (86/7/1 sites in Halo)
             # swapped the wrong slot -- corrupting the FP stack in the camera
             # basis builder that feeds world_to_view.
-            i = (self._st_index(ops[0].reg)
-                 if (ops and ops[0].type == "reg" and ops[0].reg) else 1)
+            # Capstone reports fxch with BOTH operands -- (st(0), st(i)) -- and
+            # it is the only x87 form that does; fadd/fcom/fld st(i) all come
+            # through with the explicit register alone. Reading ops[0] therefore
+            # picked up the implicit st(0) and emitted a swap of st0 with
+            # itself, so every `fxch st(i)` was a silent no-op.
+            i = (self._st_index(ops[-1].reg)
+                 if (ops and ops[-1].type == "reg" and ops[-1].reg) else 1)
             dst = self._st_expr(i)
             return [f"{{ double _t = fp_top(); fp_top() = {dst}; {dst} = _t; }}"
                     f" /* fxch {insn.op_str} */"]
@@ -2215,14 +2220,18 @@ class Lifter:
             # for st0 </=/> src; the FPU sets C3 on equal (ah bit 6 = 0x40) and
             # C0 on less-than (ah bit 0 = 0x01), C2 only on unordered (NaN),
             # which non-NaN game math does not hit.
+            # The status word also carries TOP in bits 11-13, which lands in
+            # AH bits 3-5. We model TOP (it is g_fp_top), so emit it: leaving it
+            # out made `fnstsw ax` disagree with the hardware on every AH read
+            # taken while the stack was non-empty. The exception-flag byte (AL)
+            # we do not model and it is zero after masked, clean operations.
+            status = ("(uint16_t)(((g_fp_top & 7u) << 11) |"
+                      " (g_fp_cmp < 0 ? 0x0100u :"
+                      " g_fp_cmp > 0 ? 0x0000u : 0x4000u))")
             if insn.op_str.strip() in ("ax", "eax"):
-                return ["eax = (eax & 0xFFFF00FFu) | ((uint32_t)("
-                        "(g_fp_cmp == 0) ? 0x40u : (g_fp_cmp < 0) ? 0x01u : 0x00u"
-                        ") << 8); /* fnstsw ax <- fpu compare */"]
-            # Any other destination gets the full 16-bit status word: C3/C2/C0
-            # sit at bits 14/10/8, so AH is simply the high byte of this.
-            status = ("(uint16_t)(g_fp_cmp < 0 ? 0x0100u :"
-                      " g_fp_cmp > 0 ? 0x0000u : 0x4000u)")
+                # `fnstsw ax` writes the whole of AX, not just AH.
+                return [f"eax = (eax & 0xFFFF0000u) | (uint32_t){status};"
+                        " /* fnstsw ax <- fpu status */"]
             if ops and ops[0].type == "mem":
                 return [f"MEM16({_fmt_mem(ops[0])}) = {status};"
                         f" /* fnstsw {insn.op_str} */"]

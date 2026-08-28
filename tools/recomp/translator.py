@@ -101,6 +101,28 @@ def _fixup_icall_esp_save(lines):
     return result
 
 
+# The x87 stack accessors the lifter's output is written against. Module-level
+# so tools/conformance emits byte-identical macros: a harness with its own copy
+# would still pass after these changed, which is the dangerous direction.
+FP_STACK_MACROS = [
+    "    #define fp_push(v) do { double _fp_value = (v); \\",
+    "        g_fp_top = (g_fp_top + 7u) & 7u; \\",
+    "        g_fp_stack[g_fp_top] = _fp_value; } while (0)",
+    "    #define fp_pop() (g_fp_top = (g_fp_top + 1u) & 7u)",
+    "    #define fp_top() g_fp_stack[g_fp_top]",
+    "    #define fp_st(i) g_fp_stack[(g_fp_top + (i)) & 7u]",
+    "    #define fp_st1() fp_st(1)",
+]
+
+FP_STACK_UNDEFS = [
+    "    #undef fp_push",
+    "    #undef fp_pop",
+    "    #undef fp_top",
+    "    #undef fp_st",
+    "    #undef fp_st1",
+]
+
+
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
@@ -669,13 +691,7 @@ class FunctionTranslator:
         # detector boundaries also split one original CRT helper into several
         # generated C functions, so function-local storage loses live ST values.
         if has_fpu:
-            lines.append(f"    #define fp_push(v) do {{ double _fp_value = (v); \\")
-            lines.append(f"        g_fp_top = (g_fp_top + 7u) & 7u; \\")
-            lines.append(f"        g_fp_stack[g_fp_top] = _fp_value; }} while (0)")
-            lines.append(f"    #define fp_pop() (g_fp_top = (g_fp_top + 1u) & 7u)")
-            lines.append(f"    #define fp_top() g_fp_stack[g_fp_top]")
-            lines.append(f"    #define fp_st(i) g_fp_stack[(g_fp_top + (i)) & 7u]")
-            lines.append(f"    #define fp_st1() fp_st(1)")
+            lines.extend(FP_STACK_MACROS)
 
         # For fpo_leaf functions that use ebp: initialize from g_seh_ebp.
         # In x86, these functions inherit EBP from their caller (typically
@@ -779,11 +795,7 @@ class FunctionTranslator:
 
         # Undefine FPU macros
         if has_fpu:
-            lines.append(f"    #undef fp_push")
-            lines.append(f"    #undef fp_pop")
-            lines.append(f"    #undef fp_top")
-            lines.append(f"    #undef fp_st")
-            lines.append(f"    #undef fp_st1")
+            lines.extend(FP_STACK_UNDEFS)
 
         lines.append(f"}}")
         lines.append(f"")

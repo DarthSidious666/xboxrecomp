@@ -507,11 +507,18 @@ linked, ran, and was wrong, with no lifter warning anywhere.
   Now 141 tests.
 - **Differential conformance testing** (`tools/conformance`) — assembles each
   snippet with MSVC, lifts the bytes, and runs the lifted C against the original
-  instructions on the real CPU over 1,560 input vectors. Adapted from
-  ps3recomp's methodology, but stronger here: it targets x86 and runs on x86, so
-  the oracle is the hardware rather than a model of it. Found `stc`/`clc`/`cmc`
-  unimplemented — the carry a following `adc`/`sbb` read kept whatever the last
-  arithmetic left in it.
+  instructions on the real CPU over **2,043 input vectors** covering integer
+  results, the x87 stack (values *and* depth) and all four SSE lanes. Adapted
+  from ps3recomp's methodology, but stronger here: we target x86 and run on
+  x86, so the oracle is the hardware rather than a model of it. It found three
+  live bugs, all of which the existing string-comparison tests passed:
+  - **`fxch st(i)` was a silent no-op** — Capstone reports `fxch` with both
+    operands, `(st(0), st(i))`, and it is the only x87 form that does, so the
+    handler picked up the implicit `st(0)` and swapped st0 with itself.
+  - **`stc`/`clc`/`cmc` were unimplemented**, so the carry a following
+    `adc`/`sbb` read kept whatever the last arithmetic left in it.
+  - **`fnstsw` did not model TOP** (status bits 11–13, AH bits 3–5) and the
+    `ax` form wrote only AH rather than all of AX.
 
 ### v0.5.0 — *"Fall-Through"* (July 2026)
 

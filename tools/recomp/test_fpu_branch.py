@@ -77,9 +77,13 @@ def _with_stubbed_mem(fn):
 def test_fnstsw_ax_sets_ah_from_fpu_cmp():
     out = "\n".join(Lifter().lift_instruction(_Insn("fnstsw", [], "ax")))
     assert "g_fp_cmp" in out, out
-    assert "eax = (eax & 0xFFFF00FFu)" in out, out
-    # equal -> 0x40, less -> 0x01, greater -> 0x00, shifted into ah
-    assert "0x40u" in out and "0x01u" in out and "<< 8" in out, out
+    # `fnstsw ax` writes the whole of AX, and the status word carries TOP in
+    # bits 11-13 as well as the condition codes -- the hardware AH includes it,
+    # so a comparison against the real CPU fails without it.
+    assert "eax = (eax & 0xFFFF0000u)" in out, out
+    assert "(g_fp_top & 7u) << 11" in out, out
+    # equal -> C3 (0x4000), less -> C0 (0x0100), greater -> 0
+    assert "0x4000u" in out and "0x0100u" in out, out
 
 
 def test_fnstsw_to_memory_writes_the_status_word():

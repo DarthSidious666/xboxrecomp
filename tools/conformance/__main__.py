@@ -29,11 +29,11 @@ import sys
 import tempfile
 
 from .cases import CASES
+from .harness import (MARK, _MARK_BYTES, harness_source, native_source)
 
 _WHY = {c["name"]: c["why"] for c in CASES}
+_TOL = {c["name"]: c.get("tol", 0.0) for c in CASES}
 
-MARK = ["nop", "nop", "nop"]
-_MARK_BYTES = "90 90 90"
 
 # "  00009\t3c ff\t\t cmp\t al, -1"  ->  addr, bytes.
 #
@@ -71,26 +71,6 @@ def _cl(vcvars, workdir, args):
     return subprocess.run(cmd, cwd=workdir, shell=True, capture_output=True,
                           text=True)
 
-
-def _native_source(cases):
-    out = ["/* generated -- native side of the conformance run */",
-           "unsigned int g_in_a, g_in_b;", ""]
-    for c in cases:
-        body = "\n".join(f"        {ins}" for ins in
-                         MARK + c["asm"] + MARK)
-        out.append(f"""unsigned int nat_{c['name']}(void) {{
-    unsigned int r;
-    __asm {{
-        mov eax, g_in_a
-        mov ecx, g_in_b
-        xor edx, edx
-{body}
-        mov r, eax
-    }}
-    return r;
-}}""")
-
-    return "\n".join(out)
 
 
 def _bytes_from_listing(cod_text, name):
@@ -148,88 +128,6 @@ def _lift(code_bytes):
     return list(lines), mnemonics
 
 
-def _harness_source(prepared):
-    out = ["""/* generated -- both sides, same inputs, compared */
-#define RECOMP_GENERATED_CODE 1
-#include <stdint.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <math.h>
-#include "recomp_types.h"
-
-RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
-RECOMP_TLS uint32_t g_seh_ebp, g_ebp;
-RECOMP_TLS double g_fp_stack[8]; RECOMP_TLS int g_fp_top;
-RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu; RECOMP_TLS int g_fp_cmp;
-RECOMP_TLS RecompXmm g_xmm0,g_xmm1,g_xmm2,g_xmm3,g_xmm4,g_xmm5,g_xmm6,g_xmm7;
-volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
-volatile uint64_t g_icall_count;
-ptrdiff_t g_xbox_mem_offset;
-void recomp_icall_fail_log(uint32_t va) { (void)va; }
-
-unsigned int g_in_a, g_in_b;
-static unsigned char g_guest_stack[64 * 1024];
-"""]
-    for name, _, _ in prepared:
-        out.append(f"unsigned int nat_{name}(void);")
-    out.append("")
-    for name, lines, _ in prepared:
-        body = "\n".join(f"    {l}" for l in lines) or "    /* nothing */"
-        # Same preamble FunctionTranslator emits: the lifter names these
-        # temporaries and the enclosing function is expected to declare them.
-        out.append(f"""static unsigned int lif_{name}(void) {{
-    uint32_t ebp = 0; int _cf = 0; int _flags = 0;
-    uint32_t _fa = 0, _fb = 0; int32_t _fas = 0, _fbs = 0;
-    (void)ebp; (void)_cf; (void)_flags;
-    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
-    g_eax = g_in_a; g_ecx = g_in_b; g_edx = 0;
-    g_esp = (uint32_t)(uintptr_t)(g_guest_stack + sizeof(g_guest_stack) / 2);
-{body}
-    return g_eax;
-}}""")
-    out.append("""
-typedef unsigned int (*fn_t)(void);
-static int g_total, g_fail;
-
-/* Runs one case over its whole input vector and reports it as a unit: a
-   lifting bug is a property of the snippet, not of one input, so a per-case
-   line with a couple of examples is more use than 60 near-identical rows. */
-static void run_case(const char *name, const char *why, fn_t nat, fn_t lif,
-                     const unsigned int (*in)[2], int n) {
-    int i, fails = 0, shown = 0;
-    for (i = 0; i < n; i++) {
-        unsigned int want, got;
-        g_in_a = in[i][0]; g_in_b = in[i][1]; want = nat();
-        g_in_a = in[i][0]; g_in_b = in[i][1]; got  = lif();
-        g_total++;
-        if (want != got) {
-            fails++;
-            if (shown < 3) {
-                if (!shown)
-                    printf("FAIL %s  (%s)\\n", name, why);
-                printf("       a=%08X b=%08X  native=%08X  lifted=%08X\\n",
-                       in[i][0], in[i][1], want, got);
-                shown++;
-            }
-        }
-    }
-    if (fails) {
-        if (fails > 3) printf("       ... %d of %d vectors\\n", fails, n);
-        g_fail += fails;
-    }
-}
-
-int main(void) {""")
-    for name, _, inputs in prepared:
-        vec = ", ".join(f"{{0x{a:08X}u,0x{b:08X}u}}" for a, b in inputs)
-        out.append(f"    {{ static const unsigned int v[][2] = {{{vec}}};")
-        out.append(f"      run_case(\"{name}\", \"{_WHY[name]}\", nat_{name}, "
-                   f"lif_{name}, v, {len(inputs)}); }}")
-    out.append("""    printf("\\n%d vectors, %d mismatches\\n", g_total, g_fail);
-    return g_fail != 0;
-}""")
-    return "\n".join(out)
-
 
 def main_with_args(argv):
     ap = argparse.ArgumentParser(prog="python -m tools.conformance",
@@ -260,7 +158,7 @@ def main_with_args(argv):
 
     # 1. MSVC assembles the snippets and tells us the exact bytes.
     with open(os.path.join(workdir, "native.c"), "w") as f:
-        f.write(_native_source(cases))
+        f.write(native_source(cases))
     r = _cl(vcvars, workdir, "/c /FAc /Fanative.cod native.c")
     if r.returncode != 0:
         print("native assembly failed:\n" + r.stdout + r.stderr, file=sys.stderr)
@@ -276,13 +174,13 @@ def main_with_args(argv):
         dropped = [l for l in lines if l.strip().startswith("/*")]
         if dropped:
             unlifted.append((c["name"], mnemonics, dropped))
-        prepared.append((c["name"], lines, c["inputs"]))
+        prepared.append((c["name"], c["kind"], lines, c["inputs"]))
         if args.verbose:
             print(f"  {c['name']:<20} {code.hex():<28} {len(lines)} C lines")
 
     # 3. Run both and compare.
     with open(os.path.join(workdir, "harness.c"), "w") as f:
-        f.write(_harness_source(prepared))
+        f.write(harness_source(prepared, _WHY, _TOL))
     r = _cl(vcvars, workdir,
             f'/W3 /I"{runtime_inc}" harness.c native.obj /Feharness.exe')
     if r.returncode != 0:

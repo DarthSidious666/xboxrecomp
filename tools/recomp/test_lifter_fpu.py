@@ -147,8 +147,10 @@ class FpuLifterTest(unittest.TestCase):
         # reads it, so the result has to be shared state, not a function local.
         self.assertIn("g_fp_cmp", lifted[0])
         self.assertNotIn("_fpu_cmp", lifted[0])
-        self.assertIn("0x40u", lifted[0])
-        self.assertIn("<< 8", lifted[0])
+        # C3 (equal) and C0 (less) at their status-word positions, plus TOP
+        self.assertIn("0x4000u", lifted[0])
+        self.assertIn("0x0100u", lifted[0])
+        self.assertIn("(g_fp_top & 7u) << 11", lifted[0])
         self.assertNotIn("/* fnstsw ax - store FPU status word */", lifted[0])
 
     def test_compare_writes_the_shared_result(self):
@@ -162,6 +164,20 @@ class FpuLifterTest(unittest.TestCase):
         self.assertEqual(len(lifted), 1)
         self.assertTrue(lifted[0].startswith("g_fp_cmp ="))
         self.assertNotIn("_fpu_cmp", lifted[0])
+
+    def test_fxch_swaps_with_the_explicit_register(self):
+        """Capstone reports fxch with both operands -- (st(0), st(i)) -- and it
+        is the only x87 form that does. Reading operand 0 picked up the
+        implicit st(0), so every `fxch st(i)` emitted a swap of st0 with
+        itself and silently did nothing."""
+        instruction = Instruction(0, 2, "fxch", "st(1)", "d9c9")
+        instruction.operands = [Operand(type="reg", reg="st(0)"),
+                                Operand(type="reg", reg="st(1)")]
+
+        lifted = Lifter().lift_instruction(instruction)[0]
+
+        self.assertIn("fp_st1()", lifted)
+        self.assertNotIn("fp_top() = fp_top()", lifted)
 
 
 if __name__ == "__main__":
