@@ -100,6 +100,19 @@ extern uint32_t g_ebx, g_esi, g_edi;
  * Similarly, __SEH_epilog reads g_seh_ebp at entry and writes it at exit.
  */
 extern uint32_t g_seh_ebp;
+extern double g_fp_stack[8];
+extern uint32_t g_fp_top;
+extern uint16_t g_fp_control_word;
+/* Result of the last x87 compare: -1, 0, or 1. One guest routine can lift
+   to several C functions, so a compare and the FNSTSW that reads it can
+   land in different bodies; the hardware status word is shared too. */
+extern int g_fp_cmp;
+
+/* x86 PF: set when the low byte of the result has an even number of set
+   bits. Used by FNSTSW/TEST AH parity branches. */
+#define PARITY8(value) \
+    ((((0x9669u >> (((uint8_t)(value) ^ ((uint8_t)(value) >> 4)) & 0xfu)) \
+       & 1u)) != 0u)
 
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
@@ -146,6 +159,7 @@ void recomp_icall_fail_log(uint32_t va);
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
 #define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))
 #define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
+#define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
 
 /** Float/double memory access. */
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))

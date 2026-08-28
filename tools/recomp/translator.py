@@ -585,15 +585,6 @@ class FunctionTranslator:
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
 
-        # Add _fpu_cmp for FPU compare instructions (both old and new style)
-        has_fpu_cmp = any(insn.mnemonic in ("fcompi", "fcomip", "fucomi",
-                                             "fucompi", "fucomip", "fcomi",
-                                             "fcom", "fcomp", "fcompp",
-                                             "fucom", "fucomp", "fucompp")
-                          for insn in instructions)
-        if has_fpu_cmp:
-            lines.append(f"    int _fpu_cmp = 0; /* FPU compare result: -1/0/1 */")
-
         # SSE/MMX register declarations
         if used_xmm:
             xmm_regs = sorted([r for r in used_xmm if r.startswith("xmm")])
@@ -604,15 +595,17 @@ class FunctionTranslator:
             if mmx_regs:
                 lines.append(f"    uint64_t {', '.join(mmx_regs)};")
 
-        # FPU stack (simplified)
+        # The x87 stack is architectural state and survives guest calls. Some
+        # detector boundaries also split one original CRT helper into several
+        # generated C functions, so function-local storage loses live ST values.
         if has_fpu:
-            lines.append(f"    double _fp_stack[8];")
-            lines.append(f"    int _fp_top = 0;")
-            lines.append(f"    #define fp_push(v) (_fp_stack[--_fp_top & 7] = (v))")
-            lines.append(f"    #define fp_pop() (_fp_top++)")
-            lines.append(f"    #define fp_popp() (fp_pop())")
-            lines.append(f"    #define fp_top() _fp_stack[_fp_top & 7]")
-            lines.append(f"    #define fp_st1() _fp_stack[(_fp_top + 1) & 7]")
+            lines.append(f"    #define fp_push(v) do {{ double _fp_value = (v); \\")
+            lines.append(f"        g_fp_top = (g_fp_top + 7u) & 7u; \\")
+            lines.append(f"        g_fp_stack[g_fp_top] = _fp_value; }} while (0)")
+            lines.append(f"    #define fp_pop() (g_fp_top = (g_fp_top + 1u) & 7u)")
+            lines.append(f"    #define fp_top() g_fp_stack[g_fp_top]")
+            lines.append(f"    #define fp_st(i) g_fp_stack[(g_fp_top + (i)) & 7u]")
+            lines.append(f"    #define fp_st1() fp_st(1)")
 
         # For fpo_leaf functions that use ebp: initialize from g_seh_ebp.
         # In x86, these functions inherit EBP from their caller (typically
@@ -717,8 +710,8 @@ class FunctionTranslator:
         if has_fpu:
             lines.append(f"    #undef fp_push")
             lines.append(f"    #undef fp_pop")
-            lines.append(f"    #undef fp_popp")
             lines.append(f"    #undef fp_top")
+            lines.append(f"    #undef fp_st")
             lines.append(f"    #undef fp_st1")
 
         lines.append(f"}}")
