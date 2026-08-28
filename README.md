@@ -13,6 +13,11 @@
 
 > Turn any Xbox game binary into a native Windows executable. No emulation. No interpreter. Just raw, recompiled C.
 
+**[Join the sp00nznet recomp Discord](https://discord.gg/CRpzGWZFcu)** — the
+community hub for sp00nznet's recomp projects, where ps3recomp development
+happens in the open. Good place to ask questions, show a port you are working
+on, or find out what people are stuck on before you duplicate the effort.
+
 **Current version: v0.6.0 — _"Credit Where Due"_ (August 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
@@ -344,6 +349,10 @@ This is an emerging field. Here's how you can contribute:
 3. **Document Xbox formats** — Every game has its own asset formats. Document what you discover.
 4. **Build runtime components** — Better D3D8 emulation, audio, networking — the runtime layer is where most per-game work happens.
 5. **Share your findings** — Write up what you learn. The Xbox modding/preservation community benefits from every discovery.
+
+Not sure where to start, or want to sanity-check an idea first? Ask in the
+[Discord](https://discord.gg/CRpzGWZFcu) — several of the people working on
+ports and on the lifter are there.
 
 ## Dependencies
 

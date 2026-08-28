@@ -120,6 +120,13 @@ Running a game is still manual:
 
 The VEH crash handler and ICALL trace ring buffer are your primary debugging tools. When a game crashes, the handler prints the faulting address, all Xbox register values, and recent indirect call targets.
 
+## Where to ask
+
+**[The sp00nznet recomp Discord](https://discord.gg/CRpzGWZFcu)** is the
+community hub for these projects. Worth a look before starting something
+substantial — it is the quickest way to find out whether someone is already on
+it, or already stuck on it.
+
 ## Reporting Bugs and Submitting Findings
 
 - **Bug reports**: Open a GitHub issue with the game name, the error output (crash log, ICALL failures), and the steps to reproduce.
