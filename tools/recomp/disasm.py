@@ -176,20 +176,47 @@ class Disassembler:
 
         return insn
 
-    def disassemble_function(self, raw_bytes, start_va, end_va):
+    def disassemble_function(self, raw_bytes, start_va, end_va, resync=None):
         """
         Disassemble bytes for a single function.
         Returns list of Instruction objects.
+
+        `resync` are addresses known to be instruction starts even if a linear
+        decode disagrees -- switch-table targets, in practice. A jump table
+        embedded in .text is data, and decoding it as instructions leaves the
+        stream misaligned: the bogus instruction covering the last table entry
+        swallows the real one just past it, so no instruction (and therefore no
+        basic block, and therefore no label) ever starts at the first case.
+        The switch then compiles to a goto with no destination, which the
+        translator turns into a no-op, and the case silently falls through to
+        an unresolved indirect branch at run time.
+
+        Decoding restarts at each such address and discards whatever instruction
+        straddled it. The garbage decoded from the table itself is left alone:
+        it is unreachable, because the block before it ends at the indirect
+        jump.
         """
         size = end_va - start_va
         if size <= 0 or size > len(raw_bytes):
             return []
 
-        instructions = []
+        decoded = {}
         for cs_insn in self._cs.disasm(raw_bytes[:size], start_va):
-            instructions.append(self._decode_instruction(cs_insn))
+            decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
-        return instructions
+        for point in sorted(resync or ()):
+            if not (start_va <= point < end_va) or point in decoded:
+                continue
+            for addr in [a for a, i in decoded.items()
+                         if a < point < a + i.size]:
+                del decoded[addr]
+            for cs_insn in self._cs.disasm(raw_bytes[point - start_va:size],
+                                           point):
+                if cs_insn.address in decoded:
+                    break          # rejoined a stream we already have
+                decoded[cs_insn.address] = self._decode_instruction(cs_insn)
+
+        return [decoded[a] for a in sorted(decoded)]
 
     def disassemble_cfg(self, raw_bytes, start_va, end_va, entry_points,
                         stop_addresses=None):

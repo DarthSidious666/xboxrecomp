@@ -1469,6 +1469,46 @@ static NTSTATUS bridge_create_file_impl(
  * STATUS_OBJECT_PATH_NOT_FOUND -- which looks like a missing file rather than
  * a missing bridge. Halo builds its map paths exactly this way.
  */
+/* -- RtlEqualString (ordinal 279, 3 args) ----------------
+ * BOOLEAN RtlEqualString(PSTRING String1, PSTRING String2, BOOLEAN CaseInSens)
+ *
+ * The fields are read out by hand rather than casting the guest struct. A
+ * guest ANSI_STRING is {USHORT Length, USHORT MaximumLength, 32-bit Buffer},
+ * eight bytes; the native one has a 64-bit PCHAR, so a cast would read
+ * MaximumLength and Buffer from the wrong offsets and then dereference a guest
+ * VA as a host address. RtlInitAnsiString stores a guest VA in that field --
+ * see the bridge below -- so it has to be translated, not passed through.
+ *
+ * Stubbed, this returned 0: "never equal". Wreckless initialises a string and
+ * compares it in a critical-section-protected lookup, so every comparison
+ * missing turned that lookup into unbounded recursion and the process died of
+ * a host stack overflow 200 kernel calls in.
+ */
+static void bridge_RtlEqualString(void)
+{
+    uint32_t s1_va  = STACK_ARG(0);
+    uint32_t s2_va  = STACK_ARG(1);
+    uint32_t nocase = STACK_ARG(2);
+    XBOX_ANSI_STRING a, b;
+
+    if (!s1_va || !s2_va) {
+        g_eax = 0;
+        return;
+    }
+    a.Length        = BRIDGE_MEM16(s1_va + 0);
+    a.MaximumLength = BRIDGE_MEM16(s1_va + 2);
+    a.Buffer        = (PCHAR)XBOX_TO_NATIVE(BRIDGE_MEM32(s1_va + 4));
+    b.Length        = BRIDGE_MEM16(s2_va + 0);
+    b.MaximumLength = BRIDGE_MEM16(s2_va + 2);
+    b.Buffer        = (PCHAR)XBOX_TO_NATIVE(BRIDGE_MEM32(s2_va + 4));
+
+    if (!a.Buffer || !b.Buffer) {
+        g_eax = 0;
+        return;
+    }
+    g_eax = xbox_RtlEqualString(&a, &b, (BOOLEAN)nocase) ? 1 : 0;
+}
+
 static void bridge_RtlInitAnsiString(void)
 {
     uint32_t dest_va = STACK_ARG(0);
@@ -2396,6 +2436,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* File/Handle */
     case 187: return bridge_NtClose;
     case 190: return bridge_NtCreateFile;
+    case 279: return bridge_RtlEqualString;
     case 289: return bridge_RtlInitAnsiString;
     case 195: return bridge_NtDeleteFile;
     case 196: return bridge_NtDeviceIoControlFile;
@@ -2598,8 +2639,14 @@ static void kernel_thunk_dispatch(void)
     g_kernel_call_count++;
 
     if (g_kernel_call_count <= 200) {
-        fprintf(stderr, "  [KERNEL] #%d: ordinal %u (slot %d) esp=0x%08X\n",
-                g_kernel_call_count, ordinal, slot, g_esp);
+        /* The guest return address sits at the top of the guest stack: the
+         * caller pushed it before dispatching here. Logging it turns "some
+         * function is calling this" into "this call site is", which is the
+         * difference between guessing and knowing when a title recurses. */
+        fprintf(stderr,
+                "  [KERNEL] #%d: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
+                g_kernel_call_count, ordinal, slot, g_esp,
+                g_esp ? BRIDGE_MEM32(g_esp) : 0);
         fflush(stderr);
     }
 

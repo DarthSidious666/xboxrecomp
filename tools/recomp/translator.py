@@ -485,6 +485,19 @@ class FunctionTranslator:
                     if start <= t < end:
                         switch_leaders.add(t)
 
+        # A switch target the decode never produced an instruction for cannot
+        # become a block leader, so it gets no label and its `goto` is dropped
+        # as dead code -- the case then falls through to an unresolved indirect
+        # branch. That happens whenever the jump table sits in .text ahead of
+        # the code it points at: decoding the table as instructions leaves the
+        # stream misaligned across the first case. Re-decode, telling the
+        # disassembler where the real instruction boundaries are.
+        if recovered is None:
+            missing = switch_leaders - {insn.address for insn in instructions}
+            if missing:
+                instructions = self.disasm.disassemble_function(
+                    raw_bytes, start, end, resync=missing)
+
         # Build basic blocks
         blocks = self.disasm.build_basic_blocks(
             instructions, start, end,
