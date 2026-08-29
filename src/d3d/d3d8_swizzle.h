@@ -214,29 +214,121 @@ static inline void xbox_swizzle_rect(void *dst, const void *src,
 }
 
 /**
+ * Compute the Z-order offset for a 3D volume texture coordinate.
+ * X, Y and Z consume index bits in a round-robin order until each
+ * dimension's extent is exhausted (the natural 3D extension of the
+ * 2D Morton layout used for regular textures on NV2A).
+ */
+static inline uint32_t xbox_swizzle_offset_3d(uint32_t x, uint32_t y, uint32_t z,
+                                               uint32_t width, uint32_t height,
+                                               uint32_t depth)
+{
+    uint32_t bit = 1, pos = 0;
+    uint32_t w = width, h = height, d = depth;
+    while (w > 1 || h > 1 || d > 1) {
+        if (w > 1) { if (x & 1) pos |= bit; x >>= 1; bit <<= 1; w >>= 1; }
+        if (h > 1) { if (y & 1) pos |= bit; y >>= 1; bit <<= 1; h >>= 1; }
+        if (d > 1) { if (z & 1) pos |= bit; z >>= 1; bit <<= 1; d >>= 1; }
+    }
+    return pos;
+}
+
+/**
+ * Unswizzle a volume texture (swizzled Z-order layout) into linear,
+ * z-slice-major order: dst is (z*slices + linear_2d(y,x)).
+ */
+static inline void xbox_unswizzle_box(void *dst, const void *src,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t depth, uint32_t bpp)
+{
+    const uint8_t *s = (const uint8_t *)src;
+    uint8_t *d = (uint8_t *)dst;
+    uint32_t x, y, z;
+    size_t face_size = (size_t)width * height * bpp;
+
+    for (z = 0; z < depth; z++) {
+        for (y = 0; y < height; y++) {
+            for (x = 0; x < width; x++) {
+                uint32_t swiz = xbox_swizzle_offset_3d(x, y, z, width, height, depth);
+                memcpy(d + (size_t)z * face_size + ((size_t)y * width + x) * bpp,
+                       s + (size_t)swiz * bpp, bpp);
+            }
+        }
+    }
+}
+
+/**
+ * Swizzle a volume texture from linear z-slice-major layout to Xbox
+ * Z-order layout. (Inverse of xbox_unswizzle_box.)
+ */
+static inline void xbox_swizzle_box(void *dst, const void *src,
+                                    uint32_t width, uint32_t height,
+                                    uint32_t depth, uint32_t bpp)
+{
+    const uint8_t *s = (const uint8_t *)src;
+    uint8_t *d = (uint8_t *)dst;
+    uint32_t x, y, z;
+    size_t face_size = (size_t)width * height * bpp;
+
+    for (z = 0; z < depth; z++) {
+        for (y = 0; y < height; y++) {
+            for (x = 0; x < width; x++) {
+                uint32_t swiz = xbox_swizzle_offset_3d(x, y, z, width, height, depth);
+                memcpy(d + (size_t)swiz * bpp,
+                       s + (size_t)z * face_size + ((size_t)y * width + x) * bpp, bpp);
+            }
+        }
+    }
+}
+
+/**
  * Check if an Xbox D3D8 format is swizzled (vs linear/compressed).
  * Xbox formats with "LIN_" prefix are linear; DXT formats are block-compressed.
  * All other uncompressed formats are swizzled by default.
  */
 static inline int d3d8_format_is_swizzled(uint32_t fmt)
 {
-    /* Linear formats */
-    if (fmt == 0x12 || /* LIN_A8R8G8B8 */
-        fmt == 0x1E || /* LIN_X8R8G8B8 */
-        fmt == 0x11 || /* LIN_R5G6B5   */
-        fmt == 0x10 || /* LIN_A1R5G5B5 */
-        fmt == 0x1D)   /* LIN_A4R4G4B4 */
+    /* Linear formats (0x10-0x41 range excludes the non-LIN 0x19-0x3C range) */
+    switch (fmt) {
+    case 0x10: case 0x11: case 0x12: case 0x13:   /* LIN_A1R5G5B5..LIN_L8 */
+    case 0x14: case 0x15:                          /* LIN_X8L8V8U8, LIN_V8U8 */
+    case 0x16: case 0x17: case 0x18:               /* LIN_R8B8, LIN_G8B8, LIN_L6V5U5 */
+    case 0x1B: case 0x1C: case 0x1D: case 0x1E:   /* LIN_AL8..LIN_X8R8G8B8 */
+    case 0x1F: case 0x20:                          /* LIN_A8, LIN_A8L8 */
+    case 0x2E: case 0x2F: case 0x30: case 0x31:   /* LIN_D24S8..LIN_F16 */
+    case 0x35: case 0x36: case 0x37:              /* LIN_L16, LIN_V16U16, LIN_R6G5B5 */
+    case 0x3D: case 0x3E: case 0x3F: case 0x40: case 0x41:  /* LIN_R5G5B5A1..LIN_R8G8B8A8 */
+    case 0x5B: case 0x5C: case 0x5D: case 0x5E: case 0x5F: case 0x60:  /* LIN_R16F..LIN_A32B32G32R32F */
+    case 0x61: case 0x62: case 0x63:              /* LIN_G16R16, LIN_A16L16, LIN_A16B16G16R16 */
+    case 0x79: case 0x7A:                          /* LIN_A32B32G32R32, LIN_G32R32 */
+    case 0x67: case 0x68:                          /* LIN_L32, LIN_A32L32 */
+    case 0x69: case 0x6A: case 0x6B:              /* LIN_V32U32..LIN_Q32W32V32U32 */
+    case 0x6C: case 0x6D: case 0x6E: case 0x6F: case 0x70: case 0x71:  /* LIN_A2R10G10B10..LIN_R11G11B10 */
+    case 0x72: case 0x73: case 0x74:              /* LIN_D24X8..LIN_D32 */
+    case 0x75: case 0x76: case 0x77: case 0x78:   /* LIN_DXN..LIN_CTX1 */
         return 0;
+    default:
+        break;
+    }
 
     /* Compressed formats (block layout, not swizzled) */
     if (fmt == 0x0C || /* DXT1 */
         fmt == 0x0E || /* DXT3 (DXT2/3) */
-        fmt == 0x0F)   /* DXT5 (DXT4/5) */
+        fmt == 0x0F || /* DXT5 (DXT4/5) */
+        fmt == 0x57 || /* DXN */
+        fmt == 0x59 || /* DXT3A */
+        fmt == 0x5A || /* DXT5A */
+        fmt == 0x58)   /* CTX1 */
         return 0;
 
     /* Index/depth formats (not swizzled) */
     if (fmt == 101 || fmt == 102 ||  /* INDEX16/32 */
-        fmt == 0x2C || fmt == 0x2A || fmt == 0x2D || fmt == 0x2B)  /* depth */
+        fmt == 0x2A || fmt == 0x2B || fmt == 0x2C || fmt == 0x2D ||  /* D24S8/F24S8/D16/F16 */
+        fmt == 0x54 || fmt == 0x55 || fmt == 0x56)  /* D24X8/D24FS8/D32 */
+        return 0;
+
+    /* YUV is linear (packed in raster order), not swizzled */
+    if (fmt == 0x24 || fmt == 0x25)  /* YUY2/UYVY */
         return 0;
 
     /* All other formats are swizzled */

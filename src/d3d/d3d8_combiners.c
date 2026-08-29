@@ -522,10 +522,10 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    float4 pos     : SV_POSITION;\n");
     EMIT("    float4 color0  : COLOR0;\n");
     EMIT("    float4 color1  : COLOR1;\n");
-    EMIT("    float2 tc0     : TEXCOORD0;\n");
-    EMIT("    float2 tc1     : TEXCOORD1;\n");
-    EMIT("    float2 tc2     : TEXCOORD2;\n");
-    EMIT("    float2 tc3     : TEXCOORD3;\n");
+    EMIT("    float3 tc0     : TEXCOORD0;\n");
+    EMIT("    float3 tc1     : TEXCOORD1;\n");
+    EMIT("    float3 tc2     : TEXCOORD2;\n");
+    EMIT("    float3 tc3     : TEXCOORD3;\n");
     EMIT("};\n\n");
 
     /* ---- Main function ---- */
@@ -548,13 +548,15 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         if (state->tex_mode[i] == NV2A_TEXMODE_NONE) {
             EMIT("    float4 r_t%d = float4(0, 0, 0, 0);\n", i);
         } else if (state->tex_mode[i] == NV2A_TEXMODE_CUBEMAP) {
-            EMIT("    float4 r_t%d = tex%d.Sample(samp%d, float3(input.tc%d, 0));\n",
+            /* Cube map: use the full 3-component reflection/TCI vector */
+            EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d);\n",
                  i, i, i, i);
         } else if (state->tex_mode[i] == NV2A_TEXMODE_3D) {
-            EMIT("    float4 r_t%d = tex%d.Sample(samp%d, float3(input.tc%d, 0));\n",
+            /* 3D texture: use the full 3-component coordinate */
+            EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d);\n",
                  i, i, i, i);
         } else {
-            EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d);\n",
+            EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d.xy);\n",
                  i, i, i, i);
         }
     }

@@ -43,6 +43,15 @@
 /* ======================================================================== */
 
 #define MAX_RS    256
+
+/* Window title for the SDL window, configurable per title via
+ * xbox_D3D8SetWindowTitle(). Default is a generic name. */
+static const char *g_window_title = "Xbox Game";
+
+void xbox_D3D8SetWindowTitle(const char *title)
+{
+    g_window_title = (title && title[0]) ? title : "Xbox Game";
+}
 #define MAX_TSS   33
 #define MAX_TSU   8     /* texture stages */
 
@@ -979,7 +988,7 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,  24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    g.window = SDL_CreateWindow("Burnout 3: Takedown",
+    g.window = SDL_CreateWindow(g_window_title,
                                 SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
                                 g.backbuf_w, g.backbuf_h,
                                 SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
