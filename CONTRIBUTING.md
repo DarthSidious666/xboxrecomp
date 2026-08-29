@@ -101,7 +101,17 @@ Every Xbox game has its own asset formats. If you reverse-engineer a texture for
 
 ## Testing
 
-There is no automated test suite (yet). Testing is manual:
+The Python side of the toolchain has a test suite. Run it before opening a PR:
+
+```
+py -3 -m pytest tools/       # unit tests
+py -3 -m tools.conformance   # differential: lifted C vs the real CPU
+```
+
+The unit tests are fast and need no game files — the lifter tests assemble real byte
+sequences and check the C that comes out. If you fix a lift, add the case.
+
+Running a game is still manual:
 
 1. Build the runtime libraries.
 2. Build a game project that uses them (Burnout 3, Wreckless, Blood Wake, or your own).
@@ -110,6 +120,13 @@ There is no automated test suite (yet). Testing is manual:
 
 The VEH crash handler and ICALL trace ring buffer are your primary debugging tools. When a game crashes, the handler prints the faulting address, all Xbox register values, and recent indirect call targets.
 
+## Where to ask
+
+**[The sp00nznet recomp Discord](https://discord.gg/CRpzGWZFcu)** is the
+community hub for these projects. Worth a look before starting something
+substantial — it is the quickest way to find out whether someone is already on
+it, or already stuck on it.
+
 ## Reporting Bugs and Submitting Findings
 
 - **Bug reports**: Open a GitHub issue with the game name, the error output (crash log, ICALL failures), and the steps to reproduce.
@@ -117,6 +134,19 @@ The VEH crash handler and ICALL trace ring buffer are your primary debugging too
 - **Lifter failures**: If the lifter produces incorrect C for a function, include the original disassembly and the generated C output.
 - **Pull requests**: Fork the repo, make your changes on a branch, and open a PR. Describe what you changed and which game(s) you tested with.
 
+## Credit
+
+Contributors are listed in **[CONTRIBUTORS.md](CONTRIBUTORS.md)**, and that
+includes people who only ever filed an issue. A good bug report is a
+contribution — several of the entries there are exactly that. If you land
+something and your name doesn't appear, that's our mistake: open a PR against
+the file, or just say so on the issue.
+
 ## License
 
 This project is licensed under the **MIT License**. By submitting a contribution, you agree that your work will be released under the same license.
+
+The exception is the xemu-derived code under `src/apu/` and
+`src/nv2a/nv2a_regs.h`, which is LGPL-2.1-or-later and stays that way — see
+[NOTICE](NOTICE). If you patch those files, your change is LGPL too, and the
+existing copyright headers must stay intact.

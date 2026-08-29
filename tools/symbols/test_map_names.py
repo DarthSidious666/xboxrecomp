@@ -6,7 +6,14 @@ import json
 import tempfile
 from pathlib import Path
 
-from map_names import check_entry, parse_map, port_names, va_to_off
+# tools.symbols is a package, so pytest imports this as a package member
+# and a bare `import map_names` fails at collection. The docstring above
+# also invites running it directly, where there is no parent package --
+# so try the package-relative import first and fall back to the flat one.
+try:
+    from .map_names import check_entry, parse_map, port_names, va_to_off
+except ImportError:  # executed as a script
+    from map_names import check_entry, parse_map, port_names, va_to_off
 
 # A title with .text at 0x11000 and an XDK section at 0x50000, mirroring the
 # real layout: MAP section 0001 -> XBE section 0.

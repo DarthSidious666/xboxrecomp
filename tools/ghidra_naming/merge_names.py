@@ -92,6 +92,53 @@ _Imaginary bool true false class new delete this namespace template typename
 operator public private protected virtual friend using try catch throw
 """.split())
 
+# Standard library identifiers we must not emit either.
+#
+# Recovered names are real names, and a title's own CRT routines are genuinely
+# called strchr, memcpy, sqrt and so on. Generated code includes <string.h>,
+# <math.h> and <stdio.h>, so emitting "void strchr(void);" collides with the
+# real declaration and the translation unit will not compile. Porting names out
+# of a linker MAP surfaces hundreds of these at once.
+#
+# Anything here gets the same _<addr> suffix as a keyword collision.
+C_STDLIB = set("""
+memcpy memmove memset memcmp memchr
+strcpy strncpy strcat strncat strcmp strncmp strcoll strxfrm strchr strrchr
+strspn strcspn strpbrk strstr strtok strlen strnlen strerror strdup
+sprintf snprintf vsprintf vsnprintf sscanf printf fprintf vfprintf scanf
+fopen fclose fread fwrite fseek ftell rewind feof ferror fflush fgets fputs
+fgetc fputc getc putc ungetc setvbuf setbuf remove rename tmpfile
+malloc calloc realloc free abort exit atexit system getenv
+abs labs div ldiv rand srand qsort bsearch atoi atol atof strtol strtoul strtod
+sqrt sqrtf pow powf exp expf log logf log10 sin sinf cos cosf tan tanf
+asin acos atan atan2 sinh cosh tanh ceil ceilf floor floorf fabs fabsf
+fmod fmodf frexp ldexp modf hypot
+isalnum isalpha iscntrl isdigit isgraph islower isprint ispunct isspace
+isupper isxdigit tolower toupper
+time clock difftime mktime localtime gmtime asctime ctime strftime
+setjmp longjmp signal raise assert
+main
+nextafter nextafterf nexttoward copysign round roundf trunc truncf rint cbrt
+log2 log1p expm1 asinh acosh atanh erf erfc lgamma tgamma fmin fmax fma
+""".split()) | set("""
+wcscpy wcsncpy wcscat wcsncat wcscmp wcsncmp wcscoll wcsxfrm wcschr wcsrchr
+wcsspn wcscspn wcspbrk wcsstr wcstok wcslen wcsnlen wcsdup wcserror
+wcsicmp wcsnicmp wcslwr wcsupr wcsrev wcsset wcsnset wcstol wcstoul wcstod
+wmemcpy wmemmove wmemset wmemcmp wmemchr
+mbstowcs wcstombs mbtowc wctomb btowc wctob
+swprintf vswprintf swscanf wprintf fwprintf wscanf
+iswalnum iswalpha iswdigit iswspace iswupper iswlower towlower towupper
+""".split()) | set("""
+_errno errno _iob _fileno _isnan _finite _hypot _strdup _stricmp _strnicmp
+_strlwr _strupr _itoa _ltoa _ultoa _fltused _CIsqrt _CIpow _CIlog _CIexp
+strnicmp stricmp strcmpi stricoll strlwr strupr strrev strset strnset
+itoa ltoa ultoa ecvt fcvt gcvt swab
+logb logbf scalb scalbn ilogb significand drem j0 j1 jn y0 y1 yn gamma
+_ftol _ftol2 _alldiv _aulldiv _allmul _allrem _aullrem _allshl _allshr _aullshr
+""".split())
+
+RESERVED = C_KEYWORDS | C_STDLIB
+
 HEX_RE = re.compile(r"^0x[0-9A-Fa-f]+$")
 
 
@@ -236,7 +283,7 @@ def build_map(export_dir):
     for addr in sorted(chosen.keys()):
         info = chosen[addr]
         nm = info["name"]
-        if nm in C_KEYWORDS:
+        if nm in RESERVED:
             nm = "%s_%s" % (nm, addr[2:])  # append addr without 0x
         if nm in seen_names and seen_names[nm] != addr:
             nm = "%s_%s" % (nm, addr[2:])
@@ -312,6 +359,12 @@ def main():
             clean = sanitize(name)
             if not clean or is_placeholder(name):
                 continue
+            # Same reserved-word rule as build_map. A linker MAP hands back the
+            # title's real CRT routine names (strchr, memcpy, sqrt), which
+            # collide with the declarations the generated code already gets
+            # from <string.h>/<math.h>.
+            if clean in RESERVED:
+                clean = "%s_%s" % (clean, a[2:])
             # Same de-dup rule as build_map: distinct addresses must not
             # collapse onto one C identifier.
             if clean in seen:

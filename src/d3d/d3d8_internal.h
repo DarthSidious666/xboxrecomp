@@ -233,6 +233,11 @@ IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
                                        const BYTE *raw_level_data,
                                        UINT palette_index);
 
+/* Wrap a raw D3D11 texture (back buffer, etc.) as a surface. */
+IDirect3DSurface8 *xbox_d3d8_surface_wrap(ID3D11Texture2D *texture,
+                                          UINT width, UINT height,
+                                          D3DFORMAT fmt);
+
 HRESULT d3d8_CreateImageSurfaceImpl(UINT Width, UINT Height, D3DFORMAT Format,
                                     IDirect3DSurface8 **ppSurface);
 

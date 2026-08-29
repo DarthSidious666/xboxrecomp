@@ -342,8 +342,12 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     switch (FileInformationClass) {
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
-            if (!SetFilePointerEx(FileHandle, info->CurrentByteOffset, NULL, FILE_BEGIN))
+            if (!SetFilePointerEx(FileHandle, info->CurrentByteOffset, NULL, FILE_BEGIN)) {
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                    "SetFilePosition failed: offset=%lld err=%u",
+                    (long long)info->CurrentByteOffset.QuadPart, GetLastError());
                 return STATUS_UNSUCCESSFUL;
+            }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -353,11 +357,39 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             SetFilePointerEx(FileHandle, zero, &cur, FILE_CURRENT);
             SetFilePointerEx(FileHandle, info->EndOfFile, NULL, FILE_BEGIN);
             if (!SetEndOfFile(FileHandle)) {
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                    "SetEndOfFile failed: size=%lld err=%u",
+                    (long long)info->EndOfFile.QuadPart, GetLastError());
                 SetFilePointerEx(FileHandle, cur, NULL, FILE_BEGIN);
                 return STATUS_UNSUCCESSFUL;
             }
             if (cur.QuadPart <= info->EndOfFile.QuadPart)
                 SetFilePointerEx(FileHandle, cur, NULL, FILE_BEGIN);
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            return STATUS_SUCCESS;
+        }
+        case XboxFileAllocationInformation: {
+            /* Reserve space for a file. Halo's save path calls this before
+             * writing, and an unimplemented class here returned
+             * STATUS_NOT_IMPLEMENTED, which the title turned into DOS error
+             * 317 and reported as "couldn't open or create saved game file".
+             *
+             * Same payload shape as EndOfFile: one LARGE_INTEGER. Windows
+             * FileAllocationInfo is the direct equivalent; if the filesystem
+             * declines it, fall back to setting the size, since the caller
+             * only needs the space to exist. */
+            PXBOX_FILE_END_OF_FILE_INFORMATION info =
+                (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            FILE_ALLOCATION_INFO fai;
+            fai.AllocationSize = info->EndOfFile;
+            if (!SetFileInformationByHandle(FileHandle, FileAllocationInfo,
+                                            &fai, sizeof(fai))) {
+                LARGE_INTEGER cur, zero = {0};
+                SetFilePointerEx(FileHandle, zero, &cur, FILE_CURRENT);
+                SetFilePointerEx(FileHandle, info->EndOfFile, NULL, FILE_BEGIN);
+                SetEndOfFile(FileHandle);
+                SetFilePointerEx(FileHandle, cur, NULL, FILE_BEGIN);
+            }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -385,8 +417,14 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             return STATUS_SUCCESS;
         }
         default:
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                "NtSetInformationFile: unhandled class %d", FileInformationClass);
+            /* stderr, not xbox_log: WARN is filtered out by default, and an
+             * unimplemented info class is exactly the kind of silent gap that
+             * surfaces far away. Halo's save path hits one, gets
+             * STATUS_NOT_IMPLEMENTED, converts it to DOS error 317 and asserts
+             * "couldn't open or create saved game file". */
+            fprintf(stderr, "  [FILE] NtSetInformationFile: unhandled class %d\n",
+                    (int)FileInformationClass);
+            fflush(stderr);
             return STATUS_NOT_IMPLEMENTED;
     }
 }
@@ -902,8 +940,14 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         default:
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                "NtSetInformationFile: unhandled class %d", FileInformationClass);
+            /* stderr, not xbox_log: WARN is filtered out by default, and an
+             * unimplemented info class is exactly the kind of silent gap that
+             * surfaces far away. Halo's save path hits one, gets
+             * STATUS_NOT_IMPLEMENTED, converts it to DOS error 317 and asserts
+             * "couldn't open or create saved game file". */
+            fprintf(stderr, "  [FILE] NtSetInformationFile: unhandled class %d\n",
+                    (int)FileInformationClass);
+            fflush(stderr);
             return STATUS_NOT_IMPLEMENTED;
     }
 }

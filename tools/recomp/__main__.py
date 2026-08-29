@@ -57,6 +57,22 @@ def find_data_files(disasm_dir=None, func_id_dir=None, abi_dir=None, overrides=N
     return paths
 
 
+def _load_addrs(path):
+    """Load a JSON address list (or {addr: name} map) as a set of ints."""
+    if not path:
+        return set()
+    with open(path, "r", encoding="utf-8") as fh:
+        entries = json.load(fh)
+    if isinstance(entries, dict):
+        entries = list(entries.keys())
+    out = set()
+    for e in entries:
+        if isinstance(e, dict):
+            e = e.get("start") or e.get("address")
+        out.add(int(e, 16) if isinstance(e, str) else int(e))
+    return out
+
+
 def check_data_matches_binary(xbe_path, summary_path):
     """Refuse to lift one binary's code using another binary's disassembly.
 
@@ -150,6 +166,23 @@ def main():
                         help="Path to abi_functions.json (overrides --abi-dir)")
     parser.add_argument("--skip-binary-check", action="store_true",
                         help="Allow disassembly recorded for a different binary")
+    parser.add_argument("--manual-functions", metavar="FILE",
+                        help="JSON list of addresses the project implements by "
+                             "hand. Their bodies are not generated, so the "
+                             "hand-written definition links instead")
+    parser.add_argument("--exclude-manual", metavar="FILE",
+                        nargs="?", const="src/game/recomp/recomp_manual.c",
+                        help="Scan a C file (default recomp_manual.c) for the "
+                             "functions it defines by hand and skip generating "
+                             "their bodies -- the same effect as listing them in "
+                             "--manual-functions, but read straight from the "
+                             "source of truth so the two cannot drift. Handles "
+                             "sub_X_gen wrappers and pins referenced sub_ names. "
+                             "Ported from the Burnout 3 fork.")
+    parser.add_argument("--trace-functions", metavar="FILE",
+                        help="JSON list of addresses to emit an entry trace "
+                             "for (RECOMP_TRACE_ENTER). For bring-up: shows "
+                             "which call in an init chain is not returning")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -202,6 +235,7 @@ def main():
         identified_json_path=data_files.get("identified"),
         abi_json_path=data_files.get("abi"),
         output_dir=args.output_dir,
+        trace_functions=_load_addrs(args.trace_functions),
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
     )
@@ -278,11 +312,88 @@ def main():
         if args.max_funcs:
             funcs = funcs[:args.max_funcs]
 
+        manual = set()
+        if args.manual_functions:
+            with open(args.manual_functions, "r", encoding="utf-8") as fh:
+                entries = json.load(fh)
+            # Accept a bare list of addresses or the {addr: name} shape the
+            # naming tools emit, so a project can point this at either.
+            #
+            # With {addr: name}, the name is binding: the hand-written C
+            # defines that symbol, so the generated declaration and every call
+            # site must use it regardless of what the function database calls
+            # the address. Otherwise re-running the naming tools silently
+            # renames the address, the manual definition no longer matches, and
+            # the only symptom is a pile of unresolved externals at link time
+            # that say nothing about naming.
+            pinned = entries if isinstance(entries, dict) else {}
+            if isinstance(entries, dict):
+                entries = list(entries.keys())
+            for e in entries:
+                if isinstance(e, dict):
+                    e = e.get("start") or e.get("address")
+                manual.add(int(e, 16) if isinstance(e, str) else int(e))
+            for key, pinned_name in pinned.items():
+                if not pinned_name:
+                    continue
+                addr = int(key, 16) if isinstance(key, str) else int(key)
+                entry = translator.func_db.get(addr)
+                if entry is None:
+                    print(f"  warning: manual function 0x{addr:08X} is not in "
+                          f"the function database", file=sys.stderr)
+                    continue
+                if entry.get("name") != pinned_name:
+                    print(f"  pinned 0x{addr:08X}: "
+                          f"{entry.get('name')} -> {pinned_name}",
+                          file=sys.stderr)
+                entry["name"] = pinned_name
+            print(f"Hand-written overrides: {len(manual)} functions will not "
+                  f"be generated", file=sys.stderr)
+
+        # --exclude-manual: derive the same `manual` set by scanning the C file
+        # the project hand-writes, instead of a separate JSON that has to be
+        # kept in sync with it. Everything below maps onto mechanisms already
+        # used above -- the `manual` set (declare-only) and func_db name pinning
+        # -- so the translator needs no changes.
+        if args.exclude_manual:
+            from .manual_scan import scan as _scan_manual
+            skip, wrap, referenced = _scan_manual(args.exclude_manual)
+            known = set(translator.func_db)
+
+            # referenced-but-not-wrapped: the hand-written code names these as
+            # sub_XXXXXXXX (declares or calls them), so they must keep that
+            # name whatever a naming pass wanted. Otherwise the manual reference
+            # is left undefined at link.
+            pinned = 0
+            for addr in (referenced & known) - wrap:
+                info = translator.func_db[addr]
+                plain = f"sub_{addr:08X}"
+                if info.get("name") != plain:
+                    info["name"] = plain
+                    pinned += 1
+
+            # wrap: recomp_manual.c defines sub_X itself and calls the generated
+            # body as sub_X_gen. So do NOT add these to `manual` (the body is
+            # still needed) -- just rename them so the emitted body is sub_X_gen.
+            for addr in wrap & known:
+                translator.func_db[addr]["name"] = f"sub_{addr:08X}_gen"
+
+            # skip - wrap: defined by hand and not wrapped -> declare-only, which
+            # is exactly what membership in `manual` produces.
+            newly = {a for a in (skip - wrap) if a in known} - manual
+            manual |= newly
+            print(f"Excluding {len(newly)} functions defined in "
+                  f"{args.exclude_manual}"
+                  + (f"; {pinned} pinned to sub_ names" if pinned else "")
+                  + (f"; {len(wrap & known)} wrapped as sub_X_gen" if wrap else ""),
+                  file=sys.stderr)
+
         stats = translator.translate_batch_split(
             funcs,
             output_dir=gen_dir,
             chunk_size=args.split,
             verbose=args.verbose,
+            manual=manual,
         )
 
         t_translate = time.time() - t0

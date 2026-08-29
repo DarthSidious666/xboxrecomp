@@ -973,6 +973,17 @@ HRESULT d3d8_CreateIndexBufferImpl(UINT Length, DWORD Usage, D3DFORMAT Format, I
 }
 
 /* ================================================================
+ * Surface Implementation
+ *
+ * D3D8Surface (declared in d3d8_internal.h) is implemented below in the
+ * "Surface Implementation (offscreen render targets, texture levels)"
+ * section. Surface LockRect uses a staging readback round-trip and covers
+ * palette/P8, MSAA and sub-rect locks. xbox_d3d8_surface_wrap() is provided
+ * for wrapping a raw D3D11 texture (e.g. a back buffer) as a surface and is
+ * implemented on top of d3d8_surface_create() below.
+ * ================================================================ */
+
+/* ================================================================
  * Texture Implementation
  * ================================================================ */
 
@@ -1399,6 +1410,17 @@ IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
     }
 
     return &sf->iface;
+}
+
+/* Wrap a raw D3D11 texture (e.g. a back buffer) as a surface. Borrowed from
+ * upstream's "ponytail" fix so a surface can alias a GPU texture that is not
+ * owned by a D3D8Texture. The surface adds a reference to the D3D11 texture. */
+IDirect3DSurface8 *xbox_d3d8_surface_wrap(ID3D11Texture2D *tex, UINT w, UINT h,
+                                          D3DFORMAT fmt)
+{
+    return d3d8_surface_create(tex, 0, 0, w, h, fmt,
+                               D3DPOOL_DEFAULT, 0,
+                               D3DMULTISAMPLE_NONE, NULL, 0);
 }
 
 static HRESULT __stdcall tex_GetSurfaceLevel(IDirect3DTexture8 *self, UINT Level, IDirect3DSurface8 **ppSurface)

@@ -74,18 +74,21 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
 {
     WCHAR save_base[MAX_PATH];
 
+    /* The fallbacks used to name Burnout 3 specifically, so any other title
+     * that passed NULL silently pointed its game dir and its saves at another
+     * game's folders. Generic now -- a caller that wants a title-specific
+     * location should pass one. */
     if (game_dir) {
         MultiByteToWideChar(CP_UTF8, 0, game_dir, -1, s_game_dir, MAX_PATH);
     } else {
         GetCurrentDirectoryW(MAX_PATH, s_game_dir);
-        wcscat_s(s_game_dir, MAX_PATH, L"\\Burnout 3 Takedown");
     }
 
     if (save_dir) {
         MultiByteToWideChar(CP_UTF8, 0, save_dir, -1, s_save_dir, MAX_PATH);
     } else {
         if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, save_base))) {
-            swprintf_s(s_save_dir, MAX_PATH, L"%s\\Burnout3", save_base);
+            swprintf_s(s_save_dir, MAX_PATH, L"%s\\xboxrecomp", save_base);
         } else {
             GetCurrentDirectoryW(MAX_PATH, s_save_dir);
             wcscat_s(s_save_dir, MAX_PATH, L"\\SaveData");
@@ -99,6 +102,26 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     len = wcslen(s_save_dir);
     if (len > 0 && s_save_dir[len - 1] == L'\\')
         s_save_dir[len - 1] = L'\0';
+
+    /* Create the save-side directories. T:/U:/Z: map into subdirectories of
+     * save_dir, and a title that opens a file there with a create disposition
+     * fails if the parent does not exist -- which reads as "cannot create save
+     * file" and sends the title down its init-failure path. Halo asserts
+     * exactly that at saved games/game_state_xbox.c:97 and then unwinds,
+     * clearing global_d3d_device on the way out, so a missing directory
+     * surfaces as a graphics failure.
+     *
+     * Cheap and idempotent: SHCreateDirectoryExW builds intermediates and is
+     * happy if they already exist. */
+    {
+        static const WCHAR *subs[] = { L"TitleData", L"UserData", L"Cache" };
+        WCHAR dir[MAX_PATH];
+        SHCreateDirectoryExW(NULL, s_save_dir, NULL);
+        for (int i = 0; i < 3; i++) {
+            swprintf_s(dir, MAX_PATH, L"%s\\%s", s_save_dir, subs[i]);
+            SHCreateDirectoryExW(NULL, dir, NULL);
+        }
+    }
 
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
@@ -132,6 +155,8 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     return TRUE;
 
 translate:
+    fprintf(stderr, "  [PATH] %s\n", xbox_path);
+    fflush(stderr);
     {
         WCHAR remainder_wide[MAX_PATH];
         MultiByteToWideChar(CP_ACP, 0, remainder, -1, remainder_wide, MAX_PATH);

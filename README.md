@@ -13,21 +13,13 @@
 
 > Turn any Xbox game binary into a native Windows executable. No emulation. No interpreter. Just raw, recompiled C.
 
-### Recent Changes
+**[Join the sp00nznet recomp Discord](https://discord.gg/CRpzGWZFcu)** — the
+community hub for sp00nznet's recomp projects, where ps3recomp development
+happens in the open. Good place to ask questions, show a port you are working
+on, or find out what people are stuck on before you duplicate the effort.
 
-- **Cross-Platform / Linux Port** — Platform abstraction layer with an **OpenGL D3D8 backend** alongside the Windows D3D11 path, POSIX path handling, and Linux build deps (`tools/linux/install_deps.sh`). Builds with GCC/Clang.
-- **`ghidra_naming` Tool (optional)** — Headless Ghidra FidDb pass recovers real CRT/XDK symbol names from a stripped XBE and merges them into `functions.json`, so generated C uses meaningful names instead of `sub_XXXXXXXX`. The core pipeline still needs no disassembler. See `tools/ghidra_naming/`.
-- **`--seed-functions`** — Iterative disasm mode: seed the function database from known/recovered entry points for fuller coverage on stripped binaries.
-- **Full Multi-Texture Fixed-Function Pipeline** — 4-stage texture blending with all D3D8 operations (MODULATE, ADD, SUBTRACT, BLEND*, DOTPRODUCT3, etc.), full D3DTA argument resolution (DIFFUSE, CURRENT, TEXTURE, TFACTOR, SPECULAR + COMPLEMENT/ALPHAREPLICATE), and 4 samplers bound per draw.
-- **Hardware T&L Lighting** — Up to 8 lights (directional, point, spot) with material properties, global ambient, specular highlights, and world-space normal transform. Full Blinn-Phong with attenuation and spotlight cones.
-- **Vertex Fog** — Linear/exp/exp2 fog computed in vertex shader, blended with fog color in pixel shader. Fog parameters sourced from D3D8 render states.
-- **DrawPrimitiveUP Ring Buffer** — 4MB persistent ring buffer eliminates per-call D3D11 buffer create/destroy. Triangle fan and quad list to triangle list conversion.
-- **NV2A Register Combiner Pixel Shaders** — Full 8-stage combiner + final combiner translated to HLSL at runtime with 128-entry shader cache.
-- **NV2A Programmable Vertex Shaders** — 128-bit microcode parser and HLSL generator covering all 14 MAC + 8 ILU operations, 192 constant registers, and relative addressing.
-- **Texture Unswizzling** — Xbox Z-order (Morton code) swizzled textures converted to linear D3D11 layout. Optimized masked-increment algorithm from xemu.
-- **NV2A PGRAPH→D3D11 Translator** — Push buffer method interception and D3D11 rendering (upstreamed from Burnout 3).
-- **EEPROM / AV Pack / SMBus** — Games can query region, language, video standard, AV pack type, and hardware info.
-- **Games in progress** — Burnout 3 (**playable**: menus, tracks, physics, audio), Xbox Dashboard (VRML+JS scene-engine bring-up), Wreckless (debugging), Blood Wake (scaffolded).
+**Current version: v0.6.0 — _"Credit Where Due"_ (August 2026).**
+See the [Changelog](#changelog) for what landed and when.
 
 ---
 
@@ -37,7 +29,10 @@ This is a complete toolkit for **statically recompiling original Xbox (2001-2005
 
 Static recompilation takes the raw x86 machine code from an Xbox binary and translates every function — every `mov`, every `jmp`, every `call` — into equivalent C source code. That C code compiles with MSVC into a native x86-64 `.exe` that runs on modern Windows. The game's original logic executes directly on your CPU, not through an interpreter or JIT compiler.
 
-**This is the first known static recompilation project targeting the original Xbox.**
+**This is the first *public* static recompilation toolkit for the original Xbox.**
+Microsoft got here first: their internal Ficl/Fission recompiler shipped Xbox
+back-compat on the 360. We have since studied it — see
+[Microsoft's Own Recompiler](docs/technical/ms-fusion-recompiler.md).
 
 The technique has been proven on other platforms — [N64Recomp](https://github.com/N64Recomp/N64Recomp) showed MIPS-to-C was viable, [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) brought it to Xbox 360's PowerPC — but nobody had tackled the OG Xbox until now. Its x86 architecture makes it both easier (same instruction set family as the host) and harder (variable-length instructions, complex addressing modes, x87 FPU stack) than MIPS or PPC targets.
 
@@ -98,11 +93,11 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 
 | Library | Source | What It Does |
 |---------|--------|-------------|
-| **xbox_kernel** | Custom | Xbox kernel → Win32 (115 of the kernel's 366 ordinals resolved, 55 with dedicated bridges: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
+| **xbox_kernel** | Custom | Xbox kernel → Win32 (152 of the kernel's 371 ordinals routed, 112 with dedicated bridges: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
 | **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
-| **xbox_apu** | xemu | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
-| **xbox_nv2a** | xemu+Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
+| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
+| **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
 | **xbox_input** | Custom | Xbox gamepad → XInput |
 
 ### Building the Libraries
@@ -191,17 +186,23 @@ py -3 -m tools.disasm game_files/default.xbe --text-only
 py -3 -m tools.func_id game_files/default.xbe -v
 #    Output: tools/func_id/output/ (CRT, RenderWare, vtables classified)
 
-# 6. Lift to C — the big one
+# 6. Recover calling conventions and parameter counts
+py -3 -m tools.abi_analysis game_files/default.xbe -v
+#    Output: tools/abi_analysis/output/abi_functions.json
+#    Skipping this still "works", but every function falls back to
+#    cdecl / 0 params / int-or-void, so the generated signatures are guesses.
+
+# 7. Lift to C — the big one
 py -3 -m tools.recomp game_files/default.xbe --all --split 1000
 #    Output: src/game/recomp/gen/ (millions of lines of C)
 
-# 7. Set up runtime shims (see docs/runtime/ for templates)
-#    - Xbox kernel replacement (115 ordinals resolved)
+# 8. Set up runtime shims (see docs/runtime/ for templates)
+#    - Xbox kernel replacement (152 ordinals routed)
 #    - D3D8 -> D3D11 translation layer
 #    - Memory layout reproduction
 #    - Input system
 
-# 8. Build and run
+# 9. Build and run
 cmake -S . -B build
 cmake --build build --config Release
 bin/your_game.exe
@@ -230,7 +231,12 @@ xboxrecomp/
 │   ├── xbe_parser/              # XBE file format parser
 │   ├── disasm/                  # x86 disassembler + function detector
 │   ├── func_id/                 # Library function identifier
-│   └── recomp/                  # x86 -> C static recompiler
+│   ├── abi_analysis/            # Calling convention / param recovery
+│   ├── recomp/                  # x86 -> C static recompiler
+│   ├── debug_symbols/           # Debug-build symbol recovery
+│   ├── symbols/ ghidra_naming/  # Optional symbol-name recovery
+│   ├── xiso/ xmv/               # Disc image and video container tools
+│   └── fusion/                  # MS Ficl/Fission study tooling
 ├── src/                         # Runtime libraries (C, link-time)
 │   ├── kernel/                  # xbox_kernel - Xbox kernel → Win32
 │   ├── d3d/                     # xbox_d3d8   - D3D8 → D3D11 graphics
@@ -244,28 +250,27 @@ xboxrecomp/
 │       ├── recomp_types.h       # Register model + ICALL macros
 │       ├── xbox_memory.h        # Memory layout helpers
 │       └── kernel_stubs.h       # Kernel function stub templates
-├── docs/                        # Documentation
-│   ├── pipeline/                # Step-by-step pipeline guides
-│   ├── technical/               # Deep technical documentation
-│   ├── formats/                 # Xbox file format references
-│   └── runtime/                 # Runtime implementation guides
-└── templates/                   # new-game scaffold + runtime headers
+└── docs/                        # Documentation
+    ├── pipeline/                # Step-by-step pipeline guides
+    ├── technical/               # Deep technical documentation
+    ├── formats/                 # Xbox file format references
+    └── runtime/                 # Runtime implementation guides
 ```
 
 ## Documentation
 
 ### Start Here
 - **[Getting Started Guide](docs/GETTING_STARTED.md)** — End-to-end walkthrough from XBE to running game
-- **[Tools Reference](tools/README.md)** — Detailed usage for all 5 pipeline tools
+- **[Tools Reference](tools/README.md)** — Detailed usage for every pipeline tool
 - **[Runtime Libraries](src/README.md)** — Architecture, build instructions, integration guide
 
 ### Per-Module API Reference
-- [xbox_kernel](src/kernel/README.md) — Memory layout, file I/O, threading, sync, crypto, EEPROM, SMBus (8,298 LOC)
-- [xbox_d3d8](src/d3d/README.md) — D3D8 interface, register combiners, vertex shaders, texture unswizzle (7,018 LOC)
+- [xbox_kernel](src/kernel/README.md) — Memory layout, file I/O, threading, sync, crypto, EEPROM, SMBus (11,128 LOC)
+- [xbox_d3d8](src/d3d/README.md) — D3D8 interface, register combiners, vertex shaders, texture unswizzle (8,838 LOC)
 - [xbox_dsound](src/audio/README.md) — DirectSound buffers, 3D audio, mixbins (573 LOC)
-- [xbox_apu](src/apu/README.md) — MCPX APU voice processor, mixer, MMIO (3,918 LOC)
-- [xbox_nv2a](src/nv2a/README.md) — NV2A GPU registers, push buffer, PGRAPH→D3D11 (4,778 LOC)
-- [xbox_input](src/input/README.md) — Gamepad state, vibration, button mapping (212 LOC)
+- [xbox_apu](src/apu/README.md) — MCPX APU voice processor, mixer, MMIO (4,168 LOC)
+- [xbox_nv2a](src/nv2a/README.md) — NV2A GPU registers, push buffer, PGRAPH→D3D11 (4,892 LOC)
+- [xbox_input](src/input/README.md) — Gamepad state, vibration, button mapping (360 LOC)
 
 ### Pipeline Guides
 - [Extracting and Parsing XBE Files](docs/pipeline/01-xbe-parsing.md)
@@ -280,96 +285,38 @@ xboxrecomp/
 - [Memory Layout Reproduction](docs/technical/memory-layout.md) — CreateFileMapping, mirror views, and address space tricks
 - [Indirect Call Dispatch](docs/technical/indirect-calls.md) — The RECOMP_ICALL problem and how to solve it
 - [D3D8 to D3D11 Translation](docs/technical/d3d-translation.md) — Bridging Xbox's graphics API to modern DirectX
-- [D3D8LTCG Device Context](docs/technical/d3d8ltcg-device-context.md) — Device field map, PB ring management, stub calling conventions **(NEW)**
+- [NV2A Shader Translation](docs/technical/nv2a-shaders.md) — Register combiners and vertex microcode to HLSL
+- [D3D8LTCG Device Context](docs/technical/d3d8ltcg-device-context.md) — Device field map, PB ring management, stub calling conventions
 - [Xbox Kernel Replacement](docs/technical/kernel-replacement.md) — Mapping Xbox kernel ordinals to Win32
 - [SEH and Exception Handling](docs/technical/seh-handling.md) — Structured exception handling in recompiled code
 - [Lessons Learned](docs/technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
 - [Gap Analysis vs xemu](docs/technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
+- [Microsoft's Own Recompiler](docs/technical/ms-fusion-recompiler.md) — White-room analysis of Ficl/Fission: pipeline, address map, HLE boundary
+- [Ficl/Fission Codegen Teardown](docs/technical/ms-fusion-codegen-teardown.md) — IDA/Hex-Rays teardown of both their translators, and how it reframes our roadmap
+- [Burnout 3 Reunification](docs/technical/burnout3-reunification.md) — bringing the origin title back onto the extracted toolkit: what's done, and the threading gate that makes the runtime a merge not a swap
 
 ### Xbox Formats
 - [XBE File Format](docs/formats/xbe.md) — Xbox executable format reference
 - [Xbox Kernel Exports](docs/formats/kernel-exports.md) — All 366 kernel functions documented
 
-## How The Key Pieces Work
+## How It Works
 
-### The Register Model
+The interesting parts each have their own document rather than a summary here,
+so there is one place to keep correct:
 
-Xbox uses 32-bit x86 with 8 general-purpose registers. In recompiled code, these become C globals:
-
-```c
-// Volatile (caller-saved) — shared across all functions
-uint32_t g_eax, g_ecx, g_edx, g_esp;
-
-// Callee-saved — also global (implicit parameter passing via esi/edi/ebx)
-uint32_t g_ebx, g_esi, g_edi;
-
-// Stack lives in Xbox memory space
-#define PUSH32(val)  do { g_esp -= 4; MEM32(g_esp) = (val); } while(0)
-#define POP32(dst)   do { (dst) = MEM32(g_esp); g_esp += 4; } while(0)
-```
-
-Every recompiled function is `void func(void)` — arguments pass through the simulated stack and registers, just like real x86.
-
-### Memory Layout
-
-Xbox has 64 MB of unified RAM. We reproduce the exact address layout:
-
-```c
-// Create shared memory object
-HANDLE h = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 64*1024*1024, NULL);
-
-// Map at Xbox virtual addresses
-MapViewOfFileEx(h, FILE_MAP_ALL_ACCESS, 0, offset, size, (LPVOID)0x00010000);  // XBE
-MapViewOfFileEx(h, FILE_MAP_ALL_ACCESS, 0, offset, size, (LPVOID)0x80000000);  // mirror
-// ... 28 views total covering the Xbox address space
-```
-
-Why `CreateFileMapping` instead of `VirtualAlloc`? The Xbox has **mirror regions** — the same physical memory at multiple virtual addresses. File mapping gives us true aliases; VirtualAlloc would give separate copies where writes in one aren't visible in the other.
-
-### The ICALL Problem
-
-The single hardest challenge. When the game does `call [eax+0x10]` (a virtual method call), we don't know the target at compile time. Our dispatch macro handles it:
-
-```c
-#define RECOMP_ICALL(va) do {                          \
-    recomp_func_t fn = recomp_lookup_manual(va);       \  // 1. hand-written overrides
-    if (!fn) fn = recomp_lookup(va);                   \  // 2. auto dispatch table
-    if (!fn) fn = recomp_lookup_kernel(va);            \  // 3. kernel bridge
-    if (fn) fn();                                       \
-    else { g_esp += 4; /* pop dummy ret addr */ }      \
-} while(0)
-```
-
-Most ICALLs resolve through the auto-generated dispatch table (binary search over all function addresses). The rest are either kernel calls (0xFE000000+ range) or garbage pointers from corrupted vtables that need per-function guards.
-
-### NV2A Register Combiners → HLSL
-
-Xbox games don't use traditional pixel shaders — they configure the NV2A's 8-stage register combiner pipeline. Each stage performs independent RGB and alpha math (multiply, dot product, MUX) on a register file of textures, vertex colors, and constants. The final combiner blends everything together.
-
-We translate this to HLSL at runtime:
-
-```c
-// Game configures 3 combiner stages...
-SetPixelShader(0x00000103);  // 3 stages, tex0=2D, tex1=2D
-
-// At draw time, we generate and cache an HLSL pixel shader:
-//   Stage 0: r0.rgb = tex0 * diffuse
-//   Stage 1: r0.rgb = r0 * tex1 (environment map modulate)
-//   Stage 2: r0.a   = tex0.a * diffuse.a
-//   Final:   output = r0
-```
-
-The 128-entry shader cache means each unique combiner configuration is compiled once and reused. This covers multi-texturing outright. Bump and environment mapping are partial — the combiner side is there, but texture coordinate generation (`TEXCOORDINDEX` with the camera-space modes) is not, so effects that depend on generated coords won't look right yet. See [gap-analysis](docs/technical/gap-analysis.md) for the current per-feature state.
-
-### NV2A Vertex Shader Microcode → HLSL
-
-When games use programmable vertex shaders (water displacement, skeletal animation, custom lighting), they upload NV2A microcode — 128-bit instructions with paired MAC+ILU operations. We parse and translate to HLSL:
-
-- **14 MAC ops**: MOV, MUL, ADD, MAD, DP3, DP4, DPH, DST, MIN, MAX, SLT, SGE, ARL
-- **8 ILU ops**: MOV, RCP, RCC, RSQ, EXP, LOG, LIT
-- **192 constant registers**, 12 temporaries, 16 vertex inputs
-- Relative addressing via the address register (A0)
-- 64-entry compiled shader cache
+- **[The Register Model](docs/technical/register-model.md)** — why the guest
+  registers are globals (and thread-local), how the guest stack is simulated,
+  and why every recompiled function is `void f(void)`.
+- **[Memory Layout](docs/technical/memory-layout.md)** — reproducing the Xbox
+  address space with `CreateFileMapping` + 28 mirror views, and why
+  `VirtualAlloc` cannot do it (mirrors must alias the same physical pages, not
+  copy them).
+- **[Indirect Call Dispatch](docs/technical/indirect-calls.md)** — `call [eax+0x10]`
+  with no compile-time target. The hardest part of any bring-up.
+- **[NV2A Shader Translation](docs/technical/nv2a-shaders.md)** — register
+  combiners and vertex microcode to HLSL, both translated at runtime and cached.
+- **[SEH and Exception Handling](docs/technical/seh-handling.md)** — how
+  `__SEH_prolog`/`__SEH_epilog` are detected per title and bridged.
 
 ## Games That Work Well As Targets
 
@@ -388,7 +335,7 @@ See [docs/technical/candidate-games.md](docs/technical/candidate-games.md) for a
 
 ## Projects Using This Toolkit
 
-- **[Burnout 3: Takedown](https://github.com/sp00nznet/burnout3)** — The reference implementation and most mature target: **playable**. 22,097 functions lifted, main menu at 60fps, 37 tracks with textures, 67 vehicle models, physics, AWD audio.
+- **[Burnout 3: Takedown](https://github.com/sp00nznet/burnout3)** — The origin title and most mature target. 22,097 functions lifted. An earlier build was playable to the main menu at 60fps, but leaned on hand-written menu and render scaffolding; that is being replaced with genuinely recompiled code, and the honest bring-up currently reaches engine/RenderWare init. Treat the old "playable" claim as retired until the recompiled path gets back there.
 - **[Xbox Dashboard](https://github.com/sp00nznet/xboxdashboard)** — The original Xbox system shell (build 3944). Boots and renders the green orb at 60fps (D3D8→D3D11). Its UI is driven by a **VRML97 + JavaScript scene engine** (text→bytecode compiler + stack-machine VM + node-class reflection registry) — currently being brought online; demonstrates the toolkit on system software, not just games.
 - **[Wreckless: The Yakuza Missions](https://github.com/sp00nznet/wreckless)** — Xbox launch title (2002). Custom engine, 3,407 functions, boots through CRT init into game main. Debugging early gameplay crash.
 - **[Blood Wake](https://github.com/sp00nznet/bloodwake)** — First-party Microsoft naval combat (2001). Stormfront Studios custom engine. 4,608 functions, 367K lines of C generated (99.1% success). Project scaffolded, working toward first build.
@@ -398,10 +345,14 @@ See [docs/technical/candidate-games.md](docs/technical/candidate-games.md) for a
 This is an emerging field. Here's how you can contribute:
 
 1. **Try it on a new game** — Pick an Xbox exclusive, follow the pipeline, and see how far you get. Even partial results teach us about the toolchain's gaps.
-2. **Improve the lifter** — The x86-to-C translator handles ~95% of instructions. Edge cases (SIMD, obscure FPU ops, segment prefixes) need work.
+2. **Improve the lifter** — Coverage is good but unquantified; the honest signal is that an unhandled instruction lifts to a bare `/* mnemonic */` comment, so grepping generated output for those finds the gaps. Segment prefixes and the rarer x87/SSE forms are where they cluster.
 3. **Document Xbox formats** — Every game has its own asset formats. Document what you discover.
 4. **Build runtime components** — Better D3D8 emulation, audio, networking — the runtime layer is where most per-game work happens.
 5. **Share your findings** — Write up what you learn. The Xbox modding/preservation community benefits from every discovery.
+
+Not sure where to start, or want to sanity-check an idea first? Ask in the
+[Discord](https://discord.gg/CRpzGWZFcu) — several of the people working on
+ports and on the lifter are there.
 
 ## Dependencies
 
@@ -409,10 +360,28 @@ The toolchain is intentionally lightweight:
 
 ```
 Python 3.10+
-capstone        # x86 disassembly (pip install capstone)
+capstone        # x86 disassembly  (pip install capstone)
+pytest          # test suite only  (pip install pytest)
 ```
 
 That's it for the core pipeline — no IDA, no Ghidra, no proprietary tools. Just the standard library + Capstone. (An *optional* `tools/ghidra_naming` helper can use headless Ghidra purely to recover symbol names; it is never required to produce a working build.)
+
+### Running the tests
+
+```
+py -3 -m pytest tools/       # unit tests
+py -3 -m tools.conformance   # differential: lifted C vs the real CPU
+```
+
+The unit tests are fast and need no game files. The conformance suite goes
+further: it assembles each snippet with MSVC, lifts the resulting bytes, then
+runs the lifted C *and the original instructions* over the same inputs and
+requires them to agree. Because we target x86 and run on x86, the host CPU is
+the oracle — no model to be wrong. See
+[Conformance Testing](docs/technical/conformance-testing.md). It needs a 32-bit
+MSVC, and is skipped rather than failed where there isn't one.
+
+If you fix a lift, add the case.
 
 The runtime libraries (C) use:
 - MSVC (Visual Studio 2022) or MinGW-w64
@@ -439,11 +408,216 @@ A: C is portable, debuggable, and the compiler optimizes it for you. You can rea
 
 ## License
 
-MIT
+**MIT** — see [LICENSE](LICENSE). Third-party components keep their original
+licence:
+
+| Component | Licence | Copyright |
+|---|---|---|
+| the MCPX APU sources in `src/apu/` | LGPL-2.1-or-later | espes; Jannik Vogel; Matt Borgerson |
+| `src/nv2a/nv2a_regs.h` | LGPL-2.1-or-later | espes; Jannik Vogel |
+| everything else | MIT | sp00nz and contributors |
+
+The APU and the NV2A register definitions were extracted from
+[xemu](https://github.com/xemu-project/xemu) and are that project's work, not
+ours. LGPL-2.1 expressly permits linking them from MIT or proprietary code, so
+a recompiled game is unaffected; what it asks is that the notices stay, the
+source stays available, and users can relink against a modified library.
+[LICENSES/LGPL-2.1.txt](LICENSES/LGPL-2.1.txt) is the verbatim licence text —
+shipping it alongside those files is a requirement, not a courtesy.
+
+Not every file under `src/apu/` and `src/nv2a/` is xemu-derived. See
+[NOTICE](NOTICE) for the exact list, each with the copyright it actually
+carries — including algorithms we implemented ourselves but learned from xemu,
+credited there even where no licence obligation attaches.
+
+## Contributors
+
+xboxrecomp is built by more than one person. See
+**[CONTRIBUTORS.md](CONTRIBUTORS.md)** for who did what — including the people
+who never sent a patch and still moved the project further than a patch would
+have, by finding the wall everyone else was about to hit.
+
+Thank you, all of you.
 
 ## Credits
 
 Built with [Claude Code](https://claude.ai) (Anthropic) — proving that AI-assisted systems programming can tackle problems previously considered impractical.
+
+Human contributors are credited in [CONTRIBUTORS.md](CONTRIBUTORS.md); the
+third-party code we build on is credited in [NOTICE](NOTICE).
+
+## Changelog
+
+Versions start at v0.1.0 with the initial public release; earlier entries were
+reconstructed from the commit history, so they are dated by when the work
+actually landed rather than by any tag that existed at the time.
+
+### v0.6.0 — *"Credit Where Due"* (August 2026)
+
+*The first release with contributors other than the maintainer, and the
+housekeeping that should have been in place before there were any.*
+
+**Correctness — the silent kind.** Every fix here produced C that compiled,
+linked, ran, and was wrong, with no lifter warning anywhere.
+
+- **Conditional tail calls skipped the frame bridge** — `jcc` to a known
+  function entry is a tail call, but only the unconditional form emitted the
+  bridge, so the taken edge ran with the caller's frame still live. 8,263 call
+  sites across 5,426 functions on the title tested — *[@NoRain211](https://github.com/NoRain211)* (#7)
+- **Indirect calls read their target after the return-address push**, so
+  `call [esp+X]` resolved from the wrong slot — *[@NoRain211](https://github.com/NoRain211)* (#7)
+- **`repe cmpsb` / `repne scasb` folded their flags to a literal 1**, so every
+  `memcmp`/`strcmp`-shaped loop in the CRT reported "equal" regardless of
+  input — *[@NoRain211](https://github.com/NoRain211)* (#8)
+- **`NEG` carry was dropped before a non-adjacent `SBB`/`ADC`**, which is the
+  standard 64-bit subtract and sign-extend idiom — *[@NoRain211](https://github.com/NoRain211)* (#8)
+- **Signed compares evaluated at 32 bits regardless of operand width**, so the
+  sign bit of an 8- or 16-bit operand was never in the right place — *[@NoRain211](https://github.com/NoRain211)* (#8)
+- **Packed SSE was lifted as a scalar `float`** — `movaps`/`movups` moved 4 of
+  16 bytes and dropped the upper three lanes (18,439 moves), and packed
+  arithmetic had no pattern at all (561 operations dropped) — *[@NoRain211](https://github.com/NoRain211)* (#9)
+- **904 x87 instructions across 28 mnemonics lifted to comments**, desynchro-
+  nising the FPU stack from that point on; `FNSTCW`/`FNSTSW` were comments too,
+  so every `fcom`-derived parity test read a hardcoded `true` (1,326 sites) — *[@NoRain211](https://github.com/NoRain211)* (#9)
+- **XMM was a function-local**, so a value written in one lifted block and read
+  in the next was lost — *[@NoRain211](https://github.com/NoRain211)* (#10)
+
+**Pipeline**
+
+- **`tools/abi_analysis` now exists.** `tools.recomp` had always looked for
+  `abi_functions.json`, warned when it was missing, and then fallen back to
+  cdecl / 0 params / int-or-void for *every* function — because the tool meant
+  to produce that file was never written. Recovers calling convention
+  (including thiscall), parameter count from the `ret` immediate, return-type
+  hints and frame shape — *[@DarthSidious666](https://github.com/DarthSidious666)* (#6)
+- **The SSE runtime.** The lift in #9/#10 emitted 28 `XMM_*` helpers that
+  nothing defined. Added `RecompXmm` plus lane-wise implementations, verified by
+  compiling real lifter output under MSVC and checking the cases where x86
+  disagrees with naive C — `MINPS` returning its second operand on a tie,
+  `ANDNPS` being `~dst & src`, `CMPNEQPS` being the unordered form.
+- **The research branch merged back**: per-title SEH detection, the
+  function-boundary fix, operand-aware x87, the MS Ficl/Fission study, XISO
+  redump support, and indirect-call feedback.
+
+**Project**
+
+- **[CONTRIBUTORS.md](CONTRIBUTORS.md)** — including the people who only ever
+  filed an issue. [@Tiptup300](https://github.com/Tiptup300) (#1) found that
+  every documented getting-started step was broken, on Linux; that report is why
+  the pipeline was fixed *and* why this repository has a LICENSE file at all.
+  [@M0RSM4LLEO](https://github.com/M0RSM4LLEO) (#2) reproduced it with the
+  detail that made it actionable.
+- **LGPL compliance.** The xemu-derived APU and NV2A sources always carried
+  their notices, but the repository shipped no `NOTICE` and no copy of the
+  licence. Both now present, with every affected file listed against the
+  copyright it actually carries.
+- **The test suite actually runs.** A bare import in `tools/symbols` aborted
+  pytest collection for the whole tree, so `pytest tools/` executed nothing.
+  Now 141 tests.
+- **Differential conformance testing** (`tools/conformance`) — assembles each
+  snippet with MSVC, lifts the bytes, and runs the lifted C against the original
+  instructions on the real CPU over **2,043 input vectors** covering integer
+  results, the x87 stack (values *and* depth) and all four SSE lanes. Adapted
+  from ps3recomp's methodology, but stronger here: we target x86 and run on
+  x86, so the oracle is the hardware rather than a model of it. It found three
+  live bugs, all of which the existing string-comparison tests passed:
+  - **`fxch st(i)` was a silent no-op** — Capstone reports `fxch` with both
+    operands, `(st(0), st(i))`, and it is the only x87 form that does, so the
+    handler picked up the implicit `st(0)` and swapped st0 with itself.
+  - **`stc`/`clc`/`cmc` were unimplemented**, so the carry a following
+    `adc`/`sbb` read kept whatever the last arithmetic left in it.
+  - **`fnstsw` did not model TOP** (status bits 11–13, AH bits 3–5) and the
+    `ax` form wrote only AH rather than all of AX.
+- **Whole-function conformance** — a second phase compiles a C corpus with
+  `/O2 /arch:IA32` (Pentium III: SSE1, no SSE2, like the real hardware), lifts
+  the machine code back through the full `FunctionTranslator`, and runs it
+  against the original. Testing what the optimiser emits rather than what
+  someone thought to write down found two more:
+  - **Flag state followed address order, not control flow.** A `jcc` consuming
+    a `cmp` from a non-adjacent block inherited the flags of whatever sat above
+    it in memory — usually an `add`, which clobbers them. State now propagates
+    along predecessor edges, and only when every predecessor agrees.
+  - **`js`/`jns` evaluated the sign at 32 bits**, so after an 8- or 16-bit
+    `test` every value with the top bit set looked positive. The same width bug
+    the signed compares had; these two were missed at the time.
+  - **`bt`/`btr`/`bts`/`btc` were unhandled** — 386 instructions, lifted to a
+    comment, so the bit was silently left alone. Surfaced once the corpus began
+    lifting the CRT's float-to-int helper, which uses `btr` on the x87 control
+    word.
+
+  The corpus lifts from a **linked image**, so jump tables, `.rdata` float
+  constants and calls to CRT helpers all work — `__allmul` is lifted and
+  verified alongside the corpus itself.
+- **Conformance against a real title** (`--xbe path/to/default.xbe`) — Xbox
+  code is 32-bit x86 and the harness is a 32-bit x86 process, so a game's own
+  machine code can be *executed* as the oracle: map the XBE where it was linked
+  for, call one of its functions, run the lifted C over the same arguments, and
+  compare. Candidates are picked mechanically (no calls, no invented pointers,
+  plain `ret`, nothing lifting to a comment), so what gets compared is provably
+  safe to run. Verified clean on Burnout 3, Conker, Crimson Skies and Blood
+  Wake. No game files are included or needed for the rest of the suite.
+
+  It found that **`fnstsw` did not model C2, the unordered bit**. An x87 compare
+  against a NaN sets C3, C2 and C0 together, and `fucompp; fnstsw ax; test
+  ah,44h; jp` is how this era's CRT asks "is this a NaN" — reporting "equal"
+  answered *no* every time, sending every float classification in a title down
+  the wrong branch. Found by running Crimson Skies' own float classification
+  against itself.
+
+  Totals: **2,599 snippet vectors, 211 whole-function vectors**, plus per-title
+  runs (Burnout 3: 37 functions / 161 vectors clean).
+
+### v0.5.0 — *"Fall-Through"* (July 2026)
+
+- **Fall-through into the next function was dropped.** When the disassembler
+  splits a straight-line run of code at an internal branch target, the earlier
+  function often ends by falling through into the next — which x86 executes. The
+  lifter emitted nothing, so the body ended and skipped the next function's
+  shared epilogue: an esp leak that corrupted callee-saved registers.
+  **4,587 of 35,286 functions in Burnout 3** had this shape.
+- **Per-title SEH detection.** `__SEH_prolog`/`__SEH_epilog` addresses were
+  hardcoded to one game's CRT, so on every other title the `ebp` read-back was
+  never emitted. Found by signature now.
+- Halo bring-up: debug-build symbol recovery, per-target memory map, x87
+  correctness, and seven misrouted kernel ordinals.
+
+### v0.4.0 — *"Portable"* (May 2026)
+
+- **Cross-platform layer with an OpenGL D3D8 backend** beside the Windows D3D11
+  path, POSIX path handling, and Linux build deps. Builds with GCC/Clang.
+- **`ghidra_naming` (optional)** — headless Ghidra FidDb pass recovers real
+  CRT/XDK symbol names from a stripped XBE. The core pipeline still needs no
+  disassembler.
+
+### v0.3.0 — *"Fixed Function"* (March 2026)
+
+- **Full multi-texture fixed-function pipeline** — 4-stage blending with all
+  D3D8 operations and full `D3DTA` argument resolution, 4 samplers per draw.
+- **Hardware T&L lighting** — up to 8 lights with materials, global ambient,
+  specular, and world-space normal transform; Blinn-Phong with attenuation and
+  spotlight cones.
+- **Vertex fog** (linear/exp/exp2) and a **4MB DrawPrimitiveUP ring buffer**
+  that removes per-call buffer create/destroy.
+- **`--seed-functions`** for iterative disassembly on stripped binaries.
+
+### v0.2.0 — *"Programmable"* (March 2026)
+
+- **NV2A register combiner pixel shaders** — full 8-stage plus final combiner
+  translated to HLSL at runtime, with a 128-entry cache.
+- **NV2A programmable vertex shaders** — 128-bit microcode parser and HLSL
+  generator covering all 14 MAC and 8 ILU operations, 192 constant registers,
+  and relative addressing.
+- **Texture unswizzling** — Xbox Z-order (Morton) to linear.
+- **NV2A PGRAPH → D3D11 translator**, push buffer method interception.
+- **EEPROM / AV pack / SMBus** so games can query region, language, video
+  standard and hardware info.
+
+### v0.1.0 — *"First Light"* (March 2026)
+
+Initial public release: XBE parser, x86 disassembler and function detector,
+library-function identifier, the x86 → C recompiler, and the runtime libraries
+(kernel, D3D8, DirectSound, APU, NV2A, input), extracted from the Burnout 3
+bring-up that started it.
 
 ## References
 
