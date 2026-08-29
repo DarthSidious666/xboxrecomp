@@ -243,6 +243,9 @@ SHORT GetAsyncKeyState(int vKey);
 HWND  FindWindowA(LPCSTR className, LPCSTR windowName);
 HWND  GetActiveWindow(void);
 BOOL  SetWindowTextA(HWND hwnd, LPCSTR text);
+int   GetWindowTextA(HWND hwnd, LPSTR text, int count);
+typedef BOOL (CALLBACK *WNDENUMPROC)(HWND hwnd, LPARAM lParam);
+BOOL  EnumWindows(WNDENUMPROC enumProc, LPARAM lParam);
 
 /* MessageBox + flags (stderr stub on POSIX). */
 int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);

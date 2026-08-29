@@ -1895,8 +1895,8 @@ class Lifter:
         # arithmetic ops (addps/mulps) already use -- but computing the low lane
         # is strictly better than the TODO no-op these used to hit, which left
         # the destination stale and fed garbage into vector normalisation.
-        # rsqrtps/sqrtps are the workhorse of 3D vector normalize; Wreckless
-        # uses them heavily, Burnout 3 did not, which is why this surfaced now.
+        # rsqrtps/sqrtps are the workhorse of 3D vector normalize; some titles
+        # use them heavily, which is why this surfaced on those binaries.
         if m == "sqrtps":
             if nops >= 2:
                 return [_sse_write(ops[0], f"sqrtf({_sse_read(ops[1])})")

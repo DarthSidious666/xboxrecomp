@@ -18,6 +18,10 @@ community hub for sp00nznet's recomp projects, where ps3recomp development
 happens in the open. Good place to ask questions, show a port you are working
 on, or find out what people are stuck on before you duplicate the effort.
 
+**Title-agnostic.** The runtime, kernel layer, D3D8 abstraction, NV2A translator, and the Python pipeline (parser → disasm → func_id → abi_analysis → recomp) all derive per-title layout and behavior from the XBE itself. *Burnout 3: Takedown* was the reference title the toolkit was built against, so many docs use its metrics as examples — see `docs/candidate-games.md` for ports in progress.
+
+### Recent Changes
+
 **Current version: v0.6.0 — _"Credit Where Due"_ (August 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
