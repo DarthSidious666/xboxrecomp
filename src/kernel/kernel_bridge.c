@@ -245,6 +245,31 @@ static ULONG g_slot_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE];
 /* Log counter - limit output to avoid flooding */
 static int g_kernel_call_count = 0;
 
+/* How many kernel calls get logged before the log goes quiet.
+ *
+ * The cap keeps a title that makes thousands of calls from burying the
+ * console, but a bring-up that gets past early init then has no visibility at
+ * exactly the point it stops being obvious. Override with
+ * RECOMP_KERNEL_LOG_BUDGET, the same way RECOMP_TRACE_BUDGET works for the
+ * function tracer. 0 silences the log entirely.
+ */
+static long kernel_log_budget(void)
+{
+    static long budget = -1;
+
+    if (budget < 0) {
+        const char *env = getenv("RECOMP_KERNEL_LOG_BUDGET");
+        budget = env ? strtol(env, NULL, 0) : 200;
+        if (budget < 0)
+            budget = 0;
+    }
+    return budget;
+}
+
+#define KERNEL_LOG_ON()      (g_kernel_call_count <= kernel_log_budget())
+/* Some sites logged at a tighter cap than the rest; keep them proportional. */
+#define KERNEL_LOG_ON_HALF() (g_kernel_call_count <= kernel_log_budget() / 2)
+
 /* Read Xbox stack arg as uint32_t.
  * After kernel_thunk_dispatch pops the dummy return address (g_esp += 4),
  * arg0 is at g_esp+0, arg1 at g_esp+4, etc. */
@@ -459,7 +484,7 @@ static void bridge_NtClose(void)
 {
     uint32_t raw_handle = STACK_ARG(0);
 
-    if (g_kernel_call_count <= 200) {
+    if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
         fflush(stderr);
     }
@@ -483,7 +508,7 @@ static void bridge_MmAllocateContiguousMemory(void)
     /* Allocate from Xbox heap so MEM32(result) works correctly */
     uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
 
-    if (g_kernel_call_count <= 100) {
+    if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemory: size=%u → Xbox VA 0x%08X\n",
                 size, xbox_va);
         fflush(stderr);
@@ -531,7 +556,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
          * are "allocated" but full of garbage. */
         memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
 
-        if (g_kernel_call_count <= 100) {
+        if (KERNEL_LOG_ON_HALF()) {
             fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
                     "pinned phys 0x%08X -> Xbox VA 0x%08X (zeroed)\n",
                     size, low, xbox_va);
@@ -544,7 +569,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     if (align < 4096) align = 4096;
     xbox_va = xbox_HeapAlloc(size, align);
 
-    if (g_kernel_call_count <= 100) {
+    if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
                 size, align, xbox_va);
         fflush(stderr);
@@ -580,7 +605,7 @@ static void bridge_NtAllocateVirtualMemory(void)
     /* Read the base address hint (0 = let kernel choose) */
     uint32_t base_hint = base_ptr ? BRIDGE_MEM32(base_ptr) : 0;
 
-    if (g_kernel_call_count <= 200) {
+    if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: base=0x%08X size=%u type=0x%X prot=0x%X\n",
                 base_hint, size, alloc_type, protect);
         fflush(stderr);
@@ -605,7 +630,7 @@ static void bridge_NtAllocateVirtualMemory(void)
         /* MEM_COMMIT only, on an already-reserved region.
          * The memory is already committed by our bump allocator.
          * Don't change the base address - just return success. */
-        if (g_kernel_call_count <= 200) {
+        if (KERNEL_LOG_ON()) {
             fprintf(stderr, "  [KERNEL] → MEM_COMMIT on existing region 0x%08X, no-op\n", base_hint);
             fflush(stderr);
         }
@@ -677,9 +702,81 @@ static void bridge_HalReturnToFirmware(void)
 {
     uint32_t routine = STACK_ARG(0);
 
+    /* Routine 2 is a quick reboot, which on Xbox is how a title hands off to
+     * another image: XLaunchNewImage fills the launch data page and reboots.
+     * So "the title is exiting" and "the title is launching something" look
+     * identical here, and the launch page is what tells them apart. */
+    {
+        uint32_t page = BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
+
+        if (page) {
+            char path[64];
+            uint32_t i;
+
+            for (i = 0; i < sizeof(path) - 1; i++) {
+                uint8_t c = BRIDGE_MEM8(page + 8 + i);
+                if (!c) break;
+                path[i] = (char)c;
+            }
+            path[i] = 0;
+            fprintf(stderr, "  [KERNEL] launch data page 0x%08X:"
+                            " type=%u titleid=0x%08X path='%s'\n",
+                    page, BRIDGE_MEM32(page), BRIDGE_MEM32(page + 4), path);
+            /* XapiBootToDash packs its reason and two parameters into the
+             * front of the launch data, so this says why the title asked to
+             * leave rather than merely that it did. */
+            fprintf(stderr, "  [KERNEL]   launch data:");
+            for (i = 0; i < 8; i++)
+                fprintf(stderr, " %08X", BRIDGE_MEM32(page + 1024 + i * 4));
+            fprintf(stderr, "\n");
+        } else {
+            fprintf(stderr, "  [KERNEL] no launch data page set\n");
+        }
+    }
+
+    /* Who asked to quit.
+     *
+     * A title exiting looks identical whether it finished cleanly, hit an
+     * error path, or was told to reboot -- and the routine number does not say
+     * which. The guest call chain does. Same GS format tools/stackwalk.py
+     * reads. */
+    {
+        const uint8_t *mem = (const uint8_t *)g_xbox_mem_offset;
+        uint32_t i;
+
+        fprintf(stderr, "  [KERNEL] exit requested, guest esp=0x%08X:\n", g_esp);
+        for (i = 0; i < 200; i++) {
+            uint32_t a = g_esp + i * 4;
+            if (a < 0x00010000u || a >= 0x04000000u) break;
+            fprintf(stderr, "    GS %08X %08X\n", a,
+                    *(const uint32_t *)(mem + a));
+        }
+        fflush(stderr);
+    }
+
     fprintf(stderr, "  [KERNEL] HalReturnToFirmware: routine=%u - title is exiting\n",
             routine);
     fflush(stderr);
+
+    /* Let a host-played FMV finish before the process goes away.
+     *
+     * The title is not the one presenting it, so it has no reason to wait --
+     * it opens the file, carries on, and quits, which would kill the video
+     * thread part-way through a five-second clip. Waiting here is what makes
+     * the clip actually watchable, and it costs nothing when no video is
+     * playing. Bounded, so a stuck player cannot stop the process exiting. */
+    {
+        extern int xbox_VideoIsPlaying(void);
+        int waited = 0;
+
+        while (xbox_VideoIsPlaying() && waited < 60000) {
+            Sleep(50);
+            waited += 50;
+        }
+        if (waited)
+            fprintf(stderr, "  [KERNEL] waited %dms for the video to finish\n",
+                    waited);
+    }
 
     xbox_HalReturnToFirmware(routine);
 }
@@ -689,7 +786,7 @@ static void bridge_ExAllocatePool(void)
     uint32_t size = STACK_ARG(0);
     uint32_t xbox_va = xbox_HeapAlloc(size, 16);
 
-    if (g_kernel_call_count <= 200) {
+    if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] ExAllocatePool: size=%u → Xbox VA 0x%08X\n",
                 size, xbox_va);
         fflush(stderr);
@@ -704,7 +801,7 @@ static void bridge_ExAllocatePoolWithTag(void)
     uint32_t tag = STACK_ARG(1);
     uint32_t xbox_va = xbox_HeapAlloc(size, 16);
 
-    if (g_kernel_call_count <= 200) {
+    if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] ExAllocatePoolWithTag: size=%u tag='%c%c%c%c' → Xbox VA 0x%08X\n",
                 size,
                 (char)(tag & 0xFF), (char)((tag >> 8) & 0xFF),
@@ -1059,6 +1156,24 @@ static void bridge_AvSetDisplayMode(void)
     uint32_t pitch = STACK_ARG(4);
     uint32_t fb = STACK_ARG(5);
 
+    /* The framebuffer the display is meant to scan out, and the format it is
+     * in. This is the only place the address is stated: the title never writes
+     * PCRTC_START itself, so without this there is nothing that says where the
+     * guest believes its picture is. */
+    fprintf(stderr, "  [AV] SetDisplayMode mode=0x%08X format=0x%08X"
+                    " pitch=%u fb=0x%08X\n", mode, format, pitch, fb);
+    fflush(stderr);
+
+    xbox_SetDisplayFramebuffer(fb, pitch);
+    {
+        /* Point the framebuffer window at whatever the title just set, and
+         * start it on the first display mode -- before that there is nothing
+         * to show and no pitch to interpret it with. */
+        extern void xbox_FramebufferWindowSet(uint32_t, uint32_t);
+        extern void xbox_FramebufferWindowStart(void);
+        xbox_FramebufferWindowSet(fb, pitch);
+        xbox_FramebufferWindowStart();
+    }
     xbox_AvSetDisplayMode(XBOX_TO_NATIVE(addr), step, mode, format, pitch, fb);
     g_eax = 0;
 }
@@ -1552,13 +1667,50 @@ static void bridge_NtCreateFile(void)
      * hands them to a real Win32 call, so a bogus one has Windows itself write
      * into Xbox memory. That is how a wild write ends up with a stack inside
      * ntdll and no recompiled frame to blame. */
-    fprintf(stderr, "  [FILE] NtCreateFile handle_va=0x%08X oa=0x%08X ios=0x%08X\n",
-            handle_va, obj_attrs, iostatus);
-    fflush(stderr);
-
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
         file_attrs, share, disposition, options);
+
+    /* An FMV the host can decode itself.
+     *
+     * The title's own decoder is emulated like everything else, but it only
+     * produces pixels once there is something to execute its GPU work -- so on
+     * a bring-up where that does not exist yet, the video the game just asked
+     * for can still be shown. The trigger is the title opening the file, so
+     * this plays when the game decides to play it, not on a timer, and it
+     * plays the file the game chose.
+     *
+     * Off unless RECOMP_FMV_HOST is set: it is a substitute for the title's
+     * own output, and that should be a decision rather than a default. */
+    if (g_eax == 0 && getenv("RECOMP_FMV_HOST")) {
+        /* Declared here rather than included: the player lives in xbox_video,
+         * which links xbox_d3d8, and having the kernel include its header
+         * would make the dependency circular for no gain. Both land in the
+         * same executable. */
+        extern int xbox_VideoPlayFile(const char *host_path);
+        extern int xbox_VideoIsPlaying(void);
+
+        char host[MAX_PATH * 2];
+        size_t n = 0;
+
+        const wchar_t *w = xbox_LastHostPath();
+
+        while (n < sizeof(host) - 1 && w[n]) {
+            host[n] = (char)w[n];
+            n++;
+        }
+        host[n] = 0;
+        if (n > 4 && _stricmp(host + n - 4, ".wmv") == 0
+                && !xbox_VideoIsPlaying())
+            xbox_VideoPlayFile(host);
+    }
+
+    /* Paired with the [PATH] line the translation just printed: that says what
+     * was asked for, this says whether it opened. A failed open is not itself
+     * a bug -- a title probing the cache partition before the disc expects one
+     * -- so the status is what separates a probe from a real miss. */
+    fprintf(stderr, "  [FILE] -> 0x%08X%s\n", g_eax, g_eax ? " FAILED" : "");
+    fflush(stderr);
 }
 
 /* ── NtOpenFile (ordinal 202, 6 args = 24 bytes) ──────── */
@@ -1638,6 +1790,148 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
     }
 }
 
+/* -- XeLoadSection / XeUnloadSection (ordinals 327/328, 1 arg = 4 bytes) --
+ *
+ * NTSTATUS XeLoadSection(PXBE_SECTION_HEADER Section);
+ *
+ * On hardware a section marked non-preload is paged in from disc on demand,
+ * and a title that keeps its video decoder in one -- Wreckless keeps WMVDEC
+ * there -- calls this before touching it. Every section is already resident
+ * here, so the work is the bookkeeping: hand back success and keep the
+ * reference count the title can read.
+ *
+ * Done against guest memory rather than the PXBE_SECTION_HEADER struct: the
+ * on-disc header is nine 32-bit fields and a digest, and the native struct
+ * declares some of them as pointers, so on x64 its layout is not the 56 bytes
+ * actually there.
+ *
+ *   +0x14  section name address      +0x18  section reference count
+ */
+#define XBE_SECTION_REFCOUNT_OFFSET 0x18
+
+static void bridge_XeSection(int load)
+{
+    uint32_t section = STACK_ARG(0);
+    uint32_t count;
+
+    if (!section) {
+        g_eax = 0xC000000Du;              /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    count = BRIDGE_MEM32(section + XBE_SECTION_REFCOUNT_OFFSET);
+    if (load)
+        count++;
+    else if (count)
+        count--;
+    BRIDGE_MEM32(section + XBE_SECTION_REFCOUNT_OFFSET) = count;
+
+    if (KERNEL_LOG_ON())
+        fprintf(stderr, "  [XBE] Xe%sSection(0x%08X) refcount=%u\n",
+                load ? "Load" : "Unload", section, count);
+    g_eax = 0;
+}
+
+static void bridge_XeLoadSection(void)   { bridge_XeSection(1); }
+static void bridge_XeUnloadSection(void) { bridge_XeSection(0); }
+
+/* -- RtlUnwind (ordinal 312, 4 args = 16 bytes) -------------------------
+ *
+ * VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
+ *                PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue);
+ *
+ * Discards the SEH registration frames between the current one and
+ * TargetFrame, letting each handler run its __finally blocks on the way past,
+ * and leaves fs:[0] pointing at TargetFrame. fs:[0] is guest address 0 here,
+ * because the runtime models the TIB at the bottom of guest memory.
+ *
+ * Left unbridged this returned 0 without touching anything, which is not a
+ * harmless stub: MSVC's _global_unwind2 calls it and then carries on as if the
+ * frames were gone, so the chain kept pointing into stack that had already
+ * been reused and the next dispatch walked records built out of live locals.
+ *
+ * The walk is bounded and checked rather than trusting the chain, since it
+ * lives in guest stack memory that a title can corrupt: records must climb
+ * toward the stack top, stay inside the stack, and stay 4-byte aligned. A
+ * chain that breaks any of those is truncated instead of followed.
+ */
+#define XBOX_SEH_END_OF_CHAIN 0xFFFFFFFFu
+#define XBOX_EXCEPTION_UNWINDING  0x02u
+#define XBOX_EXCEPTION_EXIT_UNWIND 0x04u
+#define XBOX_SEH_MAX_FRAMES 64
+
+static void bridge_RtlUnwind(void)
+{
+    uint32_t target_frame = STACK_ARG(0);
+    uint32_t exc_record   = STACK_ARG(2);
+    uint32_t reg          = BRIDGE_MEM32(XBOX_FS_BASE);
+    uint32_t prev_reg     = 0;
+    uint32_t scratch      = 0;
+    int      guard;
+
+    /* An unwind with no record of its own still has to tell the handlers it
+     * is an unwind, so synthesise one below the stack pointer. */
+    if (!exc_record) {
+        g_esp -= 0x50;
+        scratch = g_esp;
+        memset((uint8_t *)XBOX_TO_NATIVE(scratch), 0, 0x50);
+        BRIDGE_MEM32(scratch) = 0xC0000027u;   /* STATUS_UNWIND */
+        exc_record = scratch;
+    }
+    BRIDGE_MEM32(exc_record + 4) |= XBOX_EXCEPTION_UNWINDING
+        | (target_frame ? 0u : XBOX_EXCEPTION_EXIT_UNWIND);
+
+    for (guard = 0; guard < XBOX_SEH_MAX_FRAMES; guard++) {
+        uint32_t next, handler;
+
+        if (reg == XBOX_SEH_END_OF_CHAIN || reg == 0 || reg == target_frame)
+            break;
+        if ((reg & 3u) || reg < XBOX_STACK_BASE || reg >= XBOX_STACK_TOP)
+            break;                       /* not a stack frame: chain is broken */
+        if (prev_reg && reg <= prev_reg)
+            break;                       /* not climbing: cycle or corruption */
+
+        next    = BRIDGE_MEM32(reg);
+        handler = BRIDGE_MEM32(reg + 4);
+
+        /* Pop before dispatching. The handler may raise, and it must not see
+         * its own frame still on the chain. */
+        BRIDGE_MEM32(XBOX_FS_BASE) = next;
+
+        if (handler) {
+            recomp_func_t fn = recomp_lookup(handler);
+            if (!fn) fn = recomp_lookup_manual(handler);
+            if (!fn) fn = recomp_lookup_kernel(handler);
+            if (fn) {
+                /* EXCEPTION_DISPOSITION handler(record, frame, context,
+                 * dispatcher) -- cdecl, so the caller pops. */
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = reg;
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = exc_record;
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* return address */
+                fn();
+                /* 16, not 20: the handler's own `ret` has already taken the
+                 * return address off, leaving just the four arguments for the
+                 * caller to drop. Cleaning 20 leaves esp four bytes high, and
+                 * every argument the unwound-into frame reads after that comes
+                 * from one slot over. */
+                g_esp += 16;
+            }
+        }
+
+        prev_reg = reg;
+        reg      = next;
+    }
+
+    /* Land on the target even if the walk stopped early: leaving fs:[0] on a
+     * discarded frame is worse than losing a __finally. */
+    if (target_frame && target_frame != XBOX_SEH_END_OF_CHAIN)
+        BRIDGE_MEM32(XBOX_FS_BASE) = target_frame;
+
+    if (scratch)
+        g_esp += 0x50;
+}
+
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
@@ -1658,6 +1952,19 @@ static void bridge_NtReadFile(void)
     }
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+
+    /* What a read actually delivered. A decoder that rejects its input cannot
+     * say whether the bytes were wrong or the read was, and the two look
+     * identical from inside the title -- the first bytes settle it. */
+    {
+        const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
+        uint32_t got = (uint32_t)ios.Information;
+        fprintf(stderr, "  [READ] want=%u got=%u st=0x%08X %02X %02X %02X %02X\n",
+                length, got, (uint32_t)ios.Status,
+                got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
+                got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+        fflush(stderr);
+    }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
@@ -1852,14 +2159,82 @@ static void bridge_IoCreateFile(void)
         file_attrs, share, disposition, options);
 }
 
-/* ── NtDeviceIoControlFile (ordinal 196, 10 args = 40 bytes) */
+/* -- NtDeviceIoControlFile (ordinal 196, 10 args = 40 bytes) ----
+ *
+ * NTSTATUS NtDeviceIoControlFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID,
+ *                                PIO_STATUS_BLOCK, ULONG IoControlCode,
+ *                                PVOID In, ULONG InLen,
+ *                                PVOID Out, ULONG OutLen);
+ */
+#define IOCTL_DISK_GET_DRIVE_GEOMETRY 0x00070000u
+#define IOCTL_DISK_GET_PARTITION_INFO 0x00074004u
+
+/* The retail hard disk, in the units DISK_GEOMETRY reports. Deliberately the
+ * same geometry kernel_path.c writes into the partition table it synthesises,
+ * so a title that reads both sees one disk rather than two. */
+#define XBOX_DISK_BYTES_PER_SECTOR   512u
+#define XBOX_DISK_SECTORS_PER_TRACK  63u
+#define XBOX_DISK_TRACKS_PER_CYL     255u
+#define XBOX_DISK_CYLINDERS          1216u    /* ~10 GB, a retail 8 GB drive */
+
 static void bridge_NtDeviceIoControlFile(void)
 {
-    uint32_t ioctl = STACK_ARG(5);
-    uint32_t ios_va = STACK_ARG(4);
-    fprintf(stderr, "  [FILE] NtDeviceIoControlFile(0x%X) - stub\n", ioctl);
+    uint32_t ios_va  = STACK_ARG(4);
+    uint32_t ioctl   = STACK_ARG(5);
+    uint32_t out_va  = STACK_ARG(8);
+    uint32_t out_len = STACK_ARG(9);
+
+    if (ioctl == IOCTL_DISK_GET_DRIVE_GEOMETRY) {
+        /* DISK_GEOMETRY: Cylinders (LARGE_INTEGER), MediaType,
+         * TracksPerCylinder, SectorsPerTrack, BytesPerSector -- 24 bytes. */
+        if (!out_va || out_len < 24) {
+            bridge_write_iostatus(ios_va, 0xC0000023u, 0); /* BUFFER_TOO_SMALL */
+            g_eax = 0xC0000023u;
+            return;
+        }
+        BRIDGE_MEM32(out_va +  0) = XBOX_DISK_CYLINDERS;
+        BRIDGE_MEM32(out_va +  4) = 0;
+        BRIDGE_MEM32(out_va +  8) = 0x0B;      /* FixedMedia */
+        BRIDGE_MEM32(out_va + 12) = XBOX_DISK_TRACKS_PER_CYL;
+        BRIDGE_MEM32(out_va + 16) = XBOX_DISK_SECTORS_PER_TRACK;
+        BRIDGE_MEM32(out_va + 20) = XBOX_DISK_BYTES_PER_SECTOR;
+        bridge_write_iostatus(ios_va, 0, 24);
+        g_eax = 0;
+        return;
+    }
+
+    if (ioctl == IOCTL_DISK_GET_PARTITION_INFO) {
+        /* PARTITION_INFORMATION: StartingOffset and PartitionLength as
+         * LARGE_INTEGERs, then HiddenSectors, PartitionNumber, and three
+         * bytes of type/flags -- 32 bytes. The length is the image's own
+         * size, which kernel_path.c set from the partition table. */
+        HANDLE h = bridge_resolve_handle(STACK_ARG(0));
+        LARGE_INTEGER size;
+
+        if (!out_va || out_len < 32) {
+            bridge_write_iostatus(ios_va, 0xC0000023u, 0);
+            g_eax = 0xC0000023u;
+            return;
+        }
+        size.QuadPart = 0;
+        if (h && h != INVALID_HANDLE_VALUE)
+            GetFileSizeEx(h, &size);
+        BRIDGE_MEM32(out_va +  0) = 0;                       /* StartingOffset */
+        BRIDGE_MEM32(out_va +  4) = 0;
+        BRIDGE_MEM32(out_va +  8) = (uint32_t)size.LowPart;  /* PartitionLength */
+        BRIDGE_MEM32(out_va + 12) = (uint32_t)size.HighPart;
+        BRIDGE_MEM32(out_va + 16) = 0;                       /* HiddenSectors  */
+        BRIDGE_MEM32(out_va + 20) = 1;                       /* PartitionNumber*/
+        BRIDGE_MEM32(out_va + 24) = 0x00010106u;             /* type/boot/recog */
+        BRIDGE_MEM32(out_va + 28) = 0;
+        bridge_write_iostatus(ios_va, 0, 32);
+        g_eax = 0;
+        return;
+    }
+
+    fprintf(stderr, "  [FILE] NtDeviceIoControlFile(0x%X) - unhandled\n", ioctl);
     bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
-    g_eax = 0xC00000BBu; /* STATUS_NOT_IMPLEMENTED */
+    g_eax = 0xC00000BBu; /* STATUS_NOT_SUPPORTED */
 }
 
 /* ── NtFsControlFile (ordinal 200, 10 args = 40 bytes) ──── */
@@ -1881,10 +2256,45 @@ static void bridge_NtCreateDirectoryObject(void)
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 
-/* ── IoCreateSymbolicLink (ordinal 63) ───────────────────── */
+/* IoCreateSymbolicLink (ordinal 67, 2 args)
+ *
+ * Was a bare "return STATUS_SUCCESS": the title was told its link existed and
+ * nothing recorded it. Titles mount their own drive letters this way --
+ * Wreckless links \??\Z: to \Device\Harddisk0\Partition1\ and then loads
+ * every asset through z:\ -- so dropping the link left xbox_translate_path
+ * applying the generic "Z: is the cache partition" rule, and every asset open
+ * failed with ERROR_FILE_NOT_FOUND a whole boot later.
+ *
+ * Both arguments are guest ANSI_STRINGs whose Buffer field holds a guest VA,
+ * so passing the structs straight through would have xbox_copy_ansi read a
+ * 32-bit guest address as a 64-bit host pointer. Rebuild them by hand, the way
+ * bridge_RtlEqualString does.
+ */
 static void bridge_IoCreateSymbolicLink(void)
 {
-    g_eax = 0;  /* STATUS_SUCCESS */
+    uint32_t link_va   = STACK_ARG(0);
+    uint32_t target_va = STACK_ARG(1);
+    XBOX_ANSI_STRING link, target;
+
+    if (!link_va) {
+        g_eax = 0xC000000Du;  /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    link.Length        = BRIDGE_MEM16(link_va + 0);
+    link.MaximumLength = BRIDGE_MEM16(link_va + 2);
+    link.Buffer        = (PCHAR)XBOX_TO_NATIVE(BRIDGE_MEM32(link_va + 4));
+
+    if (target_va) {
+        target.Length        = BRIDGE_MEM16(target_va + 0);
+        target.MaximumLength = BRIDGE_MEM16(target_va + 2);
+        target.Buffer        = (PCHAR)XBOX_TO_NATIVE(BRIDGE_MEM32(target_va + 4));
+    } else {
+        target.Length = target.MaximumLength = 0;
+        target.Buffer = NULL;
+    }
+
+    g_eax = (uint32_t)xbox_IoCreateSymbolicLink(&link,
+                                                target_va ? &target : NULL);
 }
 
 /* ── ObReferenceObjectByHandle (ordinal 246) ─────────────── */
@@ -2014,14 +2424,64 @@ static void bridge_ExFreePool(void)
     g_eax = 0;
 }
 
-/* ── IoCreateDevice (ordinal 65, 6 args) */
+/* ── IoCreateDevice (ordinal 65, 6 args) ────────────────
+ *
+ * NTSTATUS IoCreateDevice(PDRIVER_OBJECT DriverObject,
+ *                         ULONG DeviceExtensionSize,
+ *                         PANSI_STRING DeviceName,
+ *                         DEVICE_TYPE DeviceType,
+ *                         BOOLEAN Exclusive,
+ *                         PDEVICE_OBJECT *DeviceObject);
+ *
+ * Deliberately does NOT call xbox_IoCreateDevice. That one allocates from the
+ * host heap and writes a 64-bit native pointer through this 4-byte guest
+ * out-parameter -- the memory-model mismatch the NOT ROUTED note below
+ * describes. The object has to live in guest memory because the caller
+ * immediately walks it, so allocate it there.
+ *
+ * Leaving the ordinal unbridged was not the safe option it looked like: the
+ * unresolved thunk returns 0, which is STATUS_SUCCESS, so the title proceeds
+ * with a NULL device. Wreckless reads DeviceExtension from it and `rep stosd`s
+ * DeviceExtensionSize bytes through the NULL, erasing the fake TIB at guest
+ * VA 0. The crash surfaced in SetLastError, thousands of calls later.
+ *
+ * Layout is the Xbox DEVICE_OBJECT: Flags at 0x14, DeviceExtension at 0x18,
+ * DeviceType at 0x1C, StackSize at 0x1D, header 0x38 bytes. Only the fields a
+ * title actually reads are filled; the rest is zero, which is what a freshly
+ * created device object holds anyway.
+ */
+#define XBOX_DEVICE_OBJECT_SIZE 0x38u
+
 static void bridge_IoCreateDevice(void)
 {
-    g_eax = (uint32_t)xbox_IoCreateDevice(
-        XBOX_TO_NATIVE(STACK_ARG(0)), STACK_ARG(1),
-        (PXBOX_ANSI_STRING)XBOX_TO_NATIVE(STACK_ARG(2)),
-        STACK_ARG(3), (BOOLEAN)STACK_ARG(4),
-        (PVOID*)XBOX_TO_NATIVE(STACK_ARG(5)));
+    uint32_t extension_size = STACK_ARG(1);
+    uint32_t device_type    = STACK_ARG(3);
+    uint32_t out_va         = STACK_ARG(5);
+    uint32_t object_va;
+
+    if (!out_va) {
+        g_eax = 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+
+    object_va = xbox_HeapAlloc(XBOX_DEVICE_OBJECT_SIZE + extension_size, 16);
+    if (!object_va) {
+        g_eax = 0xC000009Au;   /* STATUS_INSUFFICIENT_RESOURCES */
+        return;
+    }
+
+    memset(XBOX_TO_NATIVE(object_va), 0,
+           XBOX_DEVICE_OBJECT_SIZE + extension_size);
+    BRIDGE_MEM16(object_va + 0x02) = (uint16_t)XBOX_DEVICE_OBJECT_SIZE;
+    BRIDGE_MEM32(object_va + 0x04) = 1;                 /* ReferenceCount   */
+    BRIDGE_MEM32(object_va + 0x08) = STACK_ARG(0);      /* DriverObject     */
+    BRIDGE_MEM32(object_va + 0x18) =                    /* DeviceExtension  */
+        extension_size ? object_va + XBOX_DEVICE_OBJECT_SIZE : 0;
+    BRIDGE_MEM8(object_va + 0x1C)  = (uint8_t)device_type;
+    BRIDGE_MEM8(object_va + 0x1D)  = 1;                 /* StackSize        */
+
+    BRIDGE_MEM32(out_va) = object_va;
+    g_eax = 0;                                          /* STATUS_SUCCESS   */
 }
 
 /* ── KeCancelTimer (ordinal 97, 1 arg) */
@@ -2081,6 +2541,25 @@ static void bridge_NtCreateMutant(void)
                              (BOOLEAN)STACK_ARG(2));
     if (st >= 0 && handle_va) bridge_write_handle(handle_va, h);
     g_eax = (uint32_t)st;
+}
+
+/* -- NtSuspendThread (ordinal 231, 2 args) --------------------------------
+ *
+ * NTSTATUS NtSuspendThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount);
+ *
+ * The implementation was already here and only the dispatch entry was missing,
+ * which is worse than an outright stub: the call returned 0, so a thread that
+ * parked itself believed it had stopped and carried straight on. Wreckless
+ * does that on a worker, and the "suspended" thread spun through 289 million
+ * kernel calls while the title thought it was idle.
+ */
+static void bridge_NtSuspendThread(void)
+{
+    uint32_t count_va = STACK_ARG(1);
+
+    g_eax = (uint32_t)xbox_NtSuspendThread(
+        bridge_resolve_handle(STACK_ARG(0)),
+        count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
 }
 
 /* ── NtResumeThread (ordinal 224, 2 args) */
@@ -2449,6 +2928,9 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 211: return bridge_NtQueryInformationFile;
     case 218: return bridge_NtQueryVolumeInformationFile;
     case 219: return bridge_NtReadFile;
+    case 312: return bridge_RtlUnwind;
+    case 327: return bridge_XeLoadSection;
+    case 328: return bridge_XeUnloadSection;
     case 226: return bridge_NtSetInformationFile;
     case 236: return bridge_NtWriteFile;
 
@@ -2477,6 +2959,15 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
     /* Critical sections */
     case 291: return bridge_RtlInitializeCriticalSection;
+    /* Wreckless asks for the AV pack during D3D device creation; unbridged it
+     * read 0, which is "no pack connected". Writes one ULONG through a guest
+     * pointer it is given and nothing else, and XBOX_TO_NATIVE turns a guest
+     * NULL into a host NULL so xbox_AvSendTVEncoderOption's own !Result guard
+     * still fires. */
+    case   2: return bridge_AvSendTVEncoderOption;
+    /* Reads a LARGE_INTEGER and fills a TIME_FIELDS, both at caller-supplied
+     * guest addresses -- the case the NOT ROUTED note below names as fine. */
+    case 305: return bridge_RtlTimeToTimeFields;
     case 277: return bridge_RtlEnterCriticalSection;
     case 294: return bridge_RtlLeaveCriticalSection;
 
@@ -2523,6 +3014,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
     /* I/O */
     case  66: return bridge_IoCreateFile;
+    case  65: return bridge_IoCreateDevice;
     case  67: return bridge_IoCreateSymbolicLink;
     case 188: return bridge_NtCreateDirectoryObject;
     case 246: return bridge_ObReferenceObjectByHandle;
@@ -2573,9 +3065,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * marshalling, and re-deriving them is the easy half of the work.
      */
     /* case   1: bridge_AvGetSavedDataAddress */
-    /* case   2: bridge_AvSendTVEncoderOption */
     /* case  17: bridge_ExFreePool */
-    /* case  65: bridge_IoCreateDevice */
     /* case  97: bridge_KeCancelTimer */
     /* case 100: bridge_KeDisconnectInterrupt */
     /* case 143: bridge_KeSetBasePriorityThread */
@@ -2595,10 +3085,10 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * unbridged it returned 0 (STATUS_SUCCESS) without resuming anything, so a
      * thread the title had created suspended never started. */
     case 224: return bridge_NtResumeThread;
+    case 231: return bridge_NtSuspendThread;
     /* case 250: bridge_ObfDereferenceObject */
     /* case 252: bridge_PhyGetLinkState */
     /* case 253: bridge_PhyInitialize */
-    /* case 305: bridge_RtlTimeToTimeFields */
     /* case 335: bridge_XcSHAInit */
     /* case 336: bridge_XcSHAUpdate */
     /* case 337: bridge_XcSHAFinal */
@@ -2638,7 +3128,7 @@ static void kernel_thunk_dispatch(void)
 
     g_kernel_call_count++;
 
-    if (g_kernel_call_count <= 200) {
+    if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the
          * caller pushed it before dispatching here. Logging it turns "some
          * function is calling this" into "this call site is", which is the
@@ -2716,7 +3206,7 @@ static void kernel_thunk_dispatch(void)
         }
     }
 
-    if (g_kernel_call_count <= 200) {
+    if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] → returned 0x%08X\n", g_eax);
         fflush(stderr);
     }

@@ -156,8 +156,25 @@ class Disassembler:
 
         # Add seed functions from vtable scanner or other sources
         if self.seed_functions:
+            realigned = 0
             for addr in self.seed_functions:
+                # Decode there first if the sweep stepped over it. A seed is an
+                # explicit claim that a function starts at this address, and it
+                # is usually the only evidence available -- seeds exist for
+                # entry points that nothing in the image references. But
+                # _build_functions needs instructions at the address to build a
+                # body from, and where the sweep came out of phase there are
+                # none, so the seed was dropped silently.
+                #
+                # Same treatment _pass_call_targets already gives a call target
+                # it has to realign, and for the same reason.
+                if addr not in self.engine.instructions:
+                    if self.engine.decode_at(addr):
+                        realigned += 1
                 self.func_detector._add_candidate(addr, 0.95, "seed_vtable_thunk")
+            if realigned:
+                print(f"  Realigned {realigned} seeded address(es) the sweep "
+                      f"stepped over")
             if self.verbose:
                 print(f"  Seeded {len(self.seed_functions)} function addresses")
 

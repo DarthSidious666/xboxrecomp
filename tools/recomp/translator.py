@@ -21,7 +21,8 @@ import struct
 # at startup, so a by-value import would freeze the fallback layout.
 from .config import va_to_file_offset, is_code_address
 from .disasm import Disassembler
-from .lifter import Lifter, lift_basic_block, detect_seh_helpers
+from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+                     detect_setjmp_helpers)
 
 
 def _fixup_icall_esp_save(lines):
@@ -129,6 +130,7 @@ class FunctionTranslator:
 
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
+                 setjmp_fn=None, longjmp_fn=None,
                  trace_functions=None):
         """
         xbe_data: bytes - raw XBE file contents
@@ -147,6 +149,7 @@ class FunctionTranslator:
         self.disasm = Disassembler()
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
+                             setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
                              seh_epilog=seh_epilog)
         self.owned_function_starts = set()
         self.recovered_function_starts = set()
@@ -392,6 +395,42 @@ class FunctionTranslator:
                 for targets in jump_tables.values():
                     cfg_targets.update(targets)
                 return instructions, jump_tables, cfg_targets
+
+    def _stub_ret_bytes(self, addr, max_insns=48):
+        """Bytes the code at `addr` would have popped beyond the return address.
+
+        Returns the immediate of the first `ret N` reachable by walking
+        straight-line from addr, or 0 if the walk finds a plain `ret`, runs into
+        a call or an unconditional jump, or finds nothing at all.
+
+        Conditional branches are walked through rather than followed: the block
+        this is used on is a switch arm whose arms all share one epilogue, so
+        the not-taken path reaches the same ret. A call or a jmp means control
+        genuinely leaves, and guessing past that is how you get a wrong answer
+        that looks right.
+        """
+        offset = va_to_file_offset(addr)
+        if offset is None or not self.xbe_data:
+            return 0
+        window = self.xbe_data[offset:offset + max_insns * 8]
+        if not window:
+            return 0
+        try:
+            decoded = self.disasm._cs.disasm(window, addr)
+        except Exception:
+            return 0
+        for count, insn in enumerate(decoded):
+            if count >= max_insns:
+                break
+            mnemonic = insn.mnemonic.lower()
+            if mnemonic in ("call", "jmp"):
+                return 0
+            if mnemonic in ("ret", "retn"):
+                try:
+                    return int(insn.op_str, 0) if insn.op_str else 0
+                except ValueError:
+                    return 0
+        return 0
 
     def _read_local_jump_table(self, table_va, lower, upper,
                                max_entries=256):
@@ -667,7 +706,11 @@ class FunctionTranslator:
         # zero- and sign-extended to the compare's own width, so the branch
         # tests what the compare actually saw. Declared whenever a cmp/test
         # exists - the consuming jcc can be in a later basic block, or absent.
-        if any(insn.mnemonic in ("cmp", "test") for insn in instructions):
+        # bsf/bsr publish ZF through the same pair (the source, against 0), so
+        # a function whose only flag-setter is a bit scan still needs them --
+        # sub_000EEA10 in Wreckless is exactly `bsf eax, ecx; ret`.
+        if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr")
+               for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
             lines.append("    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;")
@@ -688,18 +731,17 @@ class FunctionTranslator:
         self.lifter.needs_cf = has_carry
         self.lifter.publishes_ebp = self._func_has_prologue(instructions)
 
-        # SSE/MMX register declarations
-        if used_xmm:
-            xmm_regs = sorted([r for r in used_xmm if r.startswith("xmm")])
-            mmx_regs = sorted([r for r in used_xmm if r.startswith("mm")
-                               and not r.startswith("xmm")])
-            # XMM is architectural state and is declared globally by the
-            # runtime, exactly like the GPRs and the x87 stack. Declaring it
-            # here would shadow that global with a fresh zeroed local, so a
-            # value produced in one block and read in the next - a return
-            # value in xmm0, or a spill straddling a branch - would be lost.
-            if mmx_regs:
-                lines.append(f"    uint64_t {', '.join(mmx_regs)};")
+        # SSE and MMX are architectural state, declared globally by the
+        # runtime exactly like the GPRs and the x87 stack. Declaring either
+        # here would shadow the global with a fresh zeroed local, so a value
+        # produced in one block and read in the next -- a return value in
+        # xmm0, an mm register carried across a branch -- would be lost.
+        #
+        # MMX used to get `uint64_t mm0, mm1, ...` here, from before the
+        # instructions were implemented and the registers were only ever
+        # written. With mm0..mm7 now real globals, that declaration expands
+        # through the `#define mm0 g_mm0` alias into a local named g_mm0 that
+        # shadows the register it is meant to be.
 
         # The x87 stack is architectural state and survives guest calls. Some
         # detector boundaries also split one original CRT helper into several
@@ -948,11 +990,15 @@ class BatchTranslator:
         self.seh_prolog = seh_prolog
         self.seh_epilog = seh_epilog
 
+        setjmp_fn, longjmp_fn = detect_setjmp_helpers(
+            self.func_db, self.xbe_data, verbose=True)
+
         # Create translator
         self.translator = FunctionTranslator(
             self.xbe_data, self.func_db, self.label_db,
             self.classification_db, self.abi_db,
             seh_prolog=seh_prolog, seh_epilog=seh_epilog,
+            setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
             trace_functions=trace_functions)
         self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
@@ -1179,6 +1225,14 @@ class BatchTranslator:
         }
         stats["unresolved_stubs"] = len(unresolved)
         stats["manual_functions"] = len(manual_decls)
+        # Instructions the lifter has no translation for become a comment, and
+        # a comment is a silent no-op. Surfacing the tally is the difference
+        # between "bsf is unimplemented" being a line of build output and being
+        # a week of heap debugging.
+        stats["unimplemented"] = {
+            m: list(addrs)
+            for m, addrs in self.translator.lifter.unimplemented.items()
+        }
 
         # Generate header with all forward declarations
         header_path = os.path.join(output_dir, header_name)
@@ -1287,12 +1341,18 @@ class BatchTranslator:
             stub_lines.append(
                 " * registers or a garbage local. Args are not popped: the callee's")
             stub_lines.append(
-                " * stdcall byte count is unknown, and cdecl is the safer guess. */")
+                " * stdcall byte count is read from the target's own bytes where")
+            stub_lines.append(
+                " * they end in a `ret N` -- guessing cdecl there silently walks")
+            stub_lines.append(
+                " * esp off by N on every call. */")
             stub_lines.append("")
             for addr in sorted(unresolved):
+                popped = self.translator._stub_ret_bytes(addr)
+                note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += 4; "
-                    f"/* 0x{addr:08X}: not detected */ }}"
+                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
 

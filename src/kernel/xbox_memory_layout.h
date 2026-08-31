@@ -84,6 +84,48 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
 /**
  * Release the reserved Xbox memory layout.
  */
+/**
+ * Mirror a GPU completion fence the title spins on.
+ *
+ * The NV2A tables in xbox_memory_layout.c acknowledge handshakes that live at
+ * fixed aperture offsets. Some titles instead wait on a semaphore the GPU
+ * writes into contiguous memory: D3D seeds it, submits work, then spins until
+ * it reaches the submitted count. Wreckless does this at guest 0x000FE920,
+ * waiting on the 96-byte MmAllocateContiguousMemoryEx block its device struct
+ * points at.
+ *
+ * Nothing executes the push buffer -- the D3D11 layer draws -- so everything
+ * submitted is complete, and advancing the fence is the same honest
+ * acknowledgement the register tables make.
+ *
+ * The fence has no fixed address; it is reached through the title's device
+ * struct, so it is registered as the chain of indirections to follow:
+ *
+ *     device = MEM32(device_ptr_va)
+ *     fence  = MEM32(device + get_ptr_off)
+ *     MEM32(fence) = MEM32(device + put_off)
+ *
+ * Every step is bounds-checked each poll, so registering a chain that is not
+ * yet initialised (or never becomes valid) is harmless.
+ *
+ * Returns 0 on success, -1 if the table is full.
+ */
+/* Advance a frame/swap counter inside the D3D device at ~60 Hz.
+ *
+ * A title that waits a frame reads the device's swap count and spins until it
+ * moves. Nothing here presents, so without this the count never changes and
+ * the wait never ends. Followed through the device pointer, like the fence,
+ * because the device is allocated at runtime.
+ *
+ * Returns 0 on success, -1 if the table is full. */
+int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
+
+/* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
+void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
+
+int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
+                         uint32_t put_off, uint32_t get_ptr_off);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**
@@ -104,6 +146,11 @@ void *xbox_GetMemoryBase(void);
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
 void xbox_ProtectMirrorsForDebug(void);
+
+/* Dump the guest call stack and abort if the title has not exited within
+ * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;
+ * does nothing unless that variable is set. */
+void xbox_WatchdogStart(void);
 
 /* ================================================================
  * Xbox stack for recompiled code
@@ -172,6 +219,19 @@ void xbox_ProtectMirrorsForDebug(void);
  * including both, so the guard keeps that from being a redefinition. Keep the
  * two identical: the generated code and the runtime have to agree on the
  * layout, and nothing else checks. */
+#ifndef RECOMP_MMX_DEFINED
+#define RECOMP_MMX_DEFINED
+typedef union RecompMmx {
+    int8_t   b[8];
+    uint8_t  ub[8];
+    int16_t  w[4];
+    uint16_t uw[4];
+    int32_t  d[2];
+    uint32_t ud[2];
+    uint64_t q;
+} RecompMmx;
+#endif
+
 #ifndef RECOMP_XMM_DEFINED
 #define RECOMP_XMM_DEFINED
 typedef union RecompXmm {
@@ -186,6 +246,19 @@ typedef union RecompXmm {
 #define XBOX_STACK_SIZE     (8 * 1024 * 1024)
 
 /** Base VA of the stack area (above last XBE section). */
+/* Where the fake TIB lives -- the linear address fs: is based at.
+ *
+ * Deliberately not 0. The TIB used to sit on page zero, because the lifter
+ * dropped the fs prefix and fs:[N] became linear [N]. That made a null
+ * dereference read or write the TIB instead of faulting: a null check of the
+ * form `cmp byte [ecx], 0` saw the exception-chain head's 0xFF and passed, and
+ * a store through a null pointer quietly overwrote that head. Both then
+ * surfaced somewhere else entirely. With the TIB up here, page zero is left
+ * unmapped and either mistake faults where it happens.
+ *
+ * Sits below every XBE's image base (0x00010000), so it displaces nothing. */
+#define XBOX_FS_BASE        0x00001000
+
 #define XBOX_STACK_BASE     0x00780000
 
 /** Initial ESP value (top of stack, 16-byte aligned). */
@@ -241,6 +314,12 @@ typedef union RecompXmm {
 
 /** Number of 64 MB mirror views to pre-map (covers 1.75 GB of address space). */
 #define XBOX_NUM_MIRRORS    28
+
+/* Tiled / write-combined aperture. The NV2A shows physical RAM again here, and
+ * titles render through it: physical page P is at XBOX_TILED_BASE + P. Aliases
+ * the RAM mapping rather than getting its own storage, because a title writes a
+ * surface through the tiled address and reads it back through the normal one. */
+#define XBOX_TILED_BASE     0xF0000000u
 
 /**
  * Allocate from the Xbox heap. Returns an Xbox VA, or 0 on failure.

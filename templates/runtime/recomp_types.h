@@ -66,6 +66,15 @@
 #define __forceinline inline __attribute__((always_inline))
 #endif
 
+/* Guest debug output: INT 2D, the Xbox kernel debug trap.
+ *
+ * eax selects the service, ecx carries its argument. Service 1 prints the
+ * ANSI_STRING ecx points at -- what OutputDebugStringA compiles to. The int3
+ * that always follows is the slide byte the kernel steps over, so the lifter
+ * emits nothing for it; lifting it to __debugbreak() terminated the process
+ * with STATUS_BREAKPOINT the first time a title tried to print. */
+void recomp_debug_service(uint32_t service, uint32_t arg_va);
+
 /* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent.
  * The auto-generated code emits __debugbreak for x86 INT 3 instructions. */
 #if !defined(_MSC_VER) && !defined(__debugbreak)
@@ -139,7 +148,32 @@ extern RECOMP_TLS int g_fp_top;
  * The prolog writes g_seh_ebp, and the caller reads it after the call.
  * Similarly, __SEH_epilog reads g_seh_ebp at entry and writes it at exit.
  */
+/* Linear base of the fs segment: where the fake TIB lives. Generated code
+ * adds this to every fs-relative address, so page zero stays unmapped and a
+ * null dereference faults instead of hitting the TIB. Must match
+ * XBOX_FS_BASE in src/kernel/xbox_memory_layout.h. */
+#define XBOX_FS_BASE 0x00001000u
+
 extern RECOMP_TLS uint32_t g_seh_ebp;
+
+/* ---- non-local jumps (setjmp / longjmp) --------------------------------
+ *
+ * A recompiled function is a real C function, so restoring the guest esp is
+ * only half of a longjmp: the abandoned frames are still on the native stack,
+ * and control returns into them once the resume point finishes. Pairing each
+ * guest jmp_buf with a native one -- taken at the setjmp call site, the only
+ * place a native setjmp is valid -- makes the guest jump a native jump, so the
+ * frames actually unwind.
+ *
+ * recomp_setjmp_slot() returns the native buffer for a guest jmp_buf address,
+ * allocating one on first use. recomp_guest_longjmp() restores the guest
+ * registers the CRT's longjmp would and jumps; it returns 0, without jumping,
+ * for a buffer that has no native counterpart, leaving the caller to fall back
+ * to the guest's own longjmp.
+ */
+#include <setjmp.h>
+jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
+int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
 extern RECOMP_TLS uint32_t g_ebp;
 
 /* x87 control and status. Thread-local for the same reason the x87 stack
@@ -710,6 +744,246 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 #define ebx g_ebx
 #define esi g_esi
 #define edi g_edi
+
+/* ================================================================
+ * MMX register file
+ *
+ * The Xbox is a Pentium III and every XDK codec leans on MMX: the WMV
+ * decoder's IDCT and motion compensation are almost nothing else. Modelled the
+ * same way as RecompXmm -- a union of lane views over one 64-bit register --
+ * because that is what the instructions are: the same bits read as bytes,
+ * words or dwords.
+ *
+ * mm0..mm7 alias the x87 stack on real hardware. Nothing here does, and
+ * nothing needs to: a title that interleaves the two calls emms between, and
+ * emms is a no-op for us. Modelling the aliasing would mean giving up the
+ * separate x87 model that the FPU work depends on, to reproduce a hazard the
+ * hardware exists to let software avoid.
+ * ================================================================ */
+
+#ifndef RECOMP_MMX_DEFINED
+#define RECOMP_MMX_DEFINED
+typedef union RecompMmx {
+    int8_t   b[8];
+    uint8_t  ub[8];
+    int16_t  w[4];
+    uint16_t uw[4];
+    int32_t  d[2];
+    uint32_t ud[2];
+    uint64_t q;
+} RecompMmx;
+#endif
+
+extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
+extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
+
+static inline RecompMmx MMX_ZERO(void) { RecompMmx r; r.q = 0; return r; }
+
+/* cvtps2pi / cvttps2pi: the low two packed singles of an SSE register or of a
+ * 64-bit memory operand become two signed dwords in an MMX register. The
+ * rounding form follows the current rounding mode, round-to-nearest everywhere
+ * these titles use it; the truncating form is what a C cast already does.
+ *
+ * An input that is NaN or outside int32 gives the "integer indefinite" value
+ * on hardware, where the C cast is undefined -- and a video decoder pushing
+ * coefficients through this reaches that edge often enough to matter. */
+static inline int32_t MMX_CVT_F2I(float v, int truncate)
+{
+    if (!(v >= -2147483648.0f && v <= 2147483647.0f))
+        return (int32_t)0x80000000u;       /* integer indefinite */
+    if (truncate)
+        return (int32_t)v;
+    return (int32_t)(v < 0.0f ? v - 0.5f : v + 0.5f);
+}
+
+static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
+{
+    RecompMmx r;
+    r.d[0] = MMX_CVT_F2I(lo, truncate);
+    r.d[1] = MMX_CVT_F2I(hi, truncate);
+    return r;
+}
+
+static inline RecompMmx MMX_MEM(uint32_t addr) {
+    RecompMmx r;
+    memcpy(&r, (const void *)XBOX_PTR(addr), 8);
+    return r;
+}
+
+static inline void MMX_STORE(uint32_t addr, RecompMmx v) {
+    memcpy((void *)XBOX_PTR(addr), &v, 8);
+}
+
+static inline RecompMmx MMX_FROM32(uint32_t v) {
+    RecompMmx r; r.q = 0; r.ud[0] = v; return r;
+}
+
+/* -- saturation helpers ---------------------------------------- */
+static inline int16_t recomp_sat_i16(int32_t v) {
+    return (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+}
+static inline int8_t recomp_sat_i8(int32_t v) {
+    return (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
+}
+static inline uint8_t recomp_sat_u8(int32_t v) {
+    return (uint8_t)(v > 255 ? 255 : (v < 0 ? 0 : v));
+}
+
+/* -- integer arithmetic, lane-wise, wrapping -------------------- */
+#define RECOMP_MMX_BINOP(NAME, LANES, FIELD, EXPR)                      \
+    static inline RecompMmx NAME(RecompMmx a, RecompMmx b) {            \
+        RecompMmx r; int i;                                             \
+        for (i = 0; i < (LANES); i++) { (void)b; r.FIELD[i] = (EXPR); } \
+        return r;                                                       \
+    }
+
+RECOMP_MMX_BINOP(MMX_PADDB, 8, b, (int8_t)((uint8_t)a.b[i] + (uint8_t)b.b[i]))
+RECOMP_MMX_BINOP(MMX_PADDW, 4, w, (int16_t)((uint16_t)a.w[i] + (uint16_t)b.w[i]))
+RECOMP_MMX_BINOP(MMX_PADDD, 2, d, (int32_t)((uint32_t)a.d[i] + (uint32_t)b.d[i]))
+RECOMP_MMX_BINOP(MMX_PSUBB, 8, b, (int8_t)((uint8_t)a.b[i] - (uint8_t)b.b[i]))
+RECOMP_MMX_BINOP(MMX_PSUBW, 4, w, (int16_t)((uint16_t)a.w[i] - (uint16_t)b.w[i]))
+RECOMP_MMX_BINOP(MMX_PSUBD, 2, d, (int32_t)((uint32_t)a.d[i] - (uint32_t)b.d[i]))
+RECOMP_MMX_BINOP(MMX_PADDSB, 8, b, recomp_sat_i8((int32_t)a.b[i] + b.b[i]))
+RECOMP_MMX_BINOP(MMX_PADDSW, 4, w, recomp_sat_i16((int32_t)a.w[i] + b.w[i]))
+RECOMP_MMX_BINOP(MMX_PSUBSB, 8, b, recomp_sat_i8((int32_t)a.b[i] - b.b[i]))
+RECOMP_MMX_BINOP(MMX_PSUBSW, 4, w, recomp_sat_i16((int32_t)a.w[i] - b.w[i]))
+RECOMP_MMX_BINOP(MMX_PADDUSB, 8, ub,
+                 recomp_sat_u8((int32_t)a.ub[i] + b.ub[i]))
+RECOMP_MMX_BINOP(MMX_PSUBUSB, 8, ub,
+                 recomp_sat_u8((int32_t)a.ub[i] - b.ub[i]))
+RECOMP_MMX_BINOP(MMX_PMULLW, 4, w, (int16_t)((int32_t)a.w[i] * b.w[i]))
+RECOMP_MMX_BINOP(MMX_PMULHW, 4, w, (int16_t)(((int32_t)a.w[i] * b.w[i]) >> 16))
+RECOMP_MMX_BINOP(MMX_PAVGB, 8, ub, (uint8_t)(((int32_t)a.ub[i] + b.ub[i] + 1) >> 1))
+RECOMP_MMX_BINOP(MMX_PAVGW, 4, uw, (uint16_t)(((int32_t)a.uw[i] + b.uw[i] + 1) >> 1))
+RECOMP_MMX_BINOP(MMX_PMINSW, 4, w, (a.w[i] < b.w[i] ? a.w[i] : b.w[i]))
+RECOMP_MMX_BINOP(MMX_PMAXSW, 4, w, (a.w[i] > b.w[i] ? a.w[i] : b.w[i]))
+RECOMP_MMX_BINOP(MMX_PCMPEQB, 8, b, (int8_t)(a.b[i] == b.b[i] ? -1 : 0))
+RECOMP_MMX_BINOP(MMX_PCMPEQW, 4, w, (int16_t)(a.w[i] == b.w[i] ? -1 : 0))
+RECOMP_MMX_BINOP(MMX_PCMPEQD, 2, d, (int32_t)(a.d[i] == b.d[i] ? -1 : 0))
+RECOMP_MMX_BINOP(MMX_PCMPGTB, 8, b, (int8_t)(a.b[i] > b.b[i] ? -1 : 0))
+RECOMP_MMX_BINOP(MMX_PCMPGTW, 4, w, (int16_t)(a.w[i] > b.w[i] ? -1 : 0))
+RECOMP_MMX_BINOP(MMX_PCMPGTD, 2, d, (int32_t)(a.d[i] > b.d[i] ? -1 : 0))
+
+/* pmaddwd: multiply signed words, add adjacent pairs into dwords. */
+static inline RecompMmx MMX_PMADDWD(RecompMmx a, RecompMmx b) {
+    RecompMmx r;
+    r.d[0] = (int32_t)a.w[0] * b.w[0] + (int32_t)a.w[1] * b.w[1];
+    r.d[1] = (int32_t)a.w[2] * b.w[2] + (int32_t)a.w[3] * b.w[3];
+    return r;
+}
+
+/* -- bitwise ---------------------------------------------------- */
+static inline RecompMmx MMX_PAND(RecompMmx a, RecompMmx b)  { RecompMmx r; r.q = a.q & b.q; return r; }
+static inline RecompMmx MMX_PANDN(RecompMmx a, RecompMmx b) { RecompMmx r; r.q = ~a.q & b.q; return r; }
+static inline RecompMmx MMX_POR(RecompMmx a, RecompMmx b)   { RecompMmx r; r.q = a.q | b.q; return r; }
+static inline RecompMmx MMX_PXOR(RecompMmx a, RecompMmx b)  { RecompMmx r; r.q = a.q ^ b.q; return r; }
+
+/* -- shifts -----------------------------------------------------
+ * A count at or past the lane width gives zero for the logical shifts and a
+ * full sign fill for the arithmetic ones. The count is the whole 64-bit
+ * register, not one lane, and it is unsigned -- a negative-looking count is a
+ * huge one, which saturates the same way.
+ */
+#define RECOMP_MMX_SHIFT(NAME, LANES, FIELD, WIDTH, OP)                 \
+    static inline RecompMmx NAME(RecompMmx a, uint64_t cnt) {           \
+        RecompMmx r; int i;                                             \
+        for (i = 0; i < (LANES); i++)                                   \
+            r.FIELD[i] = (cnt >= (WIDTH)) ? 0 : (OP);                   \
+        return r;                                                       \
+    }
+RECOMP_MMX_SHIFT(MMX_PSLLW, 4, uw, 16, (uint16_t)(a.uw[i] << cnt))
+RECOMP_MMX_SHIFT(MMX_PSRLW, 4, uw, 16, (uint16_t)(a.uw[i] >> cnt))
+RECOMP_MMX_SHIFT(MMX_PSLLD, 2, ud, 32, (uint32_t)(a.ud[i] << cnt))
+RECOMP_MMX_SHIFT(MMX_PSRLD, 2, ud, 32, (uint32_t)(a.ud[i] >> cnt))
+
+static inline RecompMmx MMX_PSLLQ(RecompMmx a, uint64_t cnt) {
+    RecompMmx r; r.q = (cnt >= 64) ? 0 : (a.q << cnt); return r;
+}
+static inline RecompMmx MMX_PSRLQ(RecompMmx a, uint64_t cnt) {
+    RecompMmx r; r.q = (cnt >= 64) ? 0 : (a.q >> cnt); return r;
+}
+static inline RecompMmx MMX_PSRAW(RecompMmx a, uint64_t cnt) {
+    RecompMmx r; int i; uint64_t c = (cnt >= 16) ? 15 : cnt;
+    for (i = 0; i < 4; i++) r.w[i] = (int16_t)(a.w[i] >> c);
+    return r;
+}
+static inline RecompMmx MMX_PSRAD(RecompMmx a, uint64_t cnt) {
+    RecompMmx r; int i; uint64_t c = (cnt >= 32) ? 31 : cnt;
+    for (i = 0; i < 2; i++) r.d[i] = (int32_t)(a.d[i] >> c);
+    return r;
+}
+
+/* -- unpack / pack ---------------------------------------------- */
+static inline RecompMmx MMX_PUNPCKLBW(RecompMmx a, RecompMmx b) {
+    RecompMmx r; int i;
+    for (i = 0; i < 4; i++) { r.ub[i*2] = a.ub[i]; r.ub[i*2+1] = b.ub[i]; }
+    return r;
+}
+static inline RecompMmx MMX_PUNPCKHBW(RecompMmx a, RecompMmx b) {
+    RecompMmx r; int i;
+    for (i = 0; i < 4; i++) { r.ub[i*2] = a.ub[i+4]; r.ub[i*2+1] = b.ub[i+4]; }
+    return r;
+}
+static inline RecompMmx MMX_PUNPCKLWD(RecompMmx a, RecompMmx b) {
+    RecompMmx r; int i;
+    for (i = 0; i < 2; i++) { r.uw[i*2] = a.uw[i]; r.uw[i*2+1] = b.uw[i]; }
+    return r;
+}
+static inline RecompMmx MMX_PUNPCKHWD(RecompMmx a, RecompMmx b) {
+    RecompMmx r; int i;
+    for (i = 0; i < 2; i++) { r.uw[i*2] = a.uw[i+2]; r.uw[i*2+1] = b.uw[i+2]; }
+    return r;
+}
+static inline RecompMmx MMX_PUNPCKLDQ(RecompMmx a, RecompMmx b) {
+    RecompMmx r; r.ud[0] = a.ud[0]; r.ud[1] = b.ud[0]; return r;
+}
+static inline RecompMmx MMX_PUNPCKHDQ(RecompMmx a, RecompMmx b) {
+    RecompMmx r; r.ud[0] = a.ud[1]; r.ud[1] = b.ud[1]; return r;
+}
+static inline RecompMmx MMX_PACKSSWB(RecompMmx a, RecompMmx b) {
+    RecompMmx r; int i;
+    for (i = 0; i < 4; i++) r.b[i]     = recomp_sat_i8(a.w[i]);
+    for (i = 0; i < 4; i++) r.b[i + 4] = recomp_sat_i8(b.w[i]);
+    return r;
+}
+static inline RecompMmx MMX_PACKUSWB(RecompMmx a, RecompMmx b) {
+    RecompMmx r; int i;
+    for (i = 0; i < 4; i++) r.ub[i]     = recomp_sat_u8(a.w[i]);
+    for (i = 0; i < 4; i++) r.ub[i + 4] = recomp_sat_u8(b.w[i]);
+    return r;
+}
+static inline RecompMmx MMX_PACKSSDW(RecompMmx a, RecompMmx b) {
+    RecompMmx r; int i;
+    for (i = 0; i < 2; i++) r.w[i]     = recomp_sat_i16(a.d[i]);
+    for (i = 0; i < 2; i++) r.w[i + 2] = recomp_sat_i16(b.d[i]);
+    return r;
+}
+
+/* -- word insert / extract / shuffle ----------------------------- */
+static inline RecompMmx MMX_PSHUFW(RecompMmx a, uint32_t imm) {
+    RecompMmx r; int i;
+    for (i = 0; i < 4; i++) r.uw[i] = a.uw[(imm >> (i * 2)) & 3];
+    return r;
+}
+static inline RecompMmx MMX_PINSRW(RecompMmx a, uint32_t v, uint32_t imm) {
+    RecompMmx r = a; r.uw[imm & 3] = (uint16_t)v; return r;
+}
+static inline uint32_t MMX_PEXTRW(RecompMmx a, uint32_t imm) {
+    return (uint32_t)a.uw[imm & 3];
+}
+static inline uint32_t MMX_PMOVMSKB(RecompMmx a) {
+    uint32_t m = 0; int i;
+    for (i = 0; i < 8; i++) if (a.ub[i] & 0x80) m |= (1u << i);
+    return m;
+}
+static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
+    RecompMmx r; int i; uint32_t s = 0;
+    for (i = 0; i < 8; i++)
+        s += (uint32_t)(a.ub[i] > b.ub[i] ? a.ub[i] - b.ub[i] : b.ub[i] - a.ub[i]);
+    r.q = 0; r.uw[0] = (uint16_t)s;
+    return r;
+}
+
 #define xmm0 g_xmm0
 #define xmm1 g_xmm1
 #define xmm2 g_xmm2
@@ -718,6 +992,14 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 #define xmm5 g_xmm5
 #define xmm6 g_xmm6
 #define xmm7 g_xmm7
+#define mm0 g_mm0
+#define mm1 g_mm1
+#define mm2 g_mm2
+#define mm3 g_mm3
+#define mm4 g_mm4
+#define mm5 g_mm5
+#define mm6 g_mm6
+#define mm7 g_mm7
 /* ebp is NOT global - it's local in each function.
  * For __SEH_prolog/epilog, use g_seh_ebp to bridge. */
 #endif

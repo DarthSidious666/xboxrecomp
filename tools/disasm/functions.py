@@ -112,6 +112,9 @@ class FunctionDetector:
         # Pass 4: Call targets
         self._pass_call_targets(sections)
 
+        # Pass 4b: Function addresses installed into indirect-call slots
+        self._pass_indirect_call_slots()
+
         # Pass 5: Build functions from candidates
         self._build_functions(sections)
 
@@ -136,12 +139,52 @@ class FunctionDetector:
             self.functions.clear()
             self._build_functions(sections)
 
+        # Seeds that landed inside a function rather than on its start.
+        self._pass_seed_aliases()
+
         self._build_alias_entries()
 
         # Populate call graph
         self._build_call_graph()
 
         return len(self.functions)
+
+    def _pass_seed_aliases(self) -> None:
+        """
+        Turn seeded addresses that fell inside a function into alias entries.
+
+        A seed is usually a function start the detector could not reach, but an
+        indirect-branch target need not be one: Wreckless's D3DX calls
+        0x0010E9C3 and 0x0010EA2D, each in the middle of a function, as
+        alternate entry points that share the tail.
+
+        Splitting the enclosing function is not an option -- that truncates the
+        code the call wanted to reach. Neither is dropping it, which leaves the
+        ICALL unresolved and its stub returning without the epilogue, walking
+        esp off by the callee's argument bytes. An alias body, exactly as the
+        tail-jump pass builds for the same shape, is callable and keeps the
+        original intact.
+
+        Runs after the bodies exist, since "inside a function" is not knowable
+        before that.
+        """
+        seeded = sorted(addr for addr, (_conf, method) in self._candidates.items()
+                        if method == "seed_vtable_thunk")
+        if not seeded:
+            return
+        bodies = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bodies]
+        for addr in seeded:
+            if addr in self.functions:
+                continue
+            i = bisect.bisect_right(starts, addr) - 1
+            if i < 0:
+                continue
+            body_start, body_end = bodies[i]
+            if not (body_start < addr < body_end):
+                continue
+            if addr not in self._alias_entries:
+                self._alias_entries[addr] = body_end
 
     def _add_candidate(self, addr: int, confidence: float, method: str) -> None:
         """Add a function start candidate, keeping highest confidence."""
@@ -271,12 +314,20 @@ class FunctionDetector:
             # becoming `g_esp += 4` no-op stubs.
             if target not in self.engine.instructions:
                 # Manufacturing an instruction here is creating evidence, not
-                # reading it, so require corroboration. A call operand decoded
-                # out of data produces a plausible-looking in-section address
-                # that is almost never aligned; a real MSVC function start
-                # almost always is. Targets that already decoded are untouched,
-                # whatever their alignment -- that is pre-existing behaviour.
-                if target % config.CALL_TARGET_REALIGN_ALIGNMENT:
+                # reading it, so require corroboration: the bytes there have to
+                # decode as a function body, reaching a ret or a tail jump
+                # without hitting something undecodable. A call operand read
+                # out of data usually does not.
+                #
+                # Alignment used to be the corroboration. It is a weaker test
+                # in both directions, and it silently dropped Wreckless's
+                # _mtinitlocks at 0x000F211A -- a CRT function packed right
+                # after a jump table at no alignment at all. Stubbed out, it
+                # left the lock table all zeroes, and _lock(_LOCKTAB_LOCK)
+                # recursed into _mtinitlocknum until the stack overflowed.
+                # Targets that already decoded are untouched -- pre-existing
+                # behaviour.
+                if not self.engine.probes_as_function_body(target):
                     unaligned += 1
                     continue
                 if self.engine.decode_at(target):
@@ -290,14 +341,70 @@ class FunctionDetector:
             )
         if realigned or unaligned:
             print(f"  Realigned {realigned} call targets the sweep stepped over"
-                  f" ({unaligned} rejected as unaligned)")
+                  f" ({unaligned} rejected: bytes do not decode as a function)")
+
+    def _pass_indirect_call_slots(self) -> None:
+        """
+        Pass 4b: An immediate written into a memory slot that is elsewhere the
+        operand of an indirect call is a function address.
+
+        A function whose address is only ever taken -- never the operand of a
+        direct call, never the target of a jump -- is invisible to every other
+        pass. It gets no dispatch entry, and every indirect call to it lands on
+        a target the recompiler cannot resolve.
+
+        Only immediates stored into a slot something actually calls through
+        count. That is the whole of the evidence: the value is provably used as
+        a call target. Promoting every in-image immediate would drag in string
+        and table addresses, and a spurious start inside a real function
+        truncates it, which is worse than missing one.
+
+        Wreckless: `mov dword ptr [0x1D1938], 0xF643B` installs the
+        InitializeCriticalSectionAndSpinCount fallback thunk, which
+        `call dword ptr [0x1D1938]` six instructions later invokes. Unresolved,
+        the call returned 0, _mtinitlocks read that as failure and bailed after
+        lock 0, and _lock(_LOCKTAB_LOCK) then recursed through _mtinitlocknum
+        until the stack overflowed.
+        """
+        slots = set(self.engine.get_indirect_call_refs())
+        if not slots:
+            return
+        found = 0
+        for insn in list(self.engine.instructions.values()):
+            if insn.memory_ref not in slots or insn.imm_ref is None:
+                continue
+            target = insn.imm_ref
+            section = self.image.get_section_at_va(target)
+            if not (section and section.executable):
+                continue
+            if target not in self.engine.instructions:
+                if not self.engine.probes_as_function_body(target):
+                    continue
+                if not self.engine.decode_at(target):
+                    continue
+            self._add_candidate(
+                target,
+                config.CONFIDENCE_CALL_TARGET,
+                "indirect_call_slot"
+            )
+            found += 1
+        if found:
+            print(f"  {found} function address(es) installed into"
+                  f" indirect-call slots")
 
     def _pass_tail_jump_targets(self, sections: List[SectionInfo]) -> bool:
         """
         Pass 6: Add the target of every unconditional jmp that leaves the body
         of the function containing it.
 
-        Returns True if any new candidate was added.
+        Deliberately NOT conditional branches. A jcc is not a terminator, so a
+        jcc target past the end of its own function almost always means the
+        body was measured short, not that a function starts there -- and
+        registering it splits the function instead of extending it. Tried on
+        Halo 2276: +15 functions, but two of them landed inside an existing
+        body and a third function lost 0xA0 bytes off its end.
+
+                Returns True if any new candidate was added.
         """
         bodies = sorted((f.start, f.end) for f in self.functions.values())
         starts = [b[0] for b in bodies]

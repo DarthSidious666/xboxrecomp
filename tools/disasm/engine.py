@@ -268,6 +268,61 @@ class DisasmEngine:
             self._sorted_addrs = None
         return added
 
+    def probes_as_function_body(self, addr: int,
+                                max_insns: int = 8192) -> bool:
+        """
+        Read-only: does the instruction stream starting at `addr` look like a
+        function body -- i.e. does it reach a ret or a tail jump without
+        running into bytes that will not decode?
+
+        Corroboration for a direct call target the linear sweep stepped over.
+        Alignment used to serve that role, but a real MSVC function start is
+        only aligned when the linker had a reason to pad it; the CRT's
+        _mtinitlocks sits at Wreckless 0x000F211A, immediately after a jump
+        table, at no alignment at all. Decoding is the stronger evidence and
+        the one that actually distinguishes code from a plausible-looking
+        address read out of data.
+
+        Follows instructions the sweep already decoded where they exist, and
+        decodes the rest here without recording them, so calling this never
+        changes what the sweep produced.
+
+        max_insns only bounds the walk's cost -- leaving the section already
+        terminates it. Keep it well clear of the largest real function: Blood
+        Wake 0x0005E670 runs 537 instructions before its first ret, and a cap
+        of 512 rejected it.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        if not data:
+            return False
+
+        for _ in range(max_insns):
+            insn = self.instructions.get(addr)
+            if insn is not None:
+                if insn.is_ret or insn.is_jump:
+                    return True
+                addr = insn.end_address
+            else:
+                offset = addr - section.virtual_addr
+                if offset < 0 or offset >= len(data):
+                    return False
+                decoded = next(self._cs.disasm(data[offset:], addr, count=1),
+                               None)
+                if decoded is None:
+                    return False  # undecodable: not code
+                mnemonic = decoded.mnemonic.lower()
+                if (mnemonic in config.RET_MNEMONICS
+                        or mnemonic in config.JMP_MNEMONICS):
+                    return True
+                addr += decoded.size
+            if not (section.virtual_addr <= addr
+                    < section.virtual_addr + section.virtual_size):
+                return False  # ran off the section without terminating
+        return False
+
     def recursive_descent(self, start_addresses: List[int],
                           section_bounds: List[Tuple[int, int]]) -> Set[int]:
         """

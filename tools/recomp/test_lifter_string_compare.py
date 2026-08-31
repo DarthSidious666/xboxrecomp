@@ -44,7 +44,7 @@ class StringCompareLifterTest(unittest.TestCase):
         self.assertIn("if (!_flags) break;", generated)
         self.assertIn("if ((_flags != 0)) goto loc_00000010;", generated)
 
-    def test_unsupported_dword_compare_does_not_claim_byte_flags(self):
+    def test_dword_compare_sets_the_flags_its_jcc_reads(self):
         compare = Instruction(
             0, 2, "repe cmpsd", "dword ptr [esi], dword ptr es:[edi]",
             "f3a7")
@@ -62,8 +62,18 @@ class StringCompareLifterTest(unittest.TestCase):
             lifter, BasicBlock(start=0, instructions=[compare, jump]))
         generated = "\n".join(lifted)
 
-        self.assertIn("repe cmpsd - string compare", generated)
-        self.assertNotIn("(_flags != 0)", generated)
+        # Was a bare comment, so the jcc after it read whatever the previous
+        # instruction had left in the flags. It compares four bytes at a time
+        # and steps esi/edi by four, and the following je reads _flags.
+        self.assertIn("_flags = (MEM32(esi) == MEM32(edi));", generated)
+        self.assertIn("esi += 4; edi += 4; ecx--;", generated)
+        self.assertIn("if (!_flags) break;", generated)
+        # The je reads the flag the loop set, in whichever equivalent form
+        # the emitter picks -- what matters is that it reads _flags and not
+        # a stale _fa/_fb snapshot left by some earlier compare.
+        jcc = generated.splitlines()[-1]
+        self.assertIn("_flags", jcc)
+        self.assertNotIn("_fa", jcc)
 
 
 if __name__ == "__main__":

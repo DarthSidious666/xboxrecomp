@@ -529,6 +529,9 @@ typedef char  xbox_host_char;
  * Returns TRUE on success, FALSE if the path couldn't be translated.
  * host_path_buf must be at least MAX_PATH characters (not bytes).
  */
+/* Host path produced by the most recent xbox_translate_path call. */
+const wchar_t *xbox_LastHostPath(void);
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
 /* ============================================================================
@@ -828,6 +831,9 @@ NTSTATUS __fastcall xbox_IofCallDriver(PVOID DeviceObject, PVOID Irp);
 VOID     __fastcall xbox_IofCompleteRequest(PVOID Irp, CCHAR PriorityBoost);
 
 NTSTATUS __stdcall xbox_IoCreateSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName, PXBOX_ANSI_STRING DeviceName);
+/* Target of a link registered by xbox_IoCreateSymbolicLink, or NULL.
+ * Looked up by exact link name, e.g. "\\??\\Z:". */
+const char* xbox_LookupSymbolicLink(const char* link);
 NTSTATUS __stdcall xbox_IoDeleteSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName);
 
 /* ============================================================================
