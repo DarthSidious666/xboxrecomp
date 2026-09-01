@@ -1388,9 +1388,23 @@ class BatchTranslator:
                 print(f"  Wrote {stub_path} ({len(unresolved)} stubs)",
                       file=sys.stderr)
 
-        # Generate dispatch table
+        # Generate dispatch table.
+        #
+        # Hand-written functions belong in it too. They are declare-only here,
+        # so they never reached `translations` and got no entry -- which means
+        # a *direct* call to one linked fine by symbol while an *indirect* call
+        # to the same address found nothing in recomp_lookup and was dropped.
+        # That is a silent hole, and it grows with every function a project
+        # implements natively: on Half-Life 2 it covered memcpy, memmove,
+        # _initterm and atexit. The header already declares them.
+        # Sorted by address: recomp_lookup binary-searches this array, so an
+        # appended entry would silently break every lookup past it.
+        dispatch_entries = sorted(
+            list(translations) + [(addr, name, None)
+                                  for addr, name in manual_decls.items()],
+            key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
-        self._write_dispatch_table(translations, dispatch_path, header_name)
+        self._write_dispatch_table(dispatch_entries, dispatch_path, header_name)
         generated_files.append(dispatch_path)
 
         stats["files"] = generated_files
