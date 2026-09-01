@@ -582,6 +582,17 @@ class FunctionDetector:
             i = bisect.bisect_right(starts, addr) - 1
             return i >= 0 and addr < bounds[i][1]
 
+        # Deliberately NOT filtering out targets inside a function. That guard
+        # belongs to the immediate pass, which creates function *starts* and
+        # would split whatever it landed in. This pass creates aliases, and
+        # inside-a-function is precisely what an alias is for: an alternate
+        # entry point sharing the enclosing body.
+        #
+        # It matters. MSVC merges runs of tiny C++ constructor thunks into one
+        # body -- sub_005C10D6 covers 2,246 bytes of them -- so 45 of Half-Life
+        # 2's static initialisers are addresses inside another function and
+        # nowhere else. Excluding them left those constructors with no body at
+        # all, and _initterm silently skipped every one.
         targets = set()
         for sec in self.image.sections:
             if sec.name in code_names:
@@ -591,7 +602,7 @@ class FunctionDetector:
                 continue
             for off in range(0, len(data) - 3, 4):
                 value = int.from_bytes(data[off:off + 4], "little")
-                if in_code_section(value) and not inside_a_function(value):
+                if in_code_section(value):
                     targets.add(value)
 
         # Alias entries, not candidates.
@@ -615,15 +626,49 @@ class FunctionDetector:
         for target in sorted(targets):
             if target in self.functions or target in self._alias_entries:
                 continue
-            if not self.engine.probes_as_returning_body(target):
-                continue
-            if target not in self.engine.instructions:
-                if not self.engine.decode_at(target):
+            j = bisect.bisect_right(starts, target) - 1
+            if j >= 0 and bounds[j][0] < target < bounds[j][1]:
+                # Inside a function, so the bytes are known to be code and the
+                # only real question is whether the address is an instruction
+                # boundary rather than the middle of one. Requiring a ret here
+                # would be wrong: MSVC's constructor thunks are
+                # `mov ecx, <this>; jmp <ctor>` and end in a tail jump, which
+                # is exactly what the strict probe rejects. Share the enclosing
+                # end, as the tail-jump pass does.
+                if target not in self.engine.instructions:
                     continue
-            i = bisect.bisect_right(starts, target)
-            sec = self.image.get_section_at_va(target)
-            end = starts[i] if i < len(starts) else section_end.get(
-                sec.name if sec else "", target + 4)
+                end = bounds[j][1]
+            else:
+                # In a gap there is no enclosing body vouching for the bytes,
+                # so require two things instead of one: the address is an
+                # instruction boundary the sweep already found, and the stream
+                # from it reaches a ret *or* a tail jump.
+                #
+                # Insisting on a ret was too strict. MSVC emits C++ constructor
+                # thunks as `mov ecx, <this>; jmp <ctor>`, and a whole run of
+                # them can sit between two detected functions -- 45 of Half-Life
+                # 2's static initialisers are exactly that, in the gap after
+                # sub_005C0FB0. Their `push .. call .. ret` siblings passed the
+                # strict probe and they did not, which is a distinction with no
+                # meaning: both are entry points named by the same table.
+                #
+                # Padding is what the boundary check buys: a run of int3 is not
+                # an instruction the sweep records a start for, and a table does
+                # not point into it anyway.
+                if target not in self.engine.instructions:
+                    continue
+                first = self.engine.instructions[target]
+                if first.mnemonic.lower() in ("int3", "nop"):
+                    continue
+                if not self.engine.probes_as_function_body(target,
+                                                           max_insns=64):
+                    continue
+                i = bisect.bisect_right(starts, target)
+                sec = self.image.get_section_at_va(target)
+                end = starts[i] if i < len(starts) else section_end.get(
+                    sec.name if sec else "", target + 4)
+            if end <= target:
+                continue
             self._alias_entries[target] = end
             found += 1
 
