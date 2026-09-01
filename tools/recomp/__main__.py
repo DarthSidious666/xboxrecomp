@@ -308,7 +308,8 @@ def main():
             funcs = translator.get_functions_by_category()
 
         header_path = os.path.join(output_dir, "recomp_functions.h")
-        generate_header(funcs, header_path, abi_db=translator.abi_db)
+        generate_header(funcs, header_path, abi_db=translator.abi_db,
+                        title=translator.title)
         print(f"Generated header: {header_path} ({len(funcs)} declarations)")
         return
 
