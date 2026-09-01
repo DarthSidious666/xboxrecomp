@@ -628,6 +628,33 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                     g_icall_trace[(g_icall_trace_idx + k) & 15]);
         fprintf(stderr, "\n");
     }
+    /* Guest globals worth seeing at the moment of the hang.
+     *
+     * RECOMP_PEEK is otherwise only sampled by the pushbuffer reporter, which
+     * a title that hangs before rendering never reaches -- and a spin that
+     * makes no kernel calls is invisible to RECOMP_KERNEL_WATCH too. A pure
+     * CPU loop polling a global is exactly the case neither of those covers.
+     */
+    {
+        const char *spec = getenv("RECOMP_PEEK");
+        char buf[256], *q, *end;
+        if (spec && *spec) {
+            strncpy(buf, spec, sizeof buf - 1);
+            buf[sizeof buf - 1] = 0;
+            fprintf(stderr, "  peek:");
+            for (q = buf; *q; ) {
+                unsigned long va = strtoul(q, &end, 0);
+                if (end == q)
+                    break;
+                if (va >= XBOX_BASE_ADDRESS && va < XBOX_TOTAL_RAM)
+                    fprintf(stderr, " [%08lX]=%08X", va,
+                            *(const uint32_t *)(mem + va));
+                q = (*end == ',') ? end + 1 : end;
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
     for (i = 0; i < 400 && esp; i++) {
         uint32_t a = esp + i * 4;
         if (a < XBOX_STACK_BASE || a >= XBOX_STACK_TOP) break;
