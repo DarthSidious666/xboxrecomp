@@ -1714,9 +1714,31 @@ class Lifter:
             targets = self._read_jump_table(table_va)
         if not targets:
             return []
-        # Check that ALL targets are within the current function
-        if all(self.func_start <= t < self.func_end for t in targets):
-            return targets
+        # Truncate at the first entry outside the function rather than
+        # demanding that every entry be inside it.
+        #
+        # _read_jump_table stops at the first value that is not a plausible
+        # code address, but a switch table is followed by ordinary code, and
+        # the next function's bytes routinely read as a valid .text address --
+        # so the read overruns the real table and picks up garbage. Requiring
+        # ALL entries to be in range then threw the whole switch away because
+        # of entries that were never part of it.
+        #
+        # A switch table's arms all land inside their own function, so the
+        # first entry that does not is exactly where the table ends. On
+        # Half-Life 2's CRT format parser (sub_005B9EB0) the table at
+        # 0x005BA617 has 8 real arms followed by code; the old rule resolved
+        # none of them, the indexed jump became an unresolvable indirect call,
+        # and sprintf silently produced the wrong string.
+        inside = []
+        for target in targets:
+            if not (self.func_start <= target < self.func_end):
+                break
+            inside.append(target)
+        # Two arms is the smallest thing worth calling a switch; one is more
+        # likely a coincidence than a jump table.
+        if len(inside) >= 2:
+            return inside
         return []
 
     def _lift_jmp(self, insn, ops):
