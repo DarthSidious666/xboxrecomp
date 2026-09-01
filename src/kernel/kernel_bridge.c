@@ -3053,6 +3053,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* Memory - virtual */
     case 184: return bridge_NtAllocateVirtualMemory;
     case 199: return bridge_NtFreeVirtualMemory;
+    case 215: return bridge_NtQuerySymbolicLinkObject;
     case 217: return bridge_NtQueryVirtualMemory;
 
     /* Pool */
@@ -3302,6 +3303,21 @@ static void kernel_thunk_dispatch(void)
     kernel_watch_arm_once();
     if (g_kernel_watch_va) {
         _watch_before = BRIDGE_MEM32(g_kernel_watch_va);
+        /* Reporting only on change misses the case that matters most: a value
+         * that was already wrong before the first call sampled it. Printing
+         * every sample under RECOMP_KERNEL_WATCH_ALL shows when it changed
+         * even if no single bridge did it. */
+        if (getenv("RECOMP_KERNEL_WATCH_ALL")) {
+            static uint32_t seen = 0xDEADBEEFu;
+            if (_watch_before != seen) {
+                seen = _watch_before;
+                fprintf(stderr, "  [KWATCH] 0x%08X = %08X before ordinal %u"
+                                " (call #%d)\n",
+                        g_kernel_watch_va, _watch_before, ordinal,
+                        g_kernel_call_count);
+                fflush(stderr);
+            }
+        }
     }
 
     if (bridge) {
