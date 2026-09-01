@@ -598,12 +598,10 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── bsf/bsr: bit scan, ZF set if source is zero ──
     if flag_setter in ("bsf", "bsr"):
-        if rhs is None:
-            return None
         if jcc in ("je", "jz"):
-            return f"({rhs} == 0)", desc
+            return "_flags", desc
         if jcc in ("jne", "jnz"):
-            return f"({rhs} != 0)", desc
+            return "!_flags", desc
         return None
 
     # ── bt/bts/btr/btc: bit test, sets CF ──
@@ -804,6 +802,7 @@ class Lifter:
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
+        self.needs_flags = True  # Translator disables snapshots with no consumer
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
         self.publishes_ebp = False  # Set per-function: has a real frame
         self.trace_exit_name = None  # Set per-function when traced
@@ -900,6 +899,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("bsf", "bsr"):
+            return self._lift_bit_scan(ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -1299,6 +1300,39 @@ class Lifter:
         cnt = _fmt_operand_read(ops[1])
         func = "ROL32" if m == "rol" else "ROR32"
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+
+    def _lift_bit_scan(self, ops, mnemonic):
+        if len(ops) < 2:
+            return [f"/* {mnemonic}: bad operands */"]
+
+        src = _fmt_operand_read(ops[1])
+        width = _operand_width(ops[1]) or _operand_width(ops[0]) or 4
+        bits = width * 8
+        value = (f"(uint32_t)(uint16_t)({src})" if width == 2
+                 else f"(uint32_t)({src})")
+        if mnemonic == "bsr":
+            initial_index = bits - 1
+            step = "--_bs_index"
+        else:
+            initial_index = 0
+            step = "++_bs_index"
+        write = _fmt_operand_write(ops[0], "_bs_index")
+        statements = [
+            "{",
+            f"    uint32_t _bs_value = {value};",
+        ]
+        if self.needs_flags:
+            statements.append("    _flags = (_bs_value == 0);")
+        statements.extend([
+            "    if (_bs_value != 0) {",
+            f"        uint32_t _bs_index = {initial_index};",
+            "        while (((_bs_value >> _bs_index) & 1u) == 0u) "
+            f"{step};",
+            f"        {write}",
+            "    }",
+            f"}} /* {mnemonic} */",
+        ])
+        return statements
 
     # ── Compare / Test (standalone) ──
 
