@@ -670,6 +670,10 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
     if lifter and lifter._is_external_target(target):
         # Conditional tail call: same frame bridge as the unconditional tail
         # jmp in _lift_jmp, applied only on the taken path.
+        if target in lifter.manual_functions:
+            return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; "
+                    f"RECOMP_ITAIL(0x{target:08X}u); return; }}"
+                    f" /* {jcc}: {desc}, manual tail */")
         name = lifter._call_target_name(target)
         return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; {name}(); return; }}"
                 f" /* {jcc}: {desc} */")
@@ -787,18 +791,20 @@ class Lifter:
     """Translates x86 instructions to C statements."""
 
     def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None,
-                 seh_prolog=None, seh_epilog=None):
+                 seh_prolog=None, seh_epilog=None, manual_functions=None):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
         abi_db: dict of addr → ABI info (for calling conventions)
         xbe_data: raw XBE file bytes (for reading jump tables)
         seh_prolog/seh_epilog: override the detected __SEH_prolog/__SEH_epilog
+        manual_functions: addresses replaced through recomp_lookup_manual
         """
         self.func_db = func_db or {}
         self.label_db = label_db or {}
         self.abi_db = abi_db or {}
         self.xbe_data = xbe_data
+        self.manual_functions = set(manual_functions or ())
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
@@ -1427,7 +1433,6 @@ class Lifter:
         # value -- so writing the true address costs nothing at the return side.
         ret_va = insn.end_address
         if insn.call_target:
-            name = self._call_target_name(insn.call_target)
             lines = []
             # Re-publish this function's frame before every call, not just once
             # at `mov ebp, esp`. g_ebp is "the last frame established anywhere",
@@ -1439,9 +1444,17 @@ class Lifter:
             # [ebp-0xa0] onto Xbox VA 4 and 6: exactly the fs:[4] corruption.
             if self.publishes_ebp:
                 lines.append("g_ebp = ebp; /* frame stays current across calls */")
-            lines.append(
-                f"PUSH32(esp, 0x{ret_va:08X}u); {name}(); "
-                f"/* call 0x{insn.call_target:08X} */")
+            if insn.call_target in self.manual_functions:
+                lines.append(
+                    f"PUSH32(esp, 0x{ret_va:08X}u); "
+                    f"RECOMP_ICALL_SAFE(0x{insn.call_target:08X}u, "
+                    "_icall_esp); "
+                    f"/* manual call 0x{insn.call_target:08X} */")
+            else:
+                name = self._call_target_name(insn.call_target)
+                lines.append(
+                    f"PUSH32(esp, 0x{ret_va:08X}u); {name}(); "
+                    f"/* call 0x{insn.call_target:08X} */")
             # esp immediately after the callee returns. A per-call delta is the
             # only way to attribute a leak to one callee rather than to the
             # function containing them all.
@@ -1556,6 +1569,19 @@ class Lifter:
             if self._is_external_target(insn.jump_target):
                 # Tail call - no return address push (reuses current frame's)
                 # Bridge ebp so the target function can inherit our frame pointer.
+                if insn.jump_target in self.manual_functions:
+                    tail = (
+                        f"g_seh_ebp = ebp; "
+                        f"RECOMP_ITAIL(0x{insn.jump_target:08X}u); return; "
+                        f"/* manual tail jmp 0x{insn.jump_target:08X} */"
+                    )
+                    if self.trace_exit_name:
+                        return [
+                            f'RECOMP_TRACE_ESP("{self.trace_exit_name}", '
+                            f'"tail 0x{insn.jump_target:08X}");',
+                            tail,
+                        ]
+                    return [tail]
                 name = self._call_target_name(insn.jump_target)
                 tail = (f"g_seh_ebp = ebp; {name}(); return; "
                         f"/* tail jmp 0x{insn.jump_target:08X} */")
