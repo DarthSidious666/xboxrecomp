@@ -152,6 +152,7 @@ CASES = [
          ["stc", "inc eax", "adc ecx, 0", "mov eax, ecx"], _PAIRS),
     Case("bswap", "byte swap", ["bswap eax"], _PAIRS),
 
+
     # The dword string compares were emitted as a bare comment until the
     # Wreckless bring-up: nothing compared, esi/edi never advanced, and the
     # jcc reading the flags went wherever the previous instruction left them.
@@ -184,6 +185,16 @@ CASES = [
          ["bsf eax, ecx", "setz al", "movzx eax, al"], _PAIRS),
     Case("bsr_zf", "and the same for bsr",
          ["bsr eax, ecx", "setz al", "movzx eax, al"], _PAIRS),
+
+    # Nonzero-forced variants and a scan into a different destination,
+    # contributed in #16. The cases above leave the source to the input
+    # pairs, so these pin the common path explicitly.
+    Case("bsf_nonzero", "least-significant set bit, with a nonzero source",
+         ["or ecx, 1", "bsf eax, ecx"], _PAIRS),
+    Case("bsr_nonzero", "most-significant set bit, with a nonzero source",
+         ["or ecx, 1", "bsr eax, ecx"], _PAIRS),
+    Case("bit_scan_zf", "bit scan sets ZF when its source is zero",
+         ["bsf edx, ecx", "setz al", "movzx eax, al"], _PAIRS),
     Case("not_and", "bitwise", ["not eax", "and eax, ecx"], _PAIRS),
 
 

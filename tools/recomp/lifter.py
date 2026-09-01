@@ -622,15 +622,6 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
 
     # ── bsf/bsr: bit scan, ZF set if source is zero ──
-    if flag_setter in ("bsf", "bsr"):
-        if rhs is None:
-            return None
-        if jcc in ("je", "jz"):
-            return f"({rhs} == 0)", desc
-        if jcc in ("jne", "jnz"):
-            return f"({rhs} != 0)", desc
-        return None
-
     # ── bt/bts/btr/btc: bit test, sets CF ──
     if flag_setter in ("bt", "bts", "btr", "btc"):
         if rhs is None:
@@ -697,6 +688,10 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
     if lifter and lifter._is_external_target(target):
         # Conditional tail call: same frame bridge as the unconditional tail
         # jmp in _lift_jmp, applied only on the taken path.
+        if target in lifter.manual_functions:
+            return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; "
+                    f"RECOMP_ITAIL(0x{target:08X}u); return; }}"
+                    f" /* {jcc}: {desc}, manual tail */")
         name = lifter._call_target_name(target)
         return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; {name}(); return; }}"
                 f" /* {jcc}: {desc} */")
@@ -870,18 +865,20 @@ class Lifter:
 
     def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None,
                  seh_prolog=None, seh_epilog=None,
-                 setjmp_fn=None, longjmp_fn=None):
+                 setjmp_fn=None, longjmp_fn=None, manual_functions=None):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
         abi_db: dict of addr → ABI info (for calling conventions)
         xbe_data: raw XBE file bytes (for reading jump tables)
         seh_prolog/seh_epilog: override the detected __SEH_prolog/__SEH_epilog
+        manual_functions: addresses replaced through recomp_lookup_manual
         """
         self.func_db = func_db or {}
         self.label_db = label_db or {}
         self.abi_db = abi_db or {}
         self.xbe_data = xbe_data
+        self.manual_functions = set(manual_functions or ())
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
@@ -1086,6 +1083,15 @@ class Lifter:
             # comment-only lift is how the conformance suite reports a
             # silently dropped instruction.
             return ["(void)0; /* emms - empty MMX state */"]
+        if m in ("xlat", "xlatb"):
+            # AL indexes the byte table at EBX. With an address-size override,
+            # the effective offset is calculated and wrapped at 16 bits.
+            raw_bytes = bytes.fromhex(insn.bytes_hex)
+            if 0x67 in raw_bytes[:-1]:
+                address = "(uint16_t)(LO16(ebx) + LO8(eax))"
+            else:
+                address = "ebx + LO8(eax)"
+            return [f"SET_LO8(eax, MEM8({address})); /* xlatb */"]
         if m in ("sete", "setne", "setb", "setae", "setbe", "seta",
                  "setl", "setge", "setle", "setg", "sets", "setns"):
             return self._lift_setcc(insn, ops, m)
@@ -1606,13 +1612,22 @@ class Lifter:
                     "if (!recomp_guest_longjmp(MEM32(esp), MEM32(esp + 4)))"
                     f" {{ PUSH32(esp, 0x{ret_va:08X}u); {name}(); }}"
                     f" /* longjmp 0x{insn.call_target:08X} */")
+            elif insn.call_target in self.manual_functions:
+                # A function the project replaces by hand. recomp_lookup_manual
+                # is consulted on indirect calls, and without this a direct
+                # caller went straight to the generated body and bypassed the
+                # replacement silently. Contributed in #15.
+                lines.append(
+                    f"PUSH32(esp, 0x{ret_va:08X}u); "
+                    f"RECOMP_ICALL_SAFE(0x{insn.call_target:08X}u, "
+                    "_icall_esp); "
+                    f"/* manual call 0x{insn.call_target:08X} */")
             else:
-                # Routed through RECOMP_ABI_CALL so -DRECOMP_ABI_CHECK
-                # covers direct calls too. Without this the check sees
-                # only indirect ones, and CRT and static-init paths --
-                # where callee-saved clobbers actually bite -- are almost
-                # entirely direct. Expands to a plain call when the flag
-                # is off, so this costs nothing in a normal build.
+                # Routed through RECOMP_ABI_CALL so -DRECOMP_ABI_CHECK covers
+                # direct calls too. Without it the check sees only indirect
+                # ones, and CRT and static-init paths -- where callee-saved
+                # clobbers actually bite -- are almost entirely direct. Expands
+                # to a plain call when the flag is off.
                 lines.append(
                     f"PUSH32(esp, 0x{ret_va:08X}u); "
                     f"RECOMP_ABI_CALL(0x{insn.call_target:08X}u, {name}); "
@@ -1753,6 +1768,19 @@ class Lifter:
             if self._is_external_target(insn.jump_target):
                 # Tail call - no return address push (reuses current frame's)
                 # Bridge ebp so the target function can inherit our frame pointer.
+                if insn.jump_target in self.manual_functions:
+                    tail = (
+                        f"g_seh_ebp = ebp; "
+                        f"RECOMP_ITAIL(0x{insn.jump_target:08X}u); return; "
+                        f"/* manual tail jmp 0x{insn.jump_target:08X} */"
+                    )
+                    if self.trace_exit_name:
+                        return [
+                            f'RECOMP_TRACE_ESP("{self.trace_exit_name}", '
+                            f'"tail 0x{insn.jump_target:08X}");',
+                            tail,
+                        ]
+                    return [tail]
                 name = self._call_target_name(insn.jump_target)
                 tail = (f"g_seh_ebp = ebp; {name}(); return; "
                         f"/* tail jmp 0x{insn.jump_target:08X} */")
