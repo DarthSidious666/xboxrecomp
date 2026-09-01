@@ -691,6 +691,25 @@ static void bridge_NtAllocateVirtualMemory(void)
      * at startup if one does not. */
     uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
     if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
+        /* A pure reservation too big for the heap. Take it from the mapped
+         * space above RAM, where it costs no heap and the pages are distinct.
+         *
+         * Clamping instead -- handing back a fraction of what was asked for --
+         * is what broke Half-Life 2. It reserves 128 MB and then 200 MB, got
+         * 32 MB and 12.5 MB, and then sub-allocated across the range it
+         * believed it owned. That walks past the top of RAM, where the mirrors
+         * alias low memory, so its containers quietly shared storage with the
+         * live heap. Granting the full range is both more honest and less
+         * damaging. Returns 0 unless the title asked for a mapping larger than
+         * RAM, so nothing changes for titles that did not. */
+        xbox_va = xbox_ReserveAlloc(size, 4096);
+        if (xbox_va) {
+            fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: reserve of %u"
+                            " granted at 0x%08X above RAM\n", size, xbox_va);
+            fflush(stderr);
+        }
+    }
+    if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
         uint32_t want = size;
         while (want > 0x10000 && !xbox_va) {
             want /= 2;
@@ -2263,15 +2282,45 @@ static void bridge_NtQuerySymbolicLinkObject(void)
     const char* target = "\\Device\\CdRom0";
     USHORT len = (USHORT)strlen(target);
 
-    if (target_va) {
+    if (retlen_va) BRIDGE_MEM32(retlen_va) = (uint32_t)len;
+
+    /* Say so when the buffer could not be filled.
+     *
+     * Reporting STATUS_SUCCESS with an untouched output buffer is the same
+     * defect that left ordinal 215 unrouted: the caller believes it has a
+     * device path and parses whatever was already in that memory. Half-Life 2
+     * does exactly that -- it walked uninitialised bytes and dereferenced
+     * 0x68737572, the ASCII "rush", as a pointer. That only looked survivable
+     * because the RAM mirrors happened to back the address; with a mapping
+     * that does not alias, it faults immediately.
+     *
+     * STATUS_BUFFER_TOO_SMALL is the honest answer, and it is one the caller
+     * already has to handle -- it is what a real kernel returns when the
+     * ANSI_STRING it was handed has no room. */
+    if (!target_va) {
+        g_eax = 0xC0000023u;             /* STATUS_BUFFER_TOO_SMALL */
+        return;
+    }
+    {
         uint16_t max_len = BRIDGE_MEM16(target_va + 2);
         uint32_t buf_va  = BRIDGE_MEM32(target_va + 4);
-        if (buf_va && len < max_len) {
-            memcpy(XBOX_TO_NATIVE(buf_va), target, len + 1);
-            BRIDGE_MEM16(target_va) = len;
+
+        if (!buf_va || len >= max_len) {
+            static unsigned warned;
+            if (warned++ < 4) {
+                fprintf(stderr,
+                        "  [KERNEL] NtQuerySymbolicLinkObject: buffer 0x%08X "
+                        "max=%u cannot hold %u bytes; returning "
+                        "STATUS_BUFFER_TOO_SMALL\n",
+                        buf_va, (unsigned)max_len, (unsigned)len + 1);
+                fflush(stderr);
+            }
+            g_eax = 0xC0000023u;         /* STATUS_BUFFER_TOO_SMALL */
+            return;
         }
+        memcpy(XBOX_TO_NATIVE(buf_va), target, len + 1);
+        BRIDGE_MEM16(target_va) = len;
     }
-    if (retlen_va) BRIDGE_MEM32(retlen_va) = (uint32_t)len;
     g_eax = STATUS_SUCCESS;
 }
 

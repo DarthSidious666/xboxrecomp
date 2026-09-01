@@ -53,6 +53,36 @@ extern "C" {
  * mirror stride derive from this, not from the compile-time constant. */
 extern size_t g_xbox_total_ram;
 
+/* How much guest address space to map, when that must exceed RAM.
+ *
+ * These are not the same quantity and conflating them is a bug. RAM is what
+ * the console has and what the heap is carved out of; the mapped range is how
+ * much guest address space is backed by distinct host pages. The runtime
+ * mirrors RAM at intervals of the mapped size, because a real Xbox wraps
+ * addresses on a 26-bit bus -- so anything a title allocates above the mapped
+ * range silently shares storage with low memory.
+ *
+ * Half-Life 2 needs this: its allocator sub-allocates past the top of RAM, and
+ * at 64 MB its first commit past the boundary (0x04F80000) aliases the base of
+ * the live heap (0x00F80000). A CUtlRBTree element array landed at 0x0CB80000,
+ * aliasing 0x00B80000, and its links were overwritten between one insert and
+ * the next search.
+ *
+ * Raising g_xbox_total_ram instead does not work: the heap top and anything
+ * the guest is told about memory derive from that, so the title sizes itself
+ * differently and faults during CRT init. Growing only the mapping leaves both
+ * alone.
+ *
+ * Zero means "same as RAM", which is the existing behaviour for every title
+ * that does not ask. Set before xbox_MemoryLayoutInit(). */
+extern size_t g_xbox_map_size;
+void xbox_SetMapSize(size_t bytes);
+
+/* Carve a pure address-space reservation from the mapped range above RAM.
+ * Returns 0 if the mapping is no larger than RAM, or if it is exhausted.
+ * See the implementation for why reservations must not come from the heap. */
+uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align);
+
 /* Bounds of the guest's executable sections, derived from the XBE at load.
  *
  * recomp_types.h declares these too, for RECOMP_ICALL_IS_CODE. They are

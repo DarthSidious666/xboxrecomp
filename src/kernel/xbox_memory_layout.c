@@ -41,10 +41,17 @@ static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
 
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
+size_t g_xbox_map_size = 0;   /* 0 = same as RAM */
 
 void xbox_SetTotalRam(size_t bytes)
 {
     g_xbox_total_ram = bytes;
+}
+
+
+void xbox_SetMapSize(size_t bytes)
+{
+    g_xbox_map_size = bytes;
 }
 
 /* File mapping handle for the Xbox memory region.
@@ -770,7 +777,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     /* Map the full Xbox address space (covers all sections + stack + heap).
      * Size is runtime-configurable: retail 64 MB, devkit debug builds 128 MB. */
-    g_memory_size = g_xbox_total_ram;
+    /* The mapped range, which is not necessarily RAM. Mirrors are placed
+     * at multiples of this, so growing it is what stops a title's
+     * above-RAM allocations from aliasing low memory. */
+    g_memory_size = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
 
     /*
      * Create a file mapping backed by the page file.
@@ -1568,6 +1578,47 @@ void xbox_MemoryLayoutShutdown(void)
         g_mapping_handle = NULL;
     }
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
+}
+
+/* Bump allocator for pure address-space reservations, above RAM.
+ *
+ * A MEM_RESERVE costs no memory on real hardware -- it takes address space out
+ * of a 4 GB range, not pages out of the 64 MB the console has -- so titles
+ * reserve far more than exists and commit a fraction. Satisfying that out of
+ * the RAM heap does not work: Half-Life 2 asks for 128 MB and then 200 MB, and
+ * clamping those to what the heap can back left it sub-allocating across a
+ * range it believed it owned, walking past the top of RAM and aliasing low
+ * memory through the mirrors.
+ *
+ * So reservations come from the mapped space *above* RAM instead. Those pages
+ * are already backed and distinct, nothing else hands them out, and a commit
+ * inside one is a no-op because it is real memory already.
+ *
+ * Returns 0 when the mapping is no larger than RAM -- the default for titles
+ * that never call xbox_SetMapSize -- which leaves the old behaviour untouched.
+ *
+ * ponytail: a bump allocator with no free. A reservation is address space, the
+ * range is large, and a title that reserves and releases repeatedly would need
+ * a real allocator; none has yet.
+ */
+static uint32_t g_reserve_next;
+
+uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align)
+{
+    uint32_t base;
+
+    if (g_memory_size <= g_xbox_total_ram || size == 0)
+        return 0;
+    if (!align)
+        align = 4096;
+    if (!g_reserve_next)
+        g_reserve_next = (uint32_t)g_xbox_total_ram;
+
+    base = (g_reserve_next + align - 1) & ~(align - 1);
+    if ((size_t)base + size > g_memory_size)
+        return 0;
+    g_reserve_next = base + size;
+    return base;
 }
 
 BOOL xbox_IsXboxAddress(uintptr_t address)
