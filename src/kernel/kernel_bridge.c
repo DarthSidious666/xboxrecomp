@@ -2694,6 +2694,15 @@ static void bridge_KeDisconnectInterrupt(void)
 }
 
 /* ── KeSetBasePriorityThread (ordinal 143, 2 args) */
+/* KeQueryBasePriorityThread (ordinal 124, 1 arg). The implementation has
+ * existed in kernel_thread.c all along; only the bridge wrapper was
+ * missing, so the thunk fell through to the fallback and returned 0. */
+static void bridge_KeQueryBasePriorityThread(void)
+{
+    g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
+        XBOX_TO_NATIVE(STACK_ARG(0)));
+}
+
 static void bridge_KeSetBasePriorityThread(void)
 {
     g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
@@ -3266,7 +3275,13 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* case  17: bridge_ExFreePool */
     /* case  97: bridge_KeCancelTimer */
     /* case 100: bridge_KeDisconnectInterrupt */
-    /* case 143: bridge_KeSetBasePriorityThread */
+    /* Routed: thread base priority, queried and set. Neither allocates,
+     * frees, nor returns a pointer -- each takes a thread handle and a
+     * LONG. Half-Life 2 calls both while starting its worker threads,
+     * and unbridged they returned 0, so every thread read its own base
+     * priority as 0 and any priority the title set was discarded. */
+    case 124: return bridge_KeQueryBasePriorityThread;
+    case 143: return bridge_KeSetBasePriorityThread;
     /* Routed. Both clear the memory-model bar above: neither allocates,
      * frees, nor hands back a host pointer. KeStallExecutionProcessor takes a
      * microsecond count and busy-waits -- no pointers at all.
