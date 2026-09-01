@@ -627,6 +627,33 @@ static void bridge_NtAllocateVirtualMemory(void)
      * so MEM_COMMIT on an already-reserved region is a no-op.
      * Only allocate new memory when MEM_RESERVE is requested.
      */
+    /* An address above physical RAM is not free memory -- it aliases.
+     *
+     * The runtime maps 64 MB and then mirrors it at 64 MB intervals,
+     * because real Xbox RAM wraps on a 26-bit address bus. So a guest that
+     * sub-allocates past the top of RAM does not get fresh pages, it gets
+     * low memory that something else already owns, and the two quietly
+     * share storage. Half-Life 2 put a CUtlRBTree element array at
+     * 0x0CB80000, which aliases 0x00B80000; other regions it took land
+     * inside the live heap (0x05B80000 -> 0x01B80000).
+     *
+     * Real hardware wraps *physical* addresses while translating virtual
+     * ones, so this never happens there. Modelling every guest address as
+     * physical is the gap, and that is a bigger change than a bridge fix.
+     * Until then, say so: silent aliasing surfaces as corrupted data
+     * structures far from here, which is the worst way to find it.
+     */
+    if (base_hint >= g_xbox_total_ram) {
+        static unsigned warned;
+        if (warned++ < 8)
+            fprintf(stderr,
+                    "  [KERNEL] WARNING: allocation at 0x%08X is above "
+                    "%u MB of RAM; it aliases 0x%08X\n",
+                    base_hint, (unsigned)(g_xbox_total_ram / (1024 * 1024)),
+                    (uint32_t)(base_hint % g_xbox_total_ram));
+        fflush(stderr);
+    }
+
     if (base_hint != 0 && (alloc_type & 0x2000) == 0) {
         /* MEM_COMMIT only, on an already-reserved region.
          * The memory is already committed by our bump allocator.
