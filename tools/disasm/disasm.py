@@ -138,6 +138,12 @@ class Disassembler:
         if self.verbose:
             print(f"  Total: {total_insns:,d} instructions")
 
+        # Realign after embedded switch tables before anything reads the
+        # instruction stream. See DisasmEngine.resync_jump_tables().
+        n_tables = self.engine.resync_jump_tables()
+        if self.verbose:
+            print(f"  Resynced past {n_tables:,d} embedded jump table(s)")
+
         # Phase 4: Cross-references
         if self.verbose:
             print("\nPhase 4: Building cross-references...")

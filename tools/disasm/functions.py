@@ -580,6 +580,19 @@ class FunctionDetector:
             upper = next_func
 
         while addr < upper:
+            # An embedded switch table is data sitting on the fall-through
+            # path. engine.resync_jump_tables() removed the instructions the
+            # sweep hallucinated over it, so there is nothing to decode here --
+            # step over the table and carry on with the real code after it.
+            # Without this the function ends at its own switch and loses the
+            # epilogue, which is how callers of memcpy lost esi/edi.
+            tbl_end = self.engine.jump_tables.get(addr)
+            if tbl_end is not None and tbl_end <= upper:
+                if tbl_end > max_addr:
+                    max_addr = tbl_end
+                addr = tbl_end
+                continue
+
             insn = self.engine.get_instruction(addr)
             if insn is None:
                 break
@@ -606,6 +619,29 @@ class FunctionDetector:
                     # This jump goes forward within bounds, extend
                     max_target = target
 
+            # A switch dispatch's case bodies are jump targets too, they are
+            # just held in a table rather than encoded in the instruction.
+            # Without them the terminator check below ends the function on the
+            # dispatch itself, dropping every case and the shared epilogue --
+            # MSVC's memcpy loses its "pop edi / pop esi", so every caller is
+            # left with those registers clobbered.
+            if insn.jump_table is not None:
+                for target in self.engine.jump_table_entries(insn.jump_table):
+                    if start <= target < upper and target > max_target:
+                        max_target = target
+
+            # A switch dispatch is an unconditional jump, so the terminator
+            # check below would end the function on it -- but the table it
+            # reads is parked immediately after, and the case bodies and the
+            # epilogue follow that. Step over the table instead of stopping.
+            if insn.is_jump and not insn.is_cond_jump:
+                skipped = self._table_after(insn.end_address, upper)
+                if skipped is not None:
+                    if skipped > max_addr:
+                        max_addr = skipped
+                    addr = skipped
+                    continue
+
             if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
                 # Stop only once we have decoded *past* every internal branch
                 # target. A target is an address that must be inside the
@@ -627,6 +663,18 @@ class FunctionDetector:
             addr = insn.end_address
 
         return max_addr
+
+    def _table_after(self, addr: int, upper: int) -> Optional[int]:
+        """End of an embedded jump table starting at or just after `addr`.
+
+        MSVC usually parks the table directly after the dispatching jump, but
+        it may align first, so allow a few padding bytes.
+        """
+        for start in range(addr, addr + 16):
+            end = self.engine.jump_tables.get(start)
+            if end is not None and end <= upper:
+                return end
+        return None
 
     def _build_call_graph(self) -> None:
         """Populate calls_to and called_by for all functions."""

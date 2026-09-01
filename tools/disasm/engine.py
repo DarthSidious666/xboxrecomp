@@ -36,6 +36,7 @@ class Instruction:
     call_target: Optional[int] = None     # For direct calls
     jump_target: Optional[int] = None     # For direct jumps
     memory_ref: Optional[int] = None      # For [addr] references
+    jump_table: Optional[int] = None      # For `jmp [reg*4 + table]`
     imm_ref: Optional[int] = None         # For `push offset x` / `mov reg, offset x`
 
     @property
@@ -88,6 +89,12 @@ class DisasmEngine:
         # Sorted address list (built lazily for range queries)
         self._sorted_addrs: Optional[List[int]] = None
 
+        # Embedded jump tables: table VA -> end VA (exclusive).
+        # Populated by resync_jump_tables() from the indexed indirect jumps
+        # recorded during the sweep.
+        self.jump_tables: Dict[int, int] = {}
+        self._jt_candidates: Set[int] = set()
+
     def _classify_instruction(self, cs_insn: CsInsn) -> Instruction:
         """Convert a Capstone instruction to our Instruction type."""
         mnemonic = cs_insn.mnemonic
@@ -126,6 +133,16 @@ class DisasmEngine:
                     insn.jump_target = op.imm & 0xFFFFFFFF
                 elif op.type == CS_OP_MEM and op.mem.base == 0 and op.mem.index == 0:
                     insn.memory_ref = op.mem.disp & 0xFFFFFFFF
+                elif op.type == CS_OP_MEM and op.mem.index != 0:
+                    # `jmp dword ptr [reg*4 + disp]` -- a switch dispatch. disp
+                    # is the address of a table of code pointers, and MSVC
+                    # parks that table inside the function body, right after
+                    # this instruction. See resync_jump_tables().
+                    disp = op.mem.disp & 0xFFFFFFFF
+                    if self.image.base_address <= disp < (
+                            self.image.base_address + self.image.image_size):
+                        insn.jump_table = disp
+                        self._jt_candidates.add(disp)
 
             # Check for memory references in non-branch instructions
             if not (insn.is_call or insn.is_branch) and insn.memory_ref is None:
@@ -207,6 +224,80 @@ class DisasmEngine:
             progress_callback(total, total)
 
         return count
+
+    def resync_jump_tables(self, min_entries: int = 3,
+                           max_entries: int = 512) -> int:
+        """
+        Treat MSVC's embedded switch tables as data and realign after them.
+
+        `jmp dword ptr [reg*4 + disp]` dispatches through a table of code
+        pointers, and MSVC emits that table inline -- inside the function, on
+        the fall-through path, immediately after the jump. linear_sweep has no
+        way to know, so it decodes the pointers as instructions and comes out
+        the far side out of phase. Every byte after it belongs to an
+        instruction that does not exist, up to wherever the stream happens to
+        resync.
+
+        That is not a cosmetic loss. It routinely eats the function's own
+        epilogue, so the `pop esi / pop edi` balancing the prologue is never
+        lifted and **every caller silently loses those registers**. Half-Life 2
+        hits it in the CRT: memcpy and memmove both carry a tail-copy table, so
+        the C++ static-initialiser loop -- which walks its constructor array
+        with esi as the cursor and edi as the limit -- had both clobbered by
+        its own callees and stopped after 8% of the list, leaving Source with
+        no registered interfaces to hand CreateInterface.
+
+        Fix it where it starts: measure each table, drop the instructions the
+        sweep hallucinated over it, and decode_at() past the end to pick the
+        real code back up. A table entry must point into an executable section
+        for the table to keep growing, which is what bounds it.
+
+        Returns the number of tables resynced.
+        """
+        resynced = 0
+        for tbl in sorted(self._jt_candidates):
+            # XBEs mark .rdata and .data executable, so "points at an
+            # executable section" alone would let an array of data pointers
+            # pass as a jump table -- and resyncing over real instructions is
+            # far worse than missing a table. A switch never jumps out of its
+            # own section, so require that.
+            home = self.image.get_section_at_va(tbl)
+            if home is None:
+                continue
+            lo = home.virtual_addr
+            hi = lo + home.virtual_size
+            entries = 0
+            while entries < max_entries:
+                target = self.image.read_u32_at_va(tbl + entries * 4)
+                if target is None or not (lo <= target < hi):
+                    break
+                entries += 1
+            if entries < min_entries:
+                # Too short to distinguish from code that merely looks like
+                # pointers. Leaving it alone costs nothing; a wrong skip here
+                # would delete real instructions.
+                continue
+
+            end = tbl + entries * 4
+            for insn in self.get_instructions_in_range(
+                    tbl - 16, end):
+                if insn.end_address > tbl and insn.address < end:
+                    del self.instructions[insn.address]
+            self._sorted_addrs = None
+
+            self.jump_tables[tbl] = end
+            self.decode_at(end)
+            resynced += 1
+
+        return resynced
+
+    def jump_table_entries(self, tbl: int) -> List[int]:
+        """Code pointers held by a resynced jump table, or [] if unknown."""
+        end = self.jump_tables.get(tbl)
+        if end is None:
+            return []
+        return [self.image.read_u32_at_va(a) or 0
+                for a in range(tbl, end, 4)]
 
     def decode_at(self, addr: int, max_insns: int = 4096) -> int:
         """
