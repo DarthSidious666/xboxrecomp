@@ -55,6 +55,12 @@ LOG_PATTERNS = [
     # in the image calls this address, so only a run can reveal it.
     (re.compile(r"start routine (0x[0-9A-Fa-f]+) not found in dispatch"),
      "Thread start routine observed at runtime"),
+    # PsCreateSystemThreadEx's StartContext1. The Xbox thread convention hands
+    # the wrapper its real entry through the context pointer, so on several
+    # titles this is the game's main and nothing calls it directly. It is not
+    # always a function -- the gates below decide, which is what they are for.
+    (re.compile(r"PsCreateSystemThreadEx.*?ctx1=(0x[0-9A-Fa-f]+)"),
+     "PsCreateSystemThreadEx StartContext1 observed at runtime"),
     # Generic kernel-bridge complaint about an address it could not dispatch.
     (re.compile(r"not found in dispatch.*?(0x[0-9A-Fa-f]{6,8})"),
      "Address the kernel bridge could not dispatch"),
