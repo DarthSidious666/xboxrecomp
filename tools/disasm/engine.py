@@ -359,6 +359,39 @@ class DisasmEngine:
             self._sorted_addrs = None
         return added
 
+    def probes_as_returning_body(self, addr: int,
+                                 max_insns: int = 64) -> bool:
+        """
+        Stricter sibling of probes_as_function_body: does the stream at `addr`
+        reach a `ret` without first hitting an unconditional `jmp`?
+
+        Used where the evidence that something is a function is weak -- an
+        address that merely appears as an immediate -- so the bar has to be
+        higher than "decodes to some terminator". Requiring a ret rejects data
+        that happens to disassemble, and stopping at an unconditional jmp keeps
+        this out of tail-call territory, which _pass_tail_jump_targets already
+        covers with better evidence. Conditional branches are fine: a real
+        function has them.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.read_bytes_at_va(addr, max_insns * 8)
+        if not data:
+            return False
+
+        count = 0
+        for decoded in self._cs.disasm(data, addr):
+            count += 1
+            mnemonic = decoded.mnemonic.lower()
+            if mnemonic in config.RET_MNEMONICS:
+                return True
+            if mnemonic in config.JMP_MNEMONICS:
+                return False
+            if count >= max_insns:
+                return False
+        return False
+
     def probes_as_function_body(self, addr: int,
                                 max_insns: int = 8192) -> bool:
         """

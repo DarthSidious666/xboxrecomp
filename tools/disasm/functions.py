@@ -139,6 +139,13 @@ class FunctionDetector:
             self.functions.clear()
             self._build_functions(sections)
 
+        # Function addresses taken as an immediate. Runs once, after the
+        # bodies exist: the test is whether the target lands in a gap, which
+        # needs the gaps to be known. One rebuild picks up what it finds.
+        if self._pass_imm_ref_targets():
+            self.functions.clear()
+            self._build_functions(sections)
+
         # Seeds that landed inside a function rather than on its start.
         self._pass_seed_aliases()
 
@@ -391,6 +398,76 @@ class FunctionDetector:
         if found:
             print(f"  {found} function address(es) installed into"
                   f" indirect-call slots")
+
+    def _pass_imm_ref_targets(self) -> bool:
+        """
+        An immediate that points into unclaimed executable bytes and decodes as
+        a whole function body is a function whose address was taken.
+
+        _pass_indirect_call_slots already promotes an immediate stored into a
+        slot that something calls through by name. That is the strong evidence,
+        and it misses the ordinary C++ case entirely: a function pointer written
+        into an object field and later invoked as `call dword ptr [reg]` has no
+        fixed slot to match against.
+
+        Half-Life 2's CUtlRBTree constructor does exactly that --
+        `mov dword ptr [esi], 1D0F8h` installs the comparator, and the tree
+        calls it through `this`. Both of its comparators sat in a 42-byte hole
+        between two detected functions, so neither existed. Every tree search
+        called an address the recompiler could not resolve, got 0 back, and
+        descended into a node that was never there.
+
+        The evidence here is weaker than a named slot, so the filter carries the
+        weight, and it is the *gap* that does most of the work: the target has
+        to land in executable bytes that no function already covers, and decode
+        from there to a ret or a tail jump without hitting anything invalid. A
+        string or table address fails the decode; an offset into a real function
+        fails the gap. A spurious start inside a function would truncate it,
+        which is worse than missing one -- hence testing coverage rather than
+        just membership.
+
+        Runs after _build_functions for that reason, and returns whether it
+        added anything so the caller can rebuild.
+        """
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+
+        def inside_a_function(addr: int) -> bool:
+            i = bisect.bisect_right(starts, addr) - 1
+            return i >= 0 and addr < bounds[i][1]
+
+        # Collect distinct targets first. The instruction dict holds millions of
+        # entries and the same address is taken over and over, so probing per
+        # instruction rather than per address is the difference between seconds
+        # and not finishing.
+        targets = set()
+        for insn in self.engine.instructions.values():
+            target = insn.imm_ref
+            if target is None or target in self.functions:
+                continue
+            if inside_a_function(target):
+                continue
+            section = self.image.get_section_at_va(target)
+            if section and section.executable:
+                targets.add(target)
+
+        found = 0
+        for target in sorted(targets):
+            # A ret, not merely a terminator: an immediate is weak evidence,
+            # so the probe has to reject data that happens to disassemble. The
+            # cap also keeps a wrong guess from walking the rest of the section.
+            if not self.engine.probes_as_returning_body(target):
+                continue
+            if target not in self.engine.instructions:
+                if not self.engine.decode_at(target):
+                    continue
+            self._add_candidate(target, config.CONFIDENCE_IMM_REF,
+                                "imm_ref_target")
+            found += 1
+
+        if found:
+            print(f"  {found} function address(es) taken as an immediate")
+        return found > 0
 
     def _pass_tail_jump_targets(self, sections: List[SectionInfo]) -> bool:
         """
