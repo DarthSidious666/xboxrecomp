@@ -3179,8 +3179,20 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* case  97: bridge_KeCancelTimer */
     /* case 100: bridge_KeDisconnectInterrupt */
     /* case 143: bridge_KeSetBasePriorityThread */
-    /* case 151: bridge_KeStallExecutionProcessor */
-    /* case 175: bridge_MmLockUnlockBufferPages */
+    /* Routed. Both clear the memory-model bar above: neither allocates,
+     * frees, nor hands back a host pointer. KeStallExecutionProcessor takes a
+     * microsecond count and busy-waits -- no pointers at all.
+     * MmLockUnlockBufferPages takes (BaseAddress, Length, UnlockPages) and
+     * pins physical pages, which is a no-op on the host; XBOX_TO_NATIVE is the
+     * correct marshalling for its one address argument, and it writes nothing
+     * through it.
+     *
+     * Half-Life 2 calls both during C++ static initialisation. Unbridged they
+     * returned 0 without stalling or locking anything -- harmless in isolation,
+     * but they are exactly the kind of silent no-op that makes a later failure
+     * unattributable. */
+    case 151: return bridge_KeStallExecutionProcessor;
+    case 175: return bridge_MmLockUnlockBufferPages;
     /* case 180: bridge_MmQueryAllocationSize */
     /* case 192: bridge_NtCreateMutant */
     /* Routed. Checked against the memory-model warning above rather than

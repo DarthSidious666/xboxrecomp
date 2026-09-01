@@ -52,6 +52,17 @@ extern "C" {
  * devkit build calls xbox_SetTotalRam(XBOX_DEVKIT_RAM) before init. Heap top and
  * mirror stride derive from this, not from the compile-time constant. */
 extern size_t g_xbox_total_ram;
+
+/* Bounds of the guest's executable sections, derived from the XBE at load.
+ *
+ * recomp_types.h declares these too, for RECOMP_ICALL_IS_CODE. They are
+ * repeated here so hand-written host code -- a fault handler wanting to tell a
+ * guest return address on the stack from ordinary data, say -- can use them
+ * without including the generated-code header, which redefines `eax` and
+ * friends as macros.
+ */
+extern uint32_t g_xbox_code_lo;
+extern uint32_t g_xbox_code_hi;
 void xbox_SetTotalRam(size_t bytes);
 
 /* NOTE: Section addresses (.text, .rdata, .data, etc.) are NOT hardcoded.
