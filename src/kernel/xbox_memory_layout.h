@@ -239,6 +239,11 @@ void xbox_WatchdogStart(void);
 #define KDATA_DISK_SERIAL_STR   0x460  /* XBOX_ANSI_STRING (8 bytes) */
 #define KDATA_DISK_SERIAL_BUF   0x470  /* serial text (up to 32 bytes) */
 #define KDATA_DISK_CACHE_PARTS  0x4A0  /* HalDiskCachePartitionCount (4 bytes) */
+/* XeImageFileName's text. The exported symbol at KDATA_XE_IMAGE_FILENAME is
+ * an XBOX_ANSI_STRING, and a title dereferences its Buffer -- the CRT reads
+ * it to work out the running image's path. The struct was declared without
+ * anything to point at, so Buffer held whatever was in that page. */
+#define KDATA_XE_IMAGE_BUF      0x4B0  /* image path text (up to 64 bytes) */
 
 /** Size of the simulated Xbox stack (8 MB).
  *  Increased from 1 MB because failed RECOMP_ICALL indirect calls

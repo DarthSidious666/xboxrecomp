@@ -222,8 +222,15 @@ static void kernel_data_init(void)
         struct { uint32_t str_off, buf_off; const char *text; } d[] = {
             { KDATA_DISK_MODEL_STR,  KDATA_DISK_MODEL_BUF,  "XBOXRECOMP VIRTUAL HDD" },
             { KDATA_DISK_SERIAL_STR, KDATA_DISK_SERIAL_BUF, "XR0000000000" },
+            /* XeImageFileName (ordinal 326). Declared but never filled in, so
+             * its Buffer held whatever was in the page -- Half-Life 2's CRT
+             * reads it while working out the running image's path, took the
+             * uninitialised bytes as a char*, and dereferenced 0x68737572
+             * (the ASCII "rush"). A disc-booted title's value looks like this. */
+            { KDATA_XE_IMAGE_FILENAME, KDATA_XE_IMAGE_BUF,
+              "\\Device\\CdRom0\\default.xbe" },
         };
-        for (int k = 0; k < 2; k++) {
+        for (int k = 0; k < (int)(sizeof(d) / sizeof(d[0])); k++) {
             uint32_t str_va = XBOX_KERNEL_DATA_BASE + d[k].str_off;
             uint32_t buf_va = XBOX_KERNEL_DATA_BASE + d[k].buf_off;
             size_t len = strlen(d[k].text);
@@ -643,14 +650,19 @@ static void bridge_NtAllocateVirtualMemory(void)
      * Until then, say so: silent aliasing surfaces as corrupted data
      * structures far from here, which is the worst way to find it.
      */
-    if (base_hint >= g_xbox_total_ram) {
+    if (base_hint >= (g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram)) {
         static unsigned warned;
         if (warned++ < 8)
             fprintf(stderr,
                     "  [KERNEL] WARNING: allocation at 0x%08X is above "
-                    "%u MB of RAM; it aliases 0x%08X\n",
-                    base_hint, (unsigned)(g_xbox_total_ram / (1024 * 1024)),
-                    (uint32_t)(base_hint % g_xbox_total_ram));
+                    "%u MB mapped; it aliases 0x%08X\n",
+                    base_hint,
+                    (unsigned)((g_xbox_map_size ? g_xbox_map_size
+                                                : g_xbox_total_ram)
+                               / (1024 * 1024)),
+                    (uint32_t)(base_hint % (g_xbox_map_size
+                                            ? g_xbox_map_size
+                                            : g_xbox_total_ram)));
         fflush(stderr);
     }
 
