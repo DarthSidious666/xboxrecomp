@@ -1184,6 +1184,58 @@ static void bridge_NtWaitForSingleObjectEx(void)
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
+/* NtWaitForMultipleObjectsEx (ordinal 235, 5 args = 20 bytes)
+ *
+ * NTSTATUS NtWaitForMultipleObjectsEx(ULONG Count, HANDLE *Handles,
+ *                                     ULONG WaitType, BOOLEAN Alertable,
+ *                                     PLARGE_INTEGER Timeout);
+ *
+ * xbox_NtWaitForMultipleObjectsEx has been in kernel_sync.c all along; only
+ * the bridge wrapper was missing, so the thunk fell through to the fallback
+ * and returned 0 -- STATUS_SUCCESS, meaning 'object 0 is signalled'. A wait
+ * that always reports signalled turns a blocking wait into a busy loop, which
+ * is exactly what Half-Life 2 does after spawning its first worker: the main
+ * thread spins in a CUtlLinkedList walk making no indirect calls at all.
+ *
+ * Handles is a guest array of tokens, so each has to be resolved
+ * individually -- the array cannot just be pointed at. Bounded because a
+ * bogus Count would otherwise read arbitrary guest memory onto the stack;
+ * MAXIMUM_WAIT_OBJECTS is the real kernel's own limit.
+ */
+static void bridge_NtWaitForMultipleObjectsEx(void)
+{
+    uint32_t count       = STACK_ARG(0);
+    uint32_t handles_va  = STACK_ARG(1);
+    uint32_t wait_type   = STACK_ARG(2);
+    uint32_t alertable   = STACK_ARG(3);
+    uint32_t timeout_ptr = STACK_ARG(4);
+    HANDLE   handles[MAXIMUM_WAIT_OBJECTS];
+    uint32_t i;
+
+    if (count == 0 || count > MAXIMUM_WAIT_OBJECTS || !handles_va) {
+        g_eax = 0xC000000Du;             /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    for (i = 0; i < count; i++)
+        handles[i] = bridge_resolve_handle(BRIDGE_MEM32(handles_va + i * 4));
+
+    {
+        static int logged;
+        if (logged++ < 20) {
+            fprintf(stderr, "  [KERNEL] NtWaitForMultipleObjectsEx: count=%u type=%u timeout=%s\n",
+                    count, wait_type, timeout_ptr ? "finite" : "INFINITE");
+            for (i = 0; i < count; i++)
+                fprintf(stderr, "      [%u] token=0x%08X host=%p\n", i,
+                        BRIDGE_MEM32(handles_va + i * 4), handles[i]);
+            fflush(stderr);
+        }
+    }
+
+    g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
+        count, handles, wait_type, (BOOLEAN)alertable,
+        XBOX_TO_NATIVE(timeout_ptr));
+}
+
 /*
  * Takes an Xbox VA, so the native pointer has to be formed before the query --
  * an unbridged 0 return reads as PAGE_NOACCESS. Halo walks all 22 MB of its
@@ -3210,6 +3262,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 225: return bridge_NtSetEvent;
     case 233: return bridge_NtWaitForSingleObject;
     case 234: return bridge_NtWaitForSingleObjectEx;
+    case 235: return bridge_NtWaitForMultipleObjectsEx;
     case 238: return bridge_NtYieldExecution;
 
     /* Hardware */

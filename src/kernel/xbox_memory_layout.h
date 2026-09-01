@@ -351,7 +351,21 @@ typedef union RecompXmm {
  *  not a macro, because RAM size is now configurable (retail 64 MB vs devkit
  *  128 MB). The total mapped region (data + stack + heap) equals RAM so the
  *  engine's memory probing stops at the correct boundary. */
-#define XBOX_HEAP_TOP       ((uint32_t)g_xbox_total_ram)   /* RAM maps from VA 0 */
+/* The heap runs to the end of the *mapped* range, not the end of RAM.
+ *
+ * When a title maps more address space than it has RAM, a large
+ * MEM_RESERVE has to come from somewhere. Carving it out of a separate
+ * arena above the heap looked tidy and was wrong: the guest CRT's own
+ * bookkeeping never learns about that region, so realloc's block lookup
+ * fails for a pointer in it and the copy is skipped -- a grown buffer
+ * comes back empty with the old one still intact. Half-Life 2 loses a
+ * 129-node CUtlRBTree that way, and the tree then self-cycles.
+ *
+ * Letting the ordinary heap serve the whole mapped range keeps every
+ * allocation inside one allocator the guest already understands.
+ */
+#define XBOX_HEAP_TOP       ((uint32_t)(g_xbox_map_size ? g_xbox_map_size \
+                                                        : g_xbox_total_ram))
 
 /** No static mirror/guard region. RAM mirror is handled via file mapping
  *  views that alias the same physical pages as the base 64 MB region. */
