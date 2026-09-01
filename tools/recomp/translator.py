@@ -662,6 +662,7 @@ class FunctionTranslator:
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
+        self.lifter.needs_flags = has_conditionals
 
         # Flag snapshot temporaries: a cmp/test records its operands here,
         # zero- and sign-extended to the compare's own width, so the branch
