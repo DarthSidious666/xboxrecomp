@@ -429,6 +429,20 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     }
 }
 
+/* Xbox volume geometry.
+ *
+ * FATX uses 16 KB clusters: 512-byte sectors, 32 sectors per cluster. That is
+ * not cosmetic. A title's CRT startup asks for FileFsSizeInformation and
+ * multiplies SectorsPerAllocationUnit by BytesPerSector, then *requires* the
+ * product to equal the cluster size it was built for. Half-Life 2 checks for
+ * 0x4000 and returns STATUS_DEVICE_NOT_READY (0xC000014F) otherwise, which
+ * aborts CRT init before main ever runs -- the process then exits cleanly,
+ * which reads as a title that did nothing rather than one that failed.
+ *
+ * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
+#define XBOX_BYTES_PER_SECTOR       512u
+#define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
+
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
@@ -442,14 +456,14 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
-                info->BytesPerSector = 512;
-                info->SectorsPerAllocationUnit = 8;
+                info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
             } else {
-                info->BytesPerSector = 512;
-                info->SectorsPerAllocationUnit = 8;
+                info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
@@ -965,8 +979,10 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
             int fd = w32_handle_fd(FileHandle);
-            info->BytesPerSector = 512;
-            info->SectorsPerAllocationUnit = 8;
+            /* Xbox geometry, not the host's -- see the note on
+             * XBOX_SECTORS_PER_CLUSTER above. */
+            info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+            info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
             if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;

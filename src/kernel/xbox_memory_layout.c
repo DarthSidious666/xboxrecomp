@@ -481,6 +481,22 @@ static void *g_kernel_memory = NULL;
 /* Global offset accessible by recompiled code (via recomp_types.h) */
 ptrdiff_t g_xbox_mem_offset = 0;
 
+/* Bounds of the title's executable sections, from its own XBE section table.
+ *
+ * RECOMP_ICALL uses these to decide whether an indirect-call target is code
+ * before dispatching it. This used to be a hardcoded "0x00400000..0xFE000000 is
+ * not code" test, which is true for Burnout 3 -- its .text ends at 0x002CC200,
+ * so everything above 0x400000 really is data -- and false for any title with
+ * more code than that. Half-Life 2's .text runs to 0x005F4A6C, so the constant
+ * silently discarded every indirect call into the top two thirds of the game,
+ * including the one that enters its main. No log, no crash: eax = 0 and carry
+ * on, which looks exactly like a function that returned early.
+ *
+ * Zero until the layout is initialised, which the macro treats as "allow" so
+ * nothing breaks before the title is loaded. */
+uint32_t g_xbox_code_lo = 0;
+uint32_t g_xbox_code_hi = 0;
+
 /* Global registers for recompiled code (via recomp_types.h) */
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
@@ -874,6 +890,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             /* Copy initialized data from XBE */
             if (copy_size > 0 && sec_raw_off + copy_size <= xbe_size) {
                 memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
+            }
+
+            /* Executable sections define the range indirect calls may target.
+             * XBE section flag 0x04 is EXECUTABLE. */
+            if (*(const DWORD *)(sh + SECTHDR_FLAGS) & 0x00000004u) {
+                if (!g_xbox_code_lo || sec_va < g_xbox_code_lo)
+                    g_xbox_code_lo = sec_va;
+                if (sec_va + sec_vsize > g_xbox_code_hi)
+                    g_xbox_code_hi = sec_va + sec_vsize;
             }
 
             sections_loaded++;

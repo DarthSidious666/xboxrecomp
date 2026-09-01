@@ -95,6 +95,26 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va);
  */
 extern ptrdiff_t g_xbox_mem_offset;
 
+/* Bounds of the title's executable sections, filled in by
+ * xbox_MemoryLayoutInit from the XBE's own section table. Zero means "not
+ * loaded yet", which RECOMP_ICALL_IS_CODE treats as allow.
+ *
+ * These replace a hardcoded 0x00400000 cutoff that was only ever right for one
+ * title -- see the comment where they are defined in xbox_memory_layout.c. */
+extern uint32_t g_xbox_code_lo;
+extern uint32_t g_xbox_code_hi;
+
+/* Is this indirect-call target plausibly code?
+ *
+ * Synthetic kernel thunks live at 0xFE0000xx and are dispatched by
+ * recomp_lookup_kernel, so they are always allowed. Everything else has to lie
+ * inside an executable section of the loaded title. A target that fails this is
+ * a garbage pointer that reached a call site, and calling it would be worse
+ * than dropping it. */
+#define RECOMP_ICALL_IS_CODE(_va) \
+    ((_va) >= 0xFE000000u || g_xbox_code_hi == 0u || \
+     ((_va) >= g_xbox_code_lo && (_va) < g_xbox_code_hi))
+
 /* ================================================================
  * Global registers
  * ================================================================ */
@@ -657,7 +677,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * The caller must PUSH32 the guest return address before this macro.
  * If not found, pops it back off to keep the stack balanced.
  *
- * The range check (0x00400000 to 0xFE000000) skips garbage VAs that
+ * RECOMP_ICALL_IS_CODE skips garbage VAs that
  * come from uninitialized vtable pointers. Adjust this range based
  * on your game's .text section boundaries. Kernel thunks at
  * 0xFE000000+ must NOT be blocked.
@@ -672,7 +692,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_trace_idx++; \
     g_icall_count++; \
     /* Skip garbage VAs outside code section + kernel thunk range */ \
-    if (_va >= 0x00400000 && _va < 0xFE000000) { \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
         g_esp += 4; eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
@@ -696,7 +716,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
-    if (_va >= 0x00400000 && _va < 0xFE000000) { \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
         g_esp = (saved_esp); eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
