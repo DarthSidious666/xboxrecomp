@@ -142,7 +142,7 @@ class FunctionDetector:
         # Function addresses taken as an immediate. Runs once, after the
         # bodies exist: the test is whether the target lands in a gap, which
         # needs the gaps to be known. One rebuild picks up what it finds.
-        if self._pass_imm_ref_targets():
+        if self._pass_imm_ref_targets(sections):
             self.functions.clear()
             self._build_functions(sections)
 
@@ -399,7 +399,7 @@ class FunctionDetector:
             print(f"  {found} function address(es) installed into"
                   f" indirect-call slots")
 
-    def _pass_imm_ref_targets(self) -> bool:
+    def _pass_imm_ref_targets(self, sections: List[SectionInfo]) -> bool:
         """
         An immediate that points into unclaimed executable bytes and decodes as
         a whole function body is a function whose address was taken.
@@ -440,16 +440,25 @@ class FunctionDetector:
         # entries and the same address is taken over and over, so probing per
         # instruction rather than per address is the difference between seconds
         # and not finishing.
+        # Only the sections actually being analysed as code. An XBE marks
+        # .rdata and .data executable, so `section.executable` alone lets a
+        # string or a vtable through -- and .rdata disassembles happily into
+        # bound/popal/arpl, which then fails to compile. The caller's section
+        # list is the real answer to "is this code".
+        code_ranges = [(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+                       for sec in sections]
+
+        def in_code_section(addr: int) -> bool:
+            return any(lo <= addr < hi for lo, hi in code_ranges)
+
         targets = set()
         for insn in self.engine.instructions.values():
             target = insn.imm_ref
             if target is None or target in self.functions:
                 continue
-            if inside_a_function(target):
+            if inside_a_function(target) or not in_code_section(target):
                 continue
-            section = self.image.get_section_at_va(target)
-            if section and section.executable:
-                targets.add(target)
+            targets.add(target)
 
         found = 0
         for target in sorted(targets):
