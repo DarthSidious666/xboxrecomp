@@ -146,6 +146,12 @@ class FunctionDetector:
             self.functions.clear()
             self._build_functions(sections)
 
+        # Then the same for addresses that only ever exist as table entries.
+        # After the immediate pass, so its results narrow the gaps first. These
+        # become aliases rather than function starts, so no rebuild: aliases are
+        # materialised by _build_alias_entries once boundaries are final.
+        self._pass_data_ptr_targets(sections)
+
         # Seeds that landed inside a function rather than on its start.
         self._pass_seed_aliases()
 
@@ -538,6 +544,92 @@ class FunctionDetector:
 
         added = self._pass_cond_branch_orphans(bodies, starts) or added
         return added
+
+    def _pass_data_ptr_targets(self, sections: List[SectionInfo]) -> bool:
+        """
+        A code pointer stored in a data section is a function whose address is
+        only ever taken at run time.
+
+        _pass_imm_ref_targets catches an address that appears as an immediate in
+        code. It cannot catch one that only ever exists as a *value in a table*
+        -- a vtable the compiler emitted into .rdata, a callback array, a
+        dispatch table. RTTI recovery covers vtables belonging to polymorphic
+        classes; nothing covers the rest.
+
+        Half-Life 2 shows why that matters. Its boot reached module loading and
+        then stopped on one unresolved indirect call after another --
+        0x00427F80, 0x005AC780, 0x00581CC0 -- each a clean function reached
+        through a table, each found only by running the title and reading the
+        indirect-call feedback. There are 4,892 of them in this binary.
+
+        Same filter as the immediate pass, and the gap does the same work: the
+        target must land in executable bytes no function already covers, and
+        must decode to a ret. A data word that happens to fall in a code
+        section's range fails the decode; an offset into a real function fails
+        the gap.
+        """
+        code_ranges = [(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+                       for sec in sections]
+        code_names = {sec.name for sec in sections}
+
+        def in_code_section(addr: int) -> bool:
+            return any(lo <= addr < hi for lo, hi in code_ranges)
+
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+
+        def inside_a_function(addr: int) -> bool:
+            i = bisect.bisect_right(starts, addr) - 1
+            return i >= 0 and addr < bounds[i][1]
+
+        targets = set()
+        for sec in self.image.sections:
+            if sec.name in code_names:
+                continue                    # scan data, not code
+            data = self.image.get_section_data(sec)
+            if not data:
+                continue
+            for off in range(0, len(data) - 3, 4):
+                value = int.from_bytes(data[off:off + 4], "little")
+                if in_code_section(value) and not inside_a_function(value):
+                    targets.add(value)
+
+        # Alias entries, not candidates.
+        #
+        # Registering these as function starts measurably hurt: Half-Life 2
+        # went from 5,305 constructors to 5,260 and from 1 clobbered
+        # callee-saved register to 13, and the generated code shrank by 70%.
+        # A start inside a gap does not truncate an already-measured body, but
+        # it does stop its neighbour *extending* into that gap on the rebuild,
+        # and plenty of bodies legitimately reach past their first measurement
+        # via an out-of-line tail.
+        #
+        # An alias is the whole point: a callable entry that shares the
+        # enclosing extent, built after every boundary is fixed, so it cannot
+        # clamp anyone. Exactly what the tail-jump pass does for the same shape.
+        section_end = {}
+        for sec in sections:
+            section_end[sec.name] = sec.virtual_addr + sec.virtual_size
+
+        found = 0
+        for target in sorted(targets):
+            if target in self.functions or target in self._alias_entries:
+                continue
+            if not self.engine.probes_as_returning_body(target):
+                continue
+            if target not in self.engine.instructions:
+                if not self.engine.decode_at(target):
+                    continue
+            i = bisect.bisect_right(starts, target)
+            sec = self.image.get_section_at_va(target)
+            end = starts[i] if i < len(starts) else section_end.get(
+                sec.name if sec else "", target + 4)
+            self._alias_entries[target] = end
+            found += 1
+
+        if found:
+            print(f"  {found} function address(es) found in data tables")
+        return found > 0
 
     def _pass_cond_branch_orphans(self, bodies, starts) -> bool:
         """
