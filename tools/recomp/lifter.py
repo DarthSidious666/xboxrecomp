@@ -980,6 +980,15 @@ class Lifter:
             return [f"/* bt {insn.op_str} */"]
         if m == "emms":
             return ["/* emms - empty MMX state */"]
+        if m in ("xlat", "xlatb"):
+            # AL indexes the byte table at EBX. With an address-size override,
+            # the effective offset is calculated and wrapped at 16 bits.
+            raw_bytes = bytes.fromhex(insn.bytes_hex)
+            if 0x67 in raw_bytes[:-1]:
+                address = "(uint16_t)(LO16(ebx) + LO8(eax))"
+            else:
+                address = "ebx + LO8(eax)"
+            return [f"SET_LO8(eax, MEM8({address})); /* xlatb */"]
         if m in ("sete", "setne", "setb", "setae", "setbe", "seta",
                  "setl", "setge", "setle", "setg", "sets", "setns"):
             return self._lift_setcc(insn, ops, m)
