@@ -3216,6 +3216,28 @@ static int g_slot_arg_bytes[XBOX_KERNEL_THUNK_TABLE_SIZE];
 /* Xbox VA to sample around each bridge call; 0 = off. See dispatch. */
 uint32_t g_kernel_watch_va = 0;
 
+/* Arm the watch from the environment.
+ *
+ * The facility existed but nothing set it, so it was unreachable.
+ * RECOMP_KERNEL_WATCH=<guest addr> samples that dword either side of every
+ * bridge call and names the ordinal that changed it -- which is the one fact
+ * a hardware watchpoint cannot give, because a bridge corrupting Xbox memory
+ * faults inside ntdll with no recompiled frame to blame.
+ *
+ * A change seen between the previous call's "after" and this call's "before"
+ * is guest code, not a bridge, which is just as useful to know. */
+static void kernel_watch_arm_once(void)
+{
+    static int done;
+    const char *env;
+    if (done)
+        return;
+    done = 1;
+    env = getenv("RECOMP_KERNEL_WATCH");
+    if (env)
+        g_kernel_watch_va = (uint32_t)strtoul(env, NULL, 0);
+}
+
 /* Current dispatching slot */
 static int g_kernel_dispatch_slot = -1;
 
@@ -3277,6 +3299,7 @@ static void kernel_thunk_dispatch(void)
      *
      * Set g_kernel_watch_va to arm; zero (the default) costs one compare. */
     uint32_t _watch_before = 0;
+    kernel_watch_arm_once();
     if (g_kernel_watch_va) {
         _watch_before = BRIDGE_MEM32(g_kernel_watch_va);
     }
