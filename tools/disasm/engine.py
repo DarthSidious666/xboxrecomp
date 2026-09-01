@@ -380,6 +380,7 @@ class DisasmEngine:
         if not data:
             return False
 
+        limit = addr + len(data)
         count = 0
         for decoded in self._cs.disasm(data, addr):
             count += 1
@@ -387,7 +388,23 @@ class DisasmEngine:
             if mnemonic in config.RET_MNEMONICS:
                 return True
             if mnemonic in config.JMP_MNEMONICS:
-                return False
+                # An unconditional jump forward, still inside the window being
+                # probed, is ordinary control flow -- MSVC emits it constantly
+                # to skip an else-branch. Only a jump that leaves the window,
+                # or goes backwards, is tail-call shaped and ends the probe.
+                #
+                # Rejecting every jmp cost Half-Life 2 its CreateInterface list
+                # walk (0x00427F80): a clean 90-byte function that happens to
+                # contain one `jmp` over four instructions.
+                try:
+                    ops = decoded.operands
+                except Exception:
+                    return False
+                if not ops or ops[0].type != CS_OP_IMM:
+                    return False
+                target = ops[0].imm & 0xFFFFFFFF
+                if not (decoded.address < target < limit):
+                    return False
             if count >= max_insns:
                 return False
         return False
