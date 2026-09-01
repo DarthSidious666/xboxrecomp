@@ -29,12 +29,14 @@
  * crash occurs, the VEH handler or recomp_icall_fail_log() can dump
  * the last 16 call targets to help you trace what happened.
  *
- * If your recomp_types.h defines these as extern, they must be
- * defined here (or in xbox_memory_layout.c if you use that pattern).
+ * The runtime owns these: xbox_kernel defines them in
+ * src/kernel/xbox_memory_layout.c, and recomp_types.h declares them extern.
+ * Declare, do not define -- defining them here too is a duplicate symbol and
+ * the link fails with LNK2005 on all three.
  */
-volatile uint32_t g_icall_trace[16]  = {0};
-volatile uint32_t g_icall_trace_idx  = 0;
-volatile uint64_t g_icall_count      = 0;
+extern volatile uint32_t g_icall_trace[16];
+extern volatile uint32_t g_icall_trace_idx;
+extern volatile uint64_t g_icall_count;
 
 typedef void (*recomp_func_t)(void);
 
