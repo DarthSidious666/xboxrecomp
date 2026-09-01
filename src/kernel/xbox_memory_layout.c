@@ -589,6 +589,7 @@ int recomp_guest_longjmp(uint32_t buf_va, uint32_t value)
 /* Defined below, after the watchdog. */
 extern volatile uint32_t g_icall_trace[16];
 extern volatile uint32_t g_icall_trace_idx;
+extern volatile uint64_t g_icall_count;
 
 static uint32_t *s_watchdog_esp;
 /* The other guest registers are thread-local too, so the watchdog has to be
@@ -622,6 +623,11 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
      * beyond the return address of the call that entered it. */
     {
         uint32_t k;
+        /* The running indirect-call total separates a hang from mere
+         * slowness. Kernel calls cannot: a pure CPU loop makes none, so
+         * "same count at 20s and 60s" proves nothing about it. */
+        fprintf(stderr, "  icalls so far: %llu\n",
+                (unsigned long long)g_icall_count);
         fprintf(stderr, "  recent ICALL targets:");
         for (k = 0; k < 16; k++)
             fprintf(stderr, " %08X",
