@@ -233,6 +233,13 @@ extern volatile uint64_t g_icall_count;
  */
 void recomp_icall_fail_log(uint32_t va);
 
+/* Report an indirect call whose target is not code (a null or wild
+ * function pointer). Rate-limited per address by the implementation,
+ * because these usually arrive inside a loop -- which is exactly why
+ * they must be reported: silently skipping one turns a diagnosable null
+ * vtable call into an unexplained hang. */
+void recomp_icall_not_code_log(uint32_t va);
+
 /* Indirect-branch target feedback. The ring buffer above is crash forensics --
  * 16 entries, overwritten constantly. This is a durable, deduplicated record of
  * every target the title ever reached, for feeding back into the next codegen
@@ -693,6 +700,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_count++; \
     /* Skip garbage VAs outside code section + kernel thunk range */ \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va); \
         g_esp += 4; eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
@@ -717,6 +725,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_trace_idx++; \
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va); \
         g_esp = (saved_esp); eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
