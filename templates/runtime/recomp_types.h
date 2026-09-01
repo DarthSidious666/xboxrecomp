@@ -677,6 +677,39 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 #endif
 
 /**
+ * RECOMP_ABI_CALL - call a resolved target, optionally checking the ABI.
+ *
+ * ebx, esi and edi are callee-saved on x86, and the recompiler keeps them in
+ * globals rather than on the host's stack. So a lifted function that never
+ * reaches its own epilogue -- the usual cause is a decode that lost sync on
+ * embedded data -- does not merely lose its own state, it silently corrupts
+ * every caller's.
+ *
+ * That failure is invisible at the crash site: the caller carries on with a
+ * wrong loop cursor and simply does less work. Half-Life 2's C++ static
+ * initialiser walks 5,305 constructors with esi as the cursor and edi as the
+ * limit; a single callee returning with those changed ended the walk early and
+ * left Source with no registered interfaces, with no error anywhere.
+ *
+ * Build with -DRECOMP_ABI_CHECK to have every indirect call verify them and
+ * name the first offenders. esp is deliberately not checked: the convention
+ * decides whether the callee pops arguments, so there is no single correct
+ * value.
+ */
+#ifdef RECOMP_ABI_CHECK
+void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+                              uint32_t edi0);
+#define RECOMP_ABI_CALL(va, fn) do { \
+    uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi; \
+    (fn)(); \
+    if (g_ebx != _ab || g_esi != _as || g_edi != _ad) \
+        recomp_abi_violation_log((va), _ab, _as, _ad); \
+} while(0)
+#else
+#define RECOMP_ABI_CALL(va, fn) (fn)()
+#endif
+
+/**
  * RECOMP_ICALL - Indirect call through the dispatch table.
  *
  * Looks up the Xbox VA and calls the translated function.
@@ -706,7 +739,8 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
-    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); _fn(); } \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
@@ -731,7 +765,8 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
-    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); _fn(); } \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
@@ -748,7 +783,8 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
-    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); _fn(); } \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)

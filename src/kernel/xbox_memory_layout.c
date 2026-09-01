@@ -501,6 +501,43 @@ uint32_t g_xbox_code_hi = 0;
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 
+#ifdef RECOMP_ABI_CHECK
+/* Report a lifted function that returned without restoring ebx/esi/edi.
+ *
+ * Those are callee-saved on x86, and the recompiler keeps them in globals, so
+ * a function whose epilogue was never lifted corrupts its caller rather than
+ * itself -- an error with no crash and no message, just less work silently
+ * done. Ranked by hit count so the routine breaking a hot loop stands out from
+ * the one-offs; -DRECOMP_ABI_CHECK only, since it costs three compares on
+ * every indirect call.
+ */
+void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+                              uint32_t edi0)
+{
+    enum { SLOTS = 32 };
+    static uint32_t seen[SLOTS];
+    static uint64_t hits[SLOTS];
+    static int count;
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (seen[i] == va)
+            break;
+    if (i == count) {
+        if (count == SLOTS)
+            return;
+        seen[count] = va;
+        hits[count] = 0;
+        count++;
+        fprintf(stderr, "[ABI] sub_%08X clobbers callee-saved registers:"
+                        " ebx %08X->%08X  esi %08X->%08X  edi %08X->%08X\n",
+                va, ebx0, g_ebx, esi0, g_esi, edi0, g_edi);
+        fflush(stderr);
+    }
+    hits[i]++;
+}
+#endif
+
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
 RECOMP_TLS uint32_t g_seh_ebp = 0;
 RECOMP_TLS double g_fp_stack[8];
