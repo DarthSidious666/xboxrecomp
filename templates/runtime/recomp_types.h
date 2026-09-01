@@ -694,9 +694,15 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * Build with -DRECOMP_ABI_CHECK to have every indirect call verify them and
  * name the first offenders. esp is deliberately not checked: the convention
  * decides whether the callee pops arguments, so there is no single correct
- * value.
+ * value -- but there is one invariant that holds under every convention:
+ * the callee at least pops its own return address, so esp must come back
+ * at least 4 higher than it went in. Coming back lower means the epilogue
+ * never ran, which is the failure this exists to catch.
  *
- * Scope, because it is easy to over-read: this covers *indirect* calls only.
+ * Covers direct calls as well as indirect: tools/recomp emits every direct
+ * call through this macro, which expands to a plain call when the flag is
+ * off. That matters because CRT and static-initialiser paths -- where these
+ * clobbers actually bite -- are almost entirely direct calls.
  * Generated code emits a direct call as a plain C call to the symbol, with no
  * macro to hook, so a direct callee that clobbers these registers is invisible
  * here. That matters more than it sounds -- CRT and static-initialiser paths
@@ -706,12 +712,12 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  */
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
-                              uint32_t edi0);
+                              uint32_t edi0, uint32_t esp0);
 #define RECOMP_ABI_CALL(va, fn) do { \
-    uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi; \
+    uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
     (fn)(); \
-    if (g_ebx != _ab || g_esi != _as || g_edi != _ad) \
-        recomp_abi_violation_log((va), _ab, _as, _ad); \
+    if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
+        recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
 } while(0)
 #else
 #define RECOMP_ABI_CALL(va, fn) (fn)()

@@ -512,7 +512,7 @@ RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
  * every indirect call.
  */
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
-                              uint32_t edi0)
+                              uint32_t edi0, uint32_t esp0)
 {
     enum { SLOTS = 32 };
     static uint32_t seen[SLOTS];
@@ -529,9 +529,15 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
         seen[count] = va;
         hits[count] = 0;
         count++;
-        fprintf(stderr, "[ABI] sub_%08X clobbers callee-saved registers:"
-                        " ebx %08X->%08X  esi %08X->%08X  edi %08X->%08X\n",
-                va, ebx0, g_ebx, esi0, g_esi, edi0, g_edi);
+        fprintf(stderr, "[ABI] sub_%08X:%s%s%s%s\n"
+                        "      ebx %08X->%08X esi %08X->%08X"
+                        " edi %08X->%08X esp %08X->%08X\n",
+                va,
+                g_ebx != ebx0 ? " ebx" : "",
+                g_esi != esi0 ? " esi" : "",
+                g_edi != edi0 ? " edi" : "",
+                g_esp < esp0 + 4 ? " esp(epilogue never ran)" : "",
+                ebx0, g_ebx, esi0, g_esi, edi0, g_edi, esp0, g_esp);
         fflush(stderr);
     }
     hits[i]++;

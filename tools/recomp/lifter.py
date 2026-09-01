@@ -1607,8 +1607,15 @@ class Lifter:
                     f" {{ PUSH32(esp, 0x{ret_va:08X}u); {name}(); }}"
                     f" /* longjmp 0x{insn.call_target:08X} */")
             else:
+                # Routed through RECOMP_ABI_CALL so -DRECOMP_ABI_CHECK
+                # covers direct calls too. Without this the check sees
+                # only indirect ones, and CRT and static-init paths --
+                # where callee-saved clobbers actually bite -- are almost
+                # entirely direct. Expands to a plain call when the flag
+                # is off, so this costs nothing in a normal build.
                 lines.append(
-                    f"PUSH32(esp, 0x{ret_va:08X}u); {name}(); "
+                    f"PUSH32(esp, 0x{ret_va:08X}u); "
+                    f"RECOMP_ABI_CALL(0x{insn.call_target:08X}u, {name}); "
                     f"/* call 0x{insn.call_target:08X} */")
             # esp immediately after the callee returns. A per-call delta is the
             # only way to attribute a leak to one callee rather than to the

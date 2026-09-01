@@ -298,6 +298,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     printf("Entry point: 0x%08X\n", YOUR_GAME_ENTRY_POINT);
     printf("ESP: 0x%08X\n", g_esp);
 
+    /* Build the flat dispatch table before the guest runs.
+     *
+     * Without this recomp_lookup falls back to a binary search over the
+     * whole function table -- roughly log2(n) branches on *every*
+     * indirect call, which for a 45,000-function C++ title is about 16
+     * every time the game goes through a vtable. Half-Life 2 spent most
+     * of its static initialisation inside recomp_lookup for exactly this
+     * reason, and it read as a hang.
+     *
+     * Optional by design: if the allocation fails the search still works,
+     * so a failure is worth one line and not a fatal error. */
+    if (!recomp_dispatch_init())
+        fprintf(stderr, "[BOOT] flat dispatch unavailable; "
+                        "indirect calls will use the binary search\n");
+
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");
     fflush(stdout);
