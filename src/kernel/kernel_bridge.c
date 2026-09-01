@@ -43,6 +43,7 @@
  * reads as every register being zero. */
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
 extern RECOMP_TLS uint32_t g_seh_ebp;
 extern ptrdiff_t g_xbox_mem_offset;
 
@@ -638,8 +639,44 @@ static void bridge_NtAllocateVirtualMemory(void)
         return;
     }
 
-    /* Allocate from Xbox heap (MEM_RESERVE or MEM_RESERVE|MEM_COMMIT) */
+    /* Allocate from Xbox heap (MEM_RESERVE or MEM_RESERVE|MEM_COMMIT).
+     *
+     * A pure MEM_RESERVE costs no RAM on real hardware -- it takes address
+     * space out of a 4 GB range, not pages out of the 64 MB of memory -- so
+     * titles reserve far more than the console physically has and commit a
+     * fraction of it. Our heap is a bump allocator that commits everything it
+     * hands out, so a large reserve asks for RAM that does not exist.
+     *
+     * Half-Life 2's XBE header sets PeHeapReserve to 128 MB, and its CRT
+     * reserves exactly that during RtlCreateHeap. Failing it returned
+     * STATUS_NO_MEMORY, RtlCreateHeap returned 0, and CRT init aborted before
+     * main -- on a console with 64 MB, asking for 128 MB is normal, not an
+     * error.
+     *
+     * So a reserve that does not fit is clamped to what the heap can actually
+     * back, and the caller is told the real size through the IN/OUT RegionSize
+     * parameter, which is where the API already reports the rounded figure.
+     *
+     * ponytail: the honest fix is a reserve that costs nothing and a commit
+     * that backs pages on demand, which needs the allocator to separate the
+     * two. This clamp is enough for a title that reserves generously and
+     * commits little, and it fails loudly and later rather than silently and
+     * at startup if one does not. */
     uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
+        uint32_t want = size;
+        while (want > 0x10000 && !xbox_va) {
+            want /= 2;
+            xbox_va = xbox_HeapAlloc(want, 4096);
+        }
+        if (xbox_va) {
+            fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: reserve of %u "
+                            "clamped to %u (heap cannot back the full range)\n",
+                    size, want);
+            fflush(stderr);
+            size = want;
+        }
+    }
     if (!xbox_va) {
         g_eax = 0xC0000017u; /* STATUS_NO_MEMORY */
         return;
@@ -656,6 +693,76 @@ static void bridge_NtAllocateVirtualMemory(void)
  * NTSTATUS NtFreeVirtualMemory(PVOID *BaseAddress, PULONG FreeSize,
  *     ULONG FreeType)
  */
+/* -- NtQueryVirtualMemory (ordinal 217, 2 args = 8 bytes) --------------
+ *
+ * Xbox takes two arguments, not NT's four:
+ *
+ *     NTSTATUS NtQueryVirtualMemory(PVOID BaseAddress,
+ *                                   PMEMORY_BASIC_INFORMATION Info);
+ *
+ * This has to be a guest-side answer. The existing xbox_NtQueryVirtualMemory
+ * in kernel_memory.c calls the host VirtualQuery and memcpy's a host
+ * MEMORY_BASIC_INFORMATION into guest memory, whose pointer fields are 64-bit
+ * on an x64 build -- so every field after BaseAddress lands in the wrong place.
+ *
+ * It also has to exist at all. Without a bridge entry the thunk is left
+ * unbridged, and a title's CRT heap creation calls this to probe its heap
+ * region: RtlCreateHeap does
+ *
+ *     call NtQueryVirtualMemory ; test eax,eax ; jl fail
+ *     cmp  mbi.BaseAddress, requested ; jne fail
+ *     cmp  mbi.State, MEM_FREE        ; je  fail
+ *
+ * and returns 0 on any of those. On Half-Life 2 that null heap propagated
+ * silently through the rest of CRT init.
+ *
+ * Guest MEMORY_BASIC_INFORMATION, 32-bit, 28 bytes:
+ *     +0x00 BaseAddress   +0x04 AllocationBase  +0x08 AllocationProtect
+ *     +0x0C RegionSize    +0x10 State           +0x14 Protect
+ *     +0x18 Type
+ *
+ * The guest is one flat committed mapping, so that is what we report: any
+ * address inside it is MEM_COMMIT / PAGE_READWRITE / MEM_PRIVATE, and anything
+ * outside is MEM_FREE rather than an error, which is the honest answer and the
+ * one that lets a caller distinguish the two.
+ */
+static void bridge_NtQueryVirtualMemory(void)
+{
+    uint32_t base_va = STACK_ARG(0);
+    uint32_t info_va = STACK_ARG(1);
+    uint32_t page_base = base_va & ~0xFFFu;
+
+    if (!info_va) {
+        g_eax = 0xC000000Du;               /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+
+    BRIDGE_MEM32(info_va + 0x00) = page_base;          /* BaseAddress */
+    BRIDGE_MEM32(info_va + 0x04) = page_base;          /* AllocationBase */
+    BRIDGE_MEM32(info_va + 0x08) = 0x04;               /* PAGE_READWRITE */
+    BRIDGE_MEM32(info_va + 0x14) = 0x04;               /* Protect */
+    BRIDGE_MEM32(info_va + 0x18) = 0x20000;            /* MEM_PRIVATE */
+
+    if (page_base >= g_xbox_code_lo && page_base < XBOX_TOTAL_RAM) {
+        BRIDGE_MEM32(info_va + 0x0C) = XBOX_TOTAL_RAM - page_base; /* RegionSize */
+        BRIDGE_MEM32(info_va + 0x10) = 0x1000;         /* MEM_COMMIT */
+    } else {
+        BRIDGE_MEM32(info_va + 0x0C) = 0x1000;
+        BRIDGE_MEM32(info_va + 0x10) = 0x10000;        /* MEM_FREE */
+        BRIDGE_MEM32(info_va + 0x08) = 0;
+        BRIDGE_MEM32(info_va + 0x18) = 0;
+    }
+
+    if (KERNEL_LOG_ON()) {
+        fprintf(stderr, "  [KERNEL] NtQueryVirtualMemory: base=0x%08X -> "
+                        "state=0x%X size=%u\n", base_va,
+                        BRIDGE_MEM32(info_va + 0x10),
+                        BRIDGE_MEM32(info_va + 0x0C));
+        fflush(stderr);
+    }
+    g_eax = 0;                                          /* STATUS_SUCCESS */
+}
+
 static void bridge_NtFreeVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);
@@ -2788,7 +2895,8 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 210: return  8;  /* NtQueryFullAttributesFile (2) */
     case 211: return 20;  /* NtQueryInformationFile (5) */
     case 215: return 12;  /* NtQuerySymbolicLinkObject (3) */
-    case 217: return 16;  /* NtQueryVirtualMemory (4) */
+    case 217: return 8;   /* NtQueryVirtualMemory (2) -- Xbox takes
+                             BaseAddress and Info only, not NT's four */
     case 218: return 20;  /* NtQueryVolumeInformationFile (5) */
     case 219: return 32;  /* NtReadFile (8) */
     case 220: return 32;  /* NtReadFileScatter (8) */
@@ -2945,6 +3053,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* Memory - virtual */
     case 184: return bridge_NtAllocateVirtualMemory;
     case 199: return bridge_NtFreeVirtualMemory;
+    case 217: return bridge_NtQueryVirtualMemory;
 
     /* Pool */
     case  14: return bridge_ExAllocatePool;
