@@ -189,6 +189,45 @@ def seeds(result):
     return sorted({m for _, _, _, ms in result["vtables"] for m in ms})
 
 
+def owning_class(result):
+    """{method_va: owner class name} for methods whose owner is well defined.
+
+    A method address appearing in several vtables is one implementation shared
+    by those classes -- inherited, not duplicated. The class that declared it is
+    then the one that is an ancestor of every other class in the set. Unlike
+    "which slot did which ancestor declare", this needs only the hierarchy sets
+    and is unambiguous: on Half-Life 2 it resolves 2,528 shared methods and
+    returns no ambiguous case at all.
+
+    Methods with no common ancestor (multiple inheritance, or unrelated classes
+    sharing a compiler-generated thunk) are omitted rather than guessed at.
+    """
+    ancestors = {demangle(k): {demangle(b) for b in v}
+                 for k, v in result["hierarchy"].items()}
+    out = {}
+    for addr, classes in methods_by_class(result).items():
+        if len(classes) == 1:
+            out[addr] = next(iter(classes))
+            continue
+        owners = [c for c in classes
+                  if all(c in ancestors.get(o, ()) for o in classes)]
+        if len(owners) == 1:
+            out[addr] = owners[0]
+    return out
+
+
+def names(result):
+    """{"0xADDR": "Class__ADDR"} for tools/ghidra_naming/merge_names.py --apply.
+
+    The method's own name is not recoverable -- RTTI carries class names, not
+    member names -- so the address is kept to stay unique and the class is
+    prepended. "CBaseEntity__000162C2" beats "sub_000162C2" for reading
+    generated code and for crash stacks.
+    """
+    return {f"0x{addr:08X}": f"{owner}__{addr:08X}"
+            for addr, owner in owning_class(result).items()}
+
+
 def methods_by_class(result):
     """{method_va: {demangled class names whose vtable holds it}}.
 

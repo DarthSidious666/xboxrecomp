@@ -26,7 +26,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from .rtti import demangle, methods_by_class, recover, seeds
+from .rtti import demangle, methods_by_class, names, owning_class, recover, seeds
 
 
 def main(argv=None):
@@ -37,6 +37,10 @@ def main(argv=None):
     ap.add_argument("--seeds", type=Path,
                     help="also write method addresses as a tools.disasm "
                          "--seed-functions file")
+    ap.add_argument("--names", type=Path,
+                    help="also write {addr: ClassName__ADDR} for "
+                         "tools/ghidra_naming/merge_names.py --apply, so the "
+                         "generated C carries class names instead of sub_*")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -74,6 +78,15 @@ def main(argv=None):
         for name in sorted(classes, key=lambda c: -classes[c]["vtable_slots"])[:10]:
             c = classes[name]
             print(f"    {c['vtable_slots']:>4} slots  {name}")
+
+    if args.names:
+        n = names(r)
+        args.names.parent.mkdir(parents=True, exist_ok=True)
+        args.names.write_text(json.dumps(n, indent=1))
+        print(f"  {len(n)} of {len(methods)} methods have a well-defined "
+              f"owning class -> {args.names}")
+        print("  apply with: tools/ghidra_naming/merge_names.py --apply "
+              "--names-json <that file> --functions-json <functions.json>")
 
     if args.seeds:
         args.seeds.parent.mkdir(parents=True, exist_ok=True)

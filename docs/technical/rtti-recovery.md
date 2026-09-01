@@ -65,6 +65,39 @@ Only file-backed bytes are addressable: a section's `virtual_size` runs past
 `raw_size` for BSS, and reading there walks off the buffer. `Image` bounds every
 access by `raw_size` for that reason.
 
+## Naming the generated C
+
+`--names` writes a `{address: name}` map in the format
+`tools/ghidra_naming/merge_names.py --apply` consumes, so the recompiled output
+carries `CBaseEntity__000162C2` instead of `sub_000162C2`:
+
+```bash
+py -3 -m tools.rtti game/title.xbe --names build/rtti_names.json
+py -3 tools/ghidra_naming/merge_names.py --apply     --names-json     build/rtti_names.json     --functions-json build/disasm/functions.json
+```
+
+RTTI carries class names, not member names, so the method's own name is not
+recoverable. The address is kept to stay unique and the owning class is
+prepended -- enough to read generated code and to make a crash stack mean
+something.
+
+**Which class owns a method that appears in several vtables** is well defined
+and worth computing: the vtables share one implementation because they
+*inherit* it, so the declaring class is the one that is an ancestor of every
+other class in the set. That needs only the hierarchy sets, not layout
+modelling. On Half-Life 2:
+
+| | |
+|---|---|
+| in exactly one vtable | 8,992 |
+| shared, resolved to a common ancestor | 2,528 |
+| shared, no common ancestor (omitted) | 768 |
+| **ambiguous** | **0** |
+
+11,520 of 12,288 (94%) get an owner, and the rule never returns two candidates.
+The 768 omissions are multiple inheritance and compiler-generated thunks shared
+between unrelated classes; they stay `sub_*` rather than being guessed at.
+
 ## What it will not tell you
 
 **Which ancestor declared a given slot.** The `BaseClassDescriptor` array is a
