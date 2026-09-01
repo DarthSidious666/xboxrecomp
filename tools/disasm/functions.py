@@ -536,6 +536,75 @@ class FunctionDetector:
                                 "tail_jump_target")
             added = True
 
+        added = self._pass_cond_branch_orphans(bodies, starts) or added
+        return added
+
+    def _pass_cond_branch_orphans(self, bodies, starts) -> bool:
+        """
+        A conditional branch out of its function into unclaimed bytes.
+
+        The pass above excludes jcc for a good reason -- a jcc target past the
+        end of its own function usually means the body was measured short, and
+        registering a function start there splits it instead of extending it.
+        But the code still has to exist somewhere, and when it does not, the
+        branch is lifted as a call to a stub that pops a return address and
+        returns.
+
+        That is not a small loss. MSVC parks an out-of-line block of realloc
+        (sub_005B2C88) at 0x005B2D38 and reaches it with `jne`. Half-Life 2's
+        realloc was truncated at 0x005B2D2A because a helper at 0x005B2D2F is
+        separately called, so the block became orphaned and the branch went to
+        a stub -- meaning the *common* path of realloc never ran its SEH
+        epilogue. esp came back unrestored and ebx/esi/edi were never popped,
+        so every CUtlMemory::Grow got a garbage buffer and every growable
+        container in the game was quietly corrupt.
+
+        Registering an alias rather than a candidate is what makes this safe:
+        aliases are built after the bodies are measured, so they cannot clamp
+        anyone's end, which is precisely the failure the jcc exclusion was
+        protecting against. The target must also land in a gap -- inside
+        another function is the alias case the pass above already handles --
+        and must decode to a ret, so a mis-measured body's interior does not
+        qualify on the strength of one branch.
+        """
+        added = False
+        for insn in self.engine.instructions.values():
+            if not insn.is_cond_jump:
+                continue
+            target = insn.jump_target
+            if target is None or target in self._alias_entries:
+                continue
+            if target in self._candidates or target in self.functions:
+                continue
+
+            i = bisect.bisect_right(starts, insn.address) - 1
+            if i < 0:
+                continue
+            body_start, body_end = bodies[i]
+            if insn.address >= body_end:
+                continue                    # not inside any known function
+            if body_start <= target < body_end:
+                continue                    # ordinary intra-function branch
+
+            j = bisect.bisect_right(starts, target) - 1
+            if j >= 0 and bodies[j][0] <= target < bodies[j][1]:
+                continue                    # inside a function: handled above
+
+            section = self.image.get_section_at_va(target)
+            if section is None or not section.executable:
+                continue
+            if not self.engine.probes_as_returning_body(target, max_insns=256):
+                continue
+
+            # Run to the next known function start, or the section end.
+            k = bisect.bisect_right(starts, target)
+            end = starts[k] if k < len(starts) else (section.virtual_addr
+                                                    + section.virtual_size)
+            self._alias_entries[target] = end
+            added = True
+
+        if added:
+            print("  conditional-branch orphans recovered as alias entries")
         return added
 
     def _build_alias_entries(self) -> None:
