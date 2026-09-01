@@ -695,6 +695,14 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * name the first offenders. esp is deliberately not checked: the convention
  * decides whether the callee pops arguments, so there is no single correct
  * value.
+ *
+ * Scope, because it is easy to over-read: this covers *indirect* calls only.
+ * Generated code emits a direct call as a plain C call to the symbol, with no
+ * macro to hook, so a direct callee that clobbers these registers is invisible
+ * here. That matters more than it sounds -- CRT and static-initialiser paths
+ * are almost entirely direct calls, so this found nothing at all on Half-Life
+ * 2's static init, where the clobber demonstrably exists. It is the right tool
+ * for vtable-dispatch-heavy code and the wrong one for early boot.
  */
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
