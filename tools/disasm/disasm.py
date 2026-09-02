@@ -193,7 +193,29 @@ class Disassembler:
                 # ebx/esi/ebp/edi and a leaked frame -- which drifts esp until
                 # some later `pop esi` lifts a float off the stack and it gets
                 # used as a `this` pointer.
-                if self.engine.instruction_covering(addr) is not None:
+                covering = self.engine.instruction_covering(addr)
+                if covering is not None:
+                    # ...unless the seed decodes as a function prologue, in
+                    # which case the sweep is the one out of phase. It drifts
+                    # whenever it walks zero padding or a data table as
+                    # instructions and runs off the end into real code:
+                    # default.xbe's XPP section decodes 001C950600558D at
+                    # 0x00069533, which swallows the `push ebp` at 0x00069538
+                    # that a tail jump targets. Rejecting that seed left the
+                    # target stubbed, and the stub returned without the
+                    # callee's `ret 8` -- which walked esp off by 4 and moved
+                    # the loader's object pointer out from under its own
+                    # vtable.
+                    #
+                    # A prologue is the evidence that separates the two cases:
+                    # the bad HL2 seed at 0x00202C2E is six bytes into a mov
+                    # and decodes as nothing of the kind.
+                    if self.engine.probes_as_prologue(addr):
+                        if self.engine.decode_at(addr):
+                            realigned += 1
+                            self.func_detector._add_candidate(
+                                addr, 0.95, "seed_vtable_thunk")
+                            continue
                     mid_instruction += 1
                     continue
                 if addr not in self.engine.instructions:

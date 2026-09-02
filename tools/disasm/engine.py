@@ -410,6 +410,60 @@ class DisasmEngine:
                 return False
         return False
 
+    def probes_as_prologue(self, addr: int) -> bool:
+        """
+        Read-only: do the bytes at `addr` start with a recognisable MSVC
+        function prologue?
+
+        Weaker evidence than probes_as_function_body, and deliberately so:
+        this is asked about an address the linear sweep has already claimed as
+        the middle of an instruction, where a full-body probe would have to
+        decide which of two overlapping decodings is real. A prologue is the
+        one shape that does not occur by accident in the middle of another
+        instruction, so it is enough to say the sweep drifted rather than that
+        the address is wrong.
+
+        Recognises what MSVC actually emits at -O2 for the Xbox XDK: the
+        frame-pointer form, the register saves that start a frameless
+        function, the stack adjustment, and the two-byte hot-patch nop.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        if not data:
+            return False
+        offset = addr - section.virtual_addr
+        if offset < 0 or offset >= len(data):
+            return False
+
+        insns = list(self._cs.disasm(data[offset:offset + 16], addr, count=2))
+        if not insns:
+            return False
+
+        first = insns[0]
+        m, ops = first.mnemonic, first.op_str
+
+        if m == "push" and ops == "ebp":
+            # push ebp; mov ebp, esp  -- or lea ebp, [esp-N] for a frame the
+            # callee shifts, which is what default.xbe's XPP code uses.
+            if len(insns) > 1:
+                nxt = insns[1]
+                if nxt.mnemonic == "mov" and nxt.op_str.replace(" ", "") == "ebp,esp":
+                    return True
+                if nxt.mnemonic == "lea" and nxt.op_str.startswith("ebp,"):
+                    return True
+            return False
+
+        if m == "push" and ops in ("esi", "edi", "ebx"):
+            return True
+        if m == "sub" and ops.startswith("esp,"):
+            return True
+        if m == "mov" and ops.replace(" ", "") == "edi,edi":
+            return True   # hot-patch pad
+
+        return False
+
     def probes_as_function_body(self, addr: int,
                                 max_insns: int = 8192) -> bool:
         """
