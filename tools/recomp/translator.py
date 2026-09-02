@@ -34,8 +34,32 @@ def _fixup_icall_esp_save(lines):
 
     Scans backwards from each RECOMP_ICALL_SAFE line to find consecutive
     PUSH32 lines (the arg pushes), then inserts a save before the first.
+
+    A push of a callee-saved register can be either the function saving it or
+    an argument that happens to live in it, and the two need telling apart:
+    absorbing a save makes the failure path rewind g_esp over the function's
+    own frame, and the epilogue then pops its registers from too high -- silent
+    caller corruption. Leaving an argument behind is the mirror image, and
+    shifts the epilogue the other way.
+
+    Push and pop counts separate them. A register popped at least as often as
+    it is pushed is restored on every path out, so a push of it is a save and
+    the argument run ends there -- "at least", not "exactly", because a
+    function with several epilogues pops once per return path. A register
+    pushed more often than it is popped has a push nobody restores -- an
+    argument -- and the run absorbs it as before.
+
+    Where that is still ambiguous, stopping early is the safer error: it
+    under-rewinds, which surfaces as the detectable "epilogue never ran" leak,
+    rather than as a caller silently carrying a wrong register.
     """
     import re
+    saves = tuple(
+        "PUSH32(esp, %s)" % reg
+        for reg in ("ebx", "esi", "edi", "ebp")
+        if 0 < sum("PUSH32(esp, %s)" % reg in line for line in lines)
+        <= sum("POP32(esp, %s)" % reg in line for line in lines)
+    )
     result = []
     # Find indices of all ICALL_SAFE lines
     icall_indices = []
@@ -66,6 +90,10 @@ def _fixup_icall_esp_save(lines):
             # *before* the direct call, and an ICALL that then failed rewound
             # g_esp over a call that had already returned.
             if '/* call 0x' in stripped:
+                break
+            # A saved callee-saved register belongs to this function's frame,
+            # not to the call's arguments; the run ends here.
+            if any(stripped.startswith(save) for save in saves):
                 break
             # Check if this is a PUSH32 line (arg push)
             if stripped.startswith('PUSH32(esp,'):

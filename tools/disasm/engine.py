@@ -5,6 +5,7 @@ Provides linear sweep and recursive descent disassembly of x86-32 code,
 with instruction classification and operand analysis.
 """
 
+import bisect
 import struct
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -543,6 +544,32 @@ class DisasmEngine:
         """Build sorted address list if not cached."""
         if self._sorted_addrs is None:
             self._sorted_addrs = sorted(self.instructions.keys())
+
+    def instruction_covering(self, addr: int) -> Optional[Instruction]:
+        """The decoded instruction whose bytes contain `addr` but do not start
+        at it, or None.
+
+        A hit means the sweep already has a coherent decode across this
+        address, so anything claiming a function starts here is claiming an
+        instruction boundary in the middle of an instruction. That is worth
+        distrusting: realigning there splits whatever the address sits in.
+        """
+        self._ensure_sorted_addrs()
+        # Scan back over the longest an x86 instruction can be, rather than
+        # looking only at the nearest preceding start. Overlapping decodes are
+        # allowed here -- decode_at leaves the stream it realigned over in
+        # place -- so `addr` can be a recorded boundary *and* sit inside an
+        # instruction the sweep decoded. Checking one neighbour misses exactly
+        # that case, which is the one worth catching.
+        i = bisect.bisect_left(self._sorted_addrs, addr)
+        j = bisect.bisect_left(self._sorted_addrs, addr - 15)
+        for k in range(i - 1, j - 1, -1):
+            if k < 0:
+                break
+            insn = self.instructions[self._sorted_addrs[k]]
+            if insn.address < addr < insn.address + insn.size:
+                return insn
+        return None
 
     def get_instructions_in_range(self, start: int, end: int) -> List[Instruction]:
         """Get all instructions in address range [start, end), sorted."""

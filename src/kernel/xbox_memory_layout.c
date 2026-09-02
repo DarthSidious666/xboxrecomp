@@ -518,6 +518,9 @@ RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
  * the one-offs; -DRECOMP_ABI_CHECK only, since it costs three compares on
  * every indirect call.
  */
+extern volatile uint32_t g_icall_trace[16];
+extern volatile uint32_t g_icall_trace_idx;
+
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0)
 {
@@ -545,6 +548,19 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                 g_edi != edi0 ? " edi" : "",
                 g_esp < esp0 + 4 ? " esp(epilogue never ran)" : "",
                 ebx0, g_ebx, esi0, g_esi, edi0, g_edi, esp0, g_esp);
+        /* esp coming back too HIGH means some callee popped arguments that
+         * were never pushed -- a convention mismatch the one-sided invariant
+         * above cannot see. The most recent indirect targets are the usual
+         * suspects, so name them. */
+        {
+            int t;
+            fprintf(stderr, "      esp delta %+d, recent icall targets:",
+                    (int)(g_esp - esp0));
+            for (t = 4; t >= 1; t--)
+                fprintf(stderr, " %08X",
+                        g_icall_trace[(g_icall_trace_idx - t) & 15]);
+            fputc('\n', stderr);
+        }
         fflush(stderr);
     }
     hits[i]++;

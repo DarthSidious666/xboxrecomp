@@ -163,6 +163,7 @@ class Disassembler:
         # Add seed functions from vtable scanner or other sources
         if self.seed_functions:
             realigned = 0
+            mid_instruction = 0
             for addr in self.seed_functions:
                 # Decode there first if the sweep stepped over it. A seed is an
                 # explicit claim that a function starts at this address, and it
@@ -174,6 +175,27 @@ class Disassembler:
                 #
                 # Same treatment _pass_call_targets already gives a call target
                 # it has to realign, and for the same reason.
+                # A seed landing *inside* an instruction the sweep already
+                # decoded is not a stream out of phase -- it is a bad seed.
+                # Accepting it manufactures a boundary mid-instruction, and the
+                # new "function" then clamps the end of the real one it sits
+                # in, which loses that function its epilogue.
+                #
+                # Checked before the realign test, not inside it: an earlier
+                # seed's decode_at can already have laid a chain through this
+                # address, which made the address look like a legitimate
+                # boundary and skipped the guard entirely.
+                #
+                # Half-Life 2 has two such slots out of 12,288, and one
+                # (0x00202C2E, six bytes into a 9-byte mov) cut sub_00202BB9
+                # short at 0x00202C31 instead of 0x00202D4F. That function has
+                # 250 callers, and every one got back an unrestored
+                # ebx/esi/ebp/edi and a leaked frame -- which drifts esp until
+                # some later `pop esi` lifts a float off the stack and it gets
+                # used as a `this` pointer.
+                if self.engine.instruction_covering(addr) is not None:
+                    mid_instruction += 1
+                    continue
                 if addr not in self.engine.instructions:
                     if self.engine.decode_at(addr):
                         realigned += 1
@@ -181,6 +203,9 @@ class Disassembler:
             if realigned:
                 print(f"  Realigned {realigned} seeded address(es) the sweep "
                       f"stepped over")
+            if mid_instruction:
+                print(f"  Rejected {mid_instruction} seed(s) landing inside an "
+                      f"already-decoded instruction")
             if self.verbose:
                 print(f"  Seeded {len(self.seed_functions)} function addresses")
 
