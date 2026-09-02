@@ -2981,6 +2981,15 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  85: return 20;  /* IoSynchronousFsdRequest (5) */
     case  86: return  0;  /* IofCallDriver (fastcall: args in ecx/edx) */
     case  87: return  0;  /* IofCompleteRequest (fastcall: args in ecx/edx) */
+    /* Missing this entry cost the Xbox Dashboard its whole boot. Ordinal 91 has
+     * no bridge, so the generic stub ran -- and with no arg count it left the
+     * one pushed argument on the guest stack. The caller (sub_00032859) then
+     * ran `pop edi; pop esi; pop ebx` four bytes low and came back with its
+     * registers rotated, which destroyed the XApp `this` pointer two frames up.
+     * Its scene manager was never created, its scene never loaded, and it
+     * returned to firmware -- reported as nothing more than "returning 0". */
+    case  90: return  4;  /* IoDismountVolume (1) */
+    case  91: return  4;  /* IoDismountVolumeByName (1) */
     case  93: return  8;  /* KeAlertThread (2) */
     case  95: return  4;  /* KeBugCheck (1) */
     case  96: return 20;  /* KeBugCheckEx (5) */
@@ -3511,6 +3520,19 @@ static void kernel_thunk_dispatch(void)
             warned[slot] = 1;
             fprintf(stderr, "  [KERNEL] WARNING: no bridge for ordinal %u (slot %d), returning 0\n",
                     ordinal, slot);
+            /* "Returning 0" is the harmless half. The damaging half is the
+             * stack: the Xbox kernel is stdcall, so the callee owes the caller
+             * its arguments back, and an ordinal missing from
+             * stdcall_args_for_ordinal() returns 0 bytes and leaves them
+             * there. The caller's own `pop`s then run low by that much and it
+             * returns with its callee-saved registers rotated -- silently,
+             * frames away from here. Say so, because a title that dies of this
+             * looks nothing like a title that is missing a kernel function. */
+            if (g_slot_arg_bytes[slot] == 0)
+                fprintf(stderr, "  [KERNEL]   ordinal %u has no entry in "
+                        "stdcall_args_for_ordinal(). If it takes arguments, "
+                        "this call is corrupting the caller's stack -- add its "
+                        "argument size there before anything else.\n", ordinal);
             fflush(stderr);
         }
         g_eax = 0;

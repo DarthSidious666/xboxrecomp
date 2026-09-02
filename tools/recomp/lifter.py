@@ -1064,7 +1064,7 @@ class Lifter:
         if m in ("leave",):
             return ["esp = ebp;", "POP32(esp, ebp); /* leave */"]
         if m in ("cld", "std"):
-            return [f"/* {m} - direction flag */"]
+            return [f"g_df = {0 if m == 'cld' else 1}; /* {m} */"]
         if m == "lahf":
             return ["/* lahf - load AH from flags (used in FPU compare idiom) */"]
         if m == "sahf":
@@ -1872,47 +1872,68 @@ class Lifter:
     # ── String operations ──
 
     def _lift_rep_string(self, insn, m):
+        # Every one of these steps by RECOMP_DF_STEP(size) rather than a
+        # literal, because EFLAGS.DF decides the direction and the block
+        # forms (memcpy/memset) are only valid forwards. See g_df in
+        # recomp_types.h for what a missing direction flag actually costs.
         if "movsb" in m:
-            return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx);",
-                    "esi += ecx; edi += ecx; ecx = 0; /* rep movsb */"]
+            return ["if (!g_df) { memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx);"
+                    " esi += ecx; edi += ecx; }",
+                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM8(edi - _i) = MEM8(esi - _i); esi -= ecx; edi -= ecx; }",
+                    "ecx = 0; /* rep movsb */"]
         if "movsd" in m:
-            return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 4);",
-                    "esi += ecx * 4; edi += ecx * 4; ecx = 0; /* rep movsd */"]
+            return ["if (!g_df) { memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 4);"
+                    " esi += ecx * 4; edi += ecx * 4; }",
+                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM32(edi - _i*4) = MEM32(esi - _i*4); esi -= ecx * 4; edi -= ecx * 4; }",
+                    "ecx = 0; /* rep movsd */"]
         if "movsw" in m:
-            return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 2);",
-                    "esi += ecx * 2; edi += ecx * 2; ecx = 0; /* rep movsw */"]
+            return ["if (!g_df) { memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 2);"
+                    " esi += ecx * 2; edi += ecx * 2; }",
+                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM16(edi - _i*2) = MEM16(esi - _i*2); esi -= ecx * 2; edi -= ecx * 2; }",
+                    "ecx = 0; /* rep movsw */"]
         if "stosb" in m:
-            return ["memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx);",
-                    "edi += ecx; ecx = 0; /* rep stosb */"]
+            return ["if (!g_df) { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
+                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM8(edi - _i) = LO8(eax); edi -= ecx; }",
+                    "ecx = 0; /* rep stosb */"]
         if "stosd" in m:
             return [
-                "{ uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM32(edi + _i*4) = eax; }",
-                "edi += ecx * 4; ecx = 0; /* rep stosd */"
+                "{ uint32_t _i; int32_t _st = RECOMP_DF_STEP(4);"
+                " for (_i = 0; _i < ecx; _i++) MEM32(edi + _i*_st) = eax;"
+                " edi += ecx * _st; }",
+                "ecx = 0; /* rep stosd */"
             ]
         if "stosw" in m:
             return [
-                "{ uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*2) = LO16(eax); }",
-                "edi += ecx * 2; ecx = 0; /* rep stosw */"
+                "{ uint32_t _i; int32_t _st = RECOMP_DF_STEP(2);"
+                " for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*_st) = LO16(eax);"
+                " edi += ecx * _st; }",
+                "ecx = 0; /* rep stosw */"
             ]
         if "cmpsb" in m:
             continue_on_equal = "repne" not in m and "repnz" not in m
             stop_condition = "!_flags" if continue_on_equal else "_flags"
             return [
+                "{ int32_t _st = RECOMP_DF_STEP(1);",
                 "while (ecx != 0) {",
                 "    _flags = (MEM8(esi) == MEM8(edi));",
-                "    esi++; edi++; ecx--;",
+                "    esi += _st; edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
-                f"}} /* {m} */",
+                f"}} }} /* {m} */",
             ]
         if "scasb" in m:
             continue_on_equal = "repne" not in m and "repnz" not in m
             stop_condition = "!_flags" if continue_on_equal else "_flags"
             return [
+                "{ int32_t _st = RECOMP_DF_STEP(1);",
                 "while (ecx != 0) {",
                 "    _flags = (LO8(eax) == MEM8(edi));",
-                "    edi++; ecx--;",
+                "    edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
-                f"}} /* {m} */",
+                f"}} }} /* {m} */",
             ]
         # The word and dword forms, same shape as the byte forms above. They
         # used to be a bare comment: nothing compared, esi/edi never advanced,
@@ -1926,11 +1947,12 @@ class Lifter:
             continue_on_equal = "repne" not in m and "repnz" not in m
             stop_condition = "!_flags" if continue_on_equal else "_flags"
             return [
+                f"{{ int32_t _st = RECOMP_DF_STEP({step});",
                 "while (ecx != 0) {",
                 f"    _flags = ({acc}(esi) == {acc}(edi));",
-                f"    esi += {step}; edi += {step}; ecx--;",
+                "    esi += _st; edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
-                f"}} /* {m} */",
+                f"}} }} /* {m} */",
             ]
         if "scasw" in m or "scasd" in m:
             wide = "scasd" in m
@@ -1939,33 +1961,38 @@ class Lifter:
             continue_on_equal = "repne" not in m and "repnz" not in m
             stop_condition = "!_flags" if continue_on_equal else "_flags"
             return [
+                f"{{ int32_t _st = RECOMP_DF_STEP({step});",
                 "while (ecx != 0) {",
                 f"    _flags = ({value} == {acc}(edi));",
-                f"    edi += {step}; ecx--;",
+                "    edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
-                f"}} /* {m} */",
+                f"}} }} /* {m} */",
             ]
         return [f"/* {m} */"]
 
     def _lift_string_op(self, insn, m):
+        # Unprefixed forms; direction still comes from EFLAGS.DF.
         if m == "movsb":
-            return ["MEM8(edi) = MEM8(esi); esi++; edi++; /* movsb */"]
+            return ["MEM8(edi) = MEM8(esi); esi += RECOMP_DF_STEP(1);"
+                    " edi += RECOMP_DF_STEP(1); /* movsb */"]
         if m == "movsd":
-            return ["MEM32(edi) = MEM32(esi); esi += 4; edi += 4; /* movsd */"]
+            return ["MEM32(edi) = MEM32(esi); esi += RECOMP_DF_STEP(4);"
+                    " edi += RECOMP_DF_STEP(4); /* movsd */"]
         if m == "stosb":
-            return ["MEM8(edi) = LO8(eax); edi++; /* stosb */"]
+            return ["MEM8(edi) = LO8(eax); edi += RECOMP_DF_STEP(1); /* stosb */"]
         if m == "stosd":
-            return ["MEM32(edi) = eax; edi += 4; /* stosd */"]
+            return ["MEM32(edi) = eax; edi += RECOMP_DF_STEP(4); /* stosd */"]
         if m == "lodsb":
-            return ["SET_LO8(eax, MEM8(esi)); esi++; /* lodsb */"]
+            return ["SET_LO8(eax, MEM8(esi)); esi += RECOMP_DF_STEP(1); /* lodsb */"]
         if m == "lodsd":
-            return ["eax = MEM32(esi); esi += 4; /* lodsd */"]
+            return ["eax = MEM32(esi); esi += RECOMP_DF_STEP(4); /* lodsd */"]
         if m == "movsw":
-            return ["MEM16(edi) = MEM16(esi); esi += 2; edi += 2; /* movsw */"]
+            return ["MEM16(edi) = MEM16(esi); esi += RECOMP_DF_STEP(2);"
+                    " edi += RECOMP_DF_STEP(2); /* movsw */"]
         if m == "stosw":
-            return ["MEM16(edi) = LO16(eax); edi += 2; /* stosw */"]
+            return ["MEM16(edi) = LO16(eax); edi += RECOMP_DF_STEP(2); /* stosw */"]
         if m == "lodsw":
-            return ["SET_LO16(eax, MEM16(esi)); esi += 2; /* lodsw */"]
+            return ["SET_LO16(eax, MEM16(esi)); esi += RECOMP_DF_STEP(2); /* lodsw */"]
         return [f"/* {m} */"]
 
     # ── FPU (x87) ──

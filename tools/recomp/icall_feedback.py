@@ -124,6 +124,48 @@ def load_function_starts(path=None):
         return {int(fn["start"], 16) for fn in json.load(f)}
 
 
+def load_function_bodies(path=None):
+    """(start, end) for every known function, or None if there is no database.
+
+    Starts alone cannot answer "would seeding this address truncate something",
+    which is the one question that makes a seed actively harmful rather than
+    merely useless.
+    """
+    path = path or FUNCTIONS_PATH
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        fns = json.load(f)
+    bodies = []
+    for fn in fns:
+        start = int(fn["start"], 16)
+        size = fn.get("size") or 0
+        if size > 0:
+            bodies.append((start, start + size))
+    bodies.sort()
+    return bodies
+
+
+def _interior_of(va, bodies):
+    """The function va sits strictly inside, or None.
+
+    Strictly: an address equal to a function's start is that function, which is
+    the normal case for a target already known. Only an address *between* start
+    and end is the dangerous one.
+    """
+    lo, hi = 0, len(bodies)
+    while lo < hi:                       # rightmost body whose start <= va
+        mid = (lo + hi) // 2
+        if bodies[mid][0] <= va:
+            lo = mid + 1
+        else:
+            hi = mid
+    for start, end in reversed(bodies[max(0, lo - 8):lo]):
+        if start < va < end:
+            return start
+    return None
+
+
 def cmd_merge(args):
     db = load_db(args.db)
     before = dict(db)
@@ -212,15 +254,30 @@ def cmd_seeds(args):
         print("empty or missing database: %s" % args.db, file=sys.stderr)
         return 1
 
-    # Deliberately NOT filtered against the current functions.json. Seeds are an
+    # Known function *starts* are deliberately NOT filtered out. Seeds are an
     # input to the pass that rewrites functions.json from scratch, so dropping
     # "already known" targets is circular: on the next run they are only known
     # *because* they were seeded, and an indirect-only target is one the detector
     # cannot re-derive on its own. A seed file must be a standalone statement of
     # what to seed, idempotent across runs.
+    #
+    # An address strictly *inside* a known body is a different question, and not
+    # circular -- a previously seeded target comes back as a start, never as an
+    # interior address. Seeding one clamps the end of the function containing
+    # it, and that function loses its epilogue: it returns without restoring
+    # ebx/esi/edi or popping its own arguments, and every caller is corrupted
+    # with nothing logged anywhere. That is how the Xbox Dashboard lost
+    # __heap_init. Decoding cleanly does not save it -- an interior address is
+    # by definition mid-function, so it decodes fine.
     probe = _decode_probe(args.xbe)
+    bodies = load_function_bodies(args.functions)
     kept, dropped = {}, []
     for va, flags in sorted(db.items()):
+        if bodies:
+            inside = _interior_of(va, bodies)
+            if inside is not None:
+                dropped.append((va, "inside sub_%08X -- would truncate it" % inside))
+                continue
         if probe is not None:
             if not probe(va):
                 dropped.append((va, "does not decode as a function body"))

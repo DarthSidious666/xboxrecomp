@@ -801,6 +801,15 @@ RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
  * that address their caller's frame through ebp. */
 RECOMP_TLS uint32_t g_ebp = 0;
 
+/* EFLAGS.DF. Zero means the string instructions walk forwards, which is the
+ * ABI's resting state and what almost every one of them does -- so this is
+ * almost always 0 and costs a predictable branch. The exceptions are the ones
+ * that matter: MSVC's strrchr/wcsrchr scan backwards from the terminator with
+ * `std; repne scasb`, and memmove goes backwards when its regions overlap the
+ * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
+ * in different lifted bodies of the same guest routine. */
+RECOMP_TLS int g_df = 0;
+
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
