@@ -27,6 +27,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "recomp_icall_feedback.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -925,6 +926,13 @@ static void bridge_HalReturnToFirmware(void)
     fprintf(stderr, "  [KERNEL] HalReturnToFirmware: routine=%u - title is exiting\n",
             routine);
     fflush(stderr);
+
+    /* Write the indirect-branch targets before the process goes away. This
+     * path ends in ExitProcess, which does not run atexit handlers, so the
+     * host's registered dump never fires -- and a title that gives up during
+     * boot is exactly the one whose targets are worth having. No-op unless
+     * RECOMP_ICALL_FEEDBACK is on. */
+    RECOMP_ICALL_FEEDBACK_DUMP();
 
     /* Let a host-played FMV finish before the process goes away.
      *

@@ -163,8 +163,7 @@ void recomp_icall_not_code_log(uint32_t va)
             return;
     }
     fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped %llu time(s) "
-                    "(null or wild function pointer, at call #%llu)
-",
+                    "(null or wild function pointer, at call #%llu)\n",
             va, (unsigned long long)hits[i],
             (unsigned long long)g_icall_count);
     fflush(stderr);

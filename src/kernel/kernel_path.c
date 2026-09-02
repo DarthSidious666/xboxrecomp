@@ -52,6 +52,15 @@ static const path_rule s_rules[] = {
      *
      * No trailing separator: the probe opens the device itself, with nothing
      * after it. Listed after Partition1 so that keeps its own mapping. */
+    /* Partition2 is C:, the system partition. On a console that is where the
+     * dashboard and its own assets live, and the dashboard opens them by
+     * device path as well as through Y:, so a path *under* partition2 is an
+     * ordinary asset read and belongs in the game dir -- the same place Y:
+     * already goes. Only the bare device keeps the system-data image, which
+     * is why this rule carries the trailing separator and is listed first. */
+    { "\\Device\\Harddisk0\\Partition2\\",    0, NULL,         NULL          },
+    { "C:\\",                                 0, NULL,         NULL          },
+    { "\\??\\C:\\",                           0, NULL,         NULL          },
     { "\\Device\\Harddisk0\\Partition2",     1, "\\SystemData", "/SystemData" },
     { "\\Device\\Harddisk0\\Partition3",     1, "\\Cache",   "/Cache"      },
     { "\\Device\\Harddisk0\\Partition4",     1, "\\Cache",   "/Cache"      },
