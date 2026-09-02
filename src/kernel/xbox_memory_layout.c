@@ -64,6 +64,7 @@ static HANDLE g_mapping_handle = NULL;
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
 static void *g_tiled_view = NULL;
+
 /* Contiguous / physical memory window (see MemoryLayoutInit).
  * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
  * the same numbers for MmClaimGpuInstanceMemory. */
@@ -79,6 +80,26 @@ static void *g_nv2a_memory = NULL;
 #define XBOX_MCPX_BASE 0xFE800000u
 #define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
 static void *g_mcpx_memory = NULL;
+/* How much of the tiled aperture can exist.
+ *
+ * Two ceilings, both below the mapped RAM size once that is large:
+ *
+ *   - it starts at 0xF0000000 in a 32-bit guest address space, so it can
+ *     never reach past 0x100000000; and
+ *   - the NV2A register aperture sits at 0xFD000000, which is where the
+ *     window really ends on hardware.
+ *
+ * Asking for the full RAM size overlapped both and MapViewOfFileEx failed
+ * with ERROR_INVALID_ADDRESS -- a warning at startup and then a fault on the
+ * title's first surface write, with nothing connecting the two. */
+static size_t xbox_TiledApertureSize(void)
+{
+    uint64_t end = XBOX_NV2A_BASE < 0x100000000ULL
+                 ? XBOX_NV2A_BASE : 0x100000000ULL;
+    size_t max = (size_t)(end - XBOX_TILED_BASE);
+    return g_memory_size < max ? g_memory_size : max;
+}
+
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
 
@@ -234,8 +255,18 @@ static int fence_readable(uint32_t va, uint32_t bytes)
      * just "not null": the device pointer is zero until the title creates the
      * device, and this thread polls from before that. Rejecting only 0 let
      * dev + get_ptr_off through as 0x34 and faulted on the very first tick. */
-    return g_memory_base != NULL && va >= XBOX_FS_BASE
-        && (size_t)va + bytes <= g_memory_size;
+    if (g_memory_base == NULL || va < XBOX_FS_BASE)
+        return 0;
+    /* The contiguous window is mapped separately and sits far above the main
+     * range, so a size check against g_memory_size rejects it. The fence a
+     * title waits on is exactly the kind of block that lives there --
+     * MmAllocateContiguousMemory is where a GPU-written semaphore comes
+     * from -- so a chain ending in that window has to be followed, not
+     * discarded. */
+    if (va >= XBOX_CONTIG_BASE
+            && (uint64_t)va + bytes <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return g_contig_memory != NULL;
+    return (size_t)va + bytes <= g_memory_size;
 }
 
 /*
@@ -1447,9 +1478,32 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         int mirrors_ok = 0;
+        /* The tiled aperture is a specific architectural alias -- physical RAM
+         * a second time at 0xF0000000, which is where titles render -- while
+         * these mirrors are a generic emulation of the address wrap. When the
+         * mapped size is large enough that a mirror would cover 0xF0000000,
+         * the mirror wins the address and the tiled mapping fails with
+         * ERROR_INVALID_ADDRESS; Half-Life 2 then faults on its first surface
+         * write. The specific alias is worth more than one wrap mirror, so
+         * skip any that would overlap it.
+         *
+         * Guest addresses, not host: mirror m covers guest
+         * (m + 1) * g_memory_size. */
+        uint64_t tiled_lo = XBOX_TILED_BASE;
+        uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
+
         for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
             uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                     (uintptr_t)(m + 1) * g_memory_size;
+            uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
+            uint64_t guest_hi = guest_lo + g_memory_size;
+
+            if (guest_lo < tiled_hi && tiled_lo < guest_hi) {
+                fprintf(stderr, "  Mirror %d: skipped, overlaps the tiled"
+                                " aperture at 0x%08X\n",
+                        m + 1, (unsigned)XBOX_TILED_BASE);
+                continue;
+            }
             g_mirror_views[m] = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
@@ -1484,11 +1538,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t tiled_native = XBOX_TILED_BASE + g_memory_offset;
+        size_t tiled_size = xbox_TiledApertureSize();
         g_tiled_view = MapViewOfFileEx(
             g_mapping_handle,
             FILE_MAP_ALL_ACCESS,
             0, 0,
-            g_memory_size,
+            tiled_size,
             (LPVOID)tiled_native
         );
         if (g_tiled_view) {
