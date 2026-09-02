@@ -398,6 +398,14 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 void xbox_HeapFree(uint32_t xbox_va);
 
 /**
+ * Bytes remaining in the heap block containing this guest address, or 0 if the
+ * heap never handed it out. Backs MmQueryAllocationSize and
+ * ExQueryPoolBlockSize -- the host cannot answer either, since VirtualQuery on
+ * the translated address describes the whole guest mapping.
+ */
+uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
+
+/**
  * Get the file mapping handle for the Xbox memory region.
  * Used by the VEH handler to map additional mirror views on demand.
  * Returns NULL if file mapping is not available.
@@ -412,6 +420,15 @@ HANDLE xbox_GetMappingHandle(void);
 /* Carve a simulated stack for a spawned thread. Returns the Xbox VA of the
  * stack top, or 0 when the pool is exhausted. */
 uint32_t xbox_AllocThreadStack(void);
+
+/**
+ * Return a worker's stack when the worker ends. Takes the value
+ * xbox_AllocThreadStack returned. Without this the pool counts threads ever
+ * created rather than threads alive, and a title that cycles workers exhausts
+ * it -- after which PsCreateSystemThreadEx runs them inline, which deadlocks
+ * any caller that then waits for the worker it thought it had spawned.
+ */
+void xbox_FreeThreadStack(uint32_t stack_top);
 
 /* Worker stack slices for host-tick-driven titles (see XBOX_WORKER_STACK_* and
  * docs/technical/burnout3-reunification.md). Additive; unused by default-model

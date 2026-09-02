@@ -454,8 +454,23 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     extern void nv2a_pb_scan_report(void);
                     static DWORD last_report;
 
+                    /* DMA_PUT holds a PHYSICAL address -- Xbox D3D writes
+                     * `VA & 0x0FFFFFFF` and reads the GPU's position back as
+                     * `GET | 0x80000000`. nv2a_pb_scan reads guest VAs, so
+                     * handing it the raw register value pointed it at low
+                     * memory: for the Xbox Dashboard, whose pushbuffer is at
+                     * 0x80001000, PUT reads 0x1000 and the survey walked the
+                     * fake TIB. It reported a plausible-looking inventory of
+                     * nothing, which is worse than reporting none -- the
+                     * conclusion drawn was "the title submits no methods"
+                     * while it was submitting them the whole time.
+                     *
+                     * The contiguous window IS the physical-address view, so
+                     * OR-ing its base is the documented round trip, not a
+                     * guess. */
                     if (last_put && put > last_put)
-                        nv2a_pb_scan(last_put, put);
+                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
@@ -1783,6 +1798,29 @@ uint32_t xbox_AllocThreadStack(void)
     return base + XBOX_THREAD_STACK_SIZE - 16;
 }
 
+/* Give a worker's stack back when the worker ends.
+ *
+ * The counter used to only ever go up, so a title that creates and destroys
+ * threads ran the pool dry no matter how few were alive at once. The Xbox
+ * Dashboard spawns one worker per ambient WAV and terminates it before loading
+ * the next; after XBOX_MAX_THREAD_STACKS files the pool was empty and
+ * PsCreateSystemThreadEx fell back to running the worker inline. That fallback
+ * is a deadlock here rather than a slowdown: the worker ran to completion
+ * before the caller reached its wait, so the main thread then waited forever on
+ * events whose only signaller had already finished. It looked like an audio
+ * hang, three layers away from the cause.
+ *
+ * Takes the value AllocThreadStack returned, so callers never do the arithmetic.
+ */
+void xbox_FreeThreadStack(uint32_t stack_top)
+{
+    if (!stack_top)
+        return;
+    xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
+    if (g_thread_stacks_used > 0)
+        g_thread_stacks_used--;
+}
+
 /* Bump allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
  *
  * MmAllocateContiguousMemory hands back physical memory, and on Xbox physical
@@ -1918,6 +1956,35 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     }
 
     return result;
+}
+
+/* How big is the block at this guest address?
+ *
+ * MmQueryAllocationSize and ExQueryPoolBlockSize both ask this, and both used
+ * to answer 0 -- ExQueryPoolBlockSize by returning a literal, and
+ * MmQueryAllocationSize by having no bridge at all. The host cannot answer it:
+ * VirtualQuery on the translated address reports the size of the whole 64 MB
+ * guest mapping, which is a worse answer than none. The block table already
+ * has the real one, and it is the same table xbox_HeapFree matches against.
+ *
+ * Interior addresses count: a title that asks about a pointer it has walked
+ * forward is asking about the block that contains it. Returns 0 for an address
+ * this heap never handed out, which is what "not one of mine" has to look like.
+ */
+uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+{
+    int i;
+
+    if (!xbox_va)
+        return 0;
+    for (i = 0; i < g_heap_block_count; i++) {
+        if (g_heap_blocks[i].free)
+            continue;
+        if (xbox_va >= g_heap_blocks[i].addr &&
+            xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size)
+            return g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
+    }
+    return 0;
 }
 
 void xbox_HeapFree(uint32_t xbox_va)

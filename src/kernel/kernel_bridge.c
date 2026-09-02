@@ -324,6 +324,12 @@ static int g_thread_call_count = 0;
 /* Set on threads this bridge spawned; see PsTerminateSystemThread. */
 static RECOMP_TLS int g_is_spawned_thread = 0;
 
+/* This thread's simulated stack, so both exits can give it back. Thread-local
+ * for the obvious reason, and needed at all because the common exit is
+ * ExitThread from PsTerminateSystemThread -- bridge_thread_main's own return
+ * path is the rare one. */
+static RECOMP_TLS uint32_t g_thread_stack_top = 0;
+
 struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top;
@@ -351,12 +357,17 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     /* Own register set (RECOMP_TLS), own simulated stack. */
     g_is_spawned_thread = 1;
     g_esp = s->stack_top;
+    g_thread_stack_top = s->stack_top;
     free(s);
 
     bridge_run_thread_inline(fn, ctx1, ctx2);
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
+    /* The routine returned instead of calling PsTerminateSystemThread; the
+     * stack is still ours to give back. */
+    xbox_FreeThreadStack(g_thread_stack_top);
+    g_thread_stack_top = 0;
     return 0;
 }
 
@@ -1435,6 +1446,11 @@ static void bridge_PsTerminateSystemThread(void)
      * back to main() is how the process shuts down cleanly.
      */
     if (g_is_spawned_thread) {
+        /* The normal exit for a worker, and therefore the one that has to
+         * return the stack -- ExitThread never comes back to bridge_thread_main
+         * to do it. */
+        xbox_FreeThreadStack(g_thread_stack_top);
+        g_thread_stack_top = 0;
         ExitThread(exit_status);
     }
 }
@@ -1602,11 +1618,11 @@ static void bridge_KeSetTimer(void)
  */
 static void bridge_ExQueryPoolBlockSize(void)
 {
-    uint32_t block = STACK_ARG(0);
-    /* Return a reasonable default size. Actual pool blocks are managed
-     * by the kernel; for recompilation, returning 0 might be OK since
-     * code usually uses this for debugging/stats. */
-    g_eax = 0;
+    /* Pool blocks come from xbox_HeapAlloc, so the block table has the real
+     * answer. It used to return a literal 0 on the theory that this is only
+     * ever used for stats -- which is a guess about the caller, and a title
+     * that sizes a copy from it copies nothing. */
+    g_eax = xbox_HeapBlockSize(STACK_ARG(0));
 }
 
 /* ── RtlNtStatusToDosError (ordinal 301) ─────────────────
@@ -2787,11 +2803,18 @@ static void bridge_MmLockUnlockBufferPages(void)
     g_eax = 0;
 }
 
-/* ── MmQueryAllocationSize (ordinal 180, 1 arg) */
+/* ── MmQueryAllocationSize (ordinal 180, 1 arg)
+ *
+ * Answered from the guest heap's block table, NOT from xbox_MmQueryAllocationSize.
+ * That one calls VirtualQuery, which on a translated guest address reports the
+ * size of the whole 64 MB guest mapping -- a confidently wrong answer where the
+ * title expects the size of the block it allocated. This is the memory-model
+ * check the parked-bridge list below asks for, done: the question is about
+ * guest memory, so only the guest allocator can answer it.
+ */
 static void bridge_MmQueryAllocationSize(void)
 {
-    g_eax = (uint32_t)xbox_MmQueryAllocationSize(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+    g_eax = xbox_HeapBlockSize(STACK_ARG(0));
 }
 
 /* ── NtCreateMutant (ordinal 192, 3 args) */
@@ -2808,6 +2831,33 @@ static void bridge_NtCreateMutant(void)
                              (BOOLEAN)STACK_ARG(2));
     if (st >= 0 && handle_va) bridge_write_handle(handle_va, h);
     g_eax = (uint32_t)st;
+}
+
+/* ── NtReleaseMutant (ordinal 221, 2 args)
+ *
+ * NTSTATUS NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount);
+ *
+ * The partner of NtCreateMutant above, and routing one without the other is a
+ * deadlock generator: the create succeeds, the release silently does nothing,
+ * and the mutex stays held forever by a thread that has already exited.
+ *
+ * That is what the Xbox Dashboard's audio streaming did. Each ambient WAV gets
+ * five events, a worker thread and a mutant; the worker finished, failed to
+ * release, and terminated. The next attempt could not take the mutex, so the
+ * dashboard reopened the same file and spawned another worker with another
+ * 512 KB stack, forever -- visible only as a heap that climbed and a tick that
+ * never returned.
+ *
+ * Memory model: a handle token in, an optional 4-byte LONG out through a guest
+ * address. Nothing allocates, frees, or hands back a host pointer.
+ */
+static void bridge_NtReleaseMutant(void)
+{
+    uint32_t count_va = STACK_ARG(1);
+
+    g_eax = (uint32_t)xbox_NtReleaseMutant(
+        bridge_resolve_handle(STACK_ARG(0)),
+        count_va ? (PLONG)XBOX_TO_NATIVE(count_va) : NULL);
 }
 
 /* -- NtSuspendThread (ordinal 231, 2 args) --------------------------------
@@ -3369,8 +3419,23 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * unattributable. */
     case 151: return bridge_KeStallExecutionProcessor;
     case 175: return bridge_MmLockUnlockBufferPages;
-    /* case 180: bridge_MmQueryAllocationSize */
-    /* case 192: bridge_NtCreateMutant */
+    /* Routed, both checked against the memory-model bar above.
+     *
+     * MmQueryAllocationSize now answers from the guest heap's block table
+     * instead of the host's VirtualQuery, so nothing crosses the two worlds.
+     *
+     * NtCreateMutant creates a host mutex and hands it back through
+     * bridge_write_handle, which is a guest token -- the same shape as
+     * NtCreateEvent, which has been routed all along. It allocates no guest
+     * memory and returns no host pointer.
+     *
+     * The Xbox Dashboard needs the mutant: its audio thread creates one during
+     * the first tick, and unbridged the call returned STATUS_SUCCESS without
+     * writing a handle, so the main thread waited on five events that nothing
+     * would ever signal. */
+    case 180: return bridge_MmQueryAllocationSize;
+    case 192: return bridge_NtCreateMutant;
+    case 221: return bridge_NtReleaseMutant;
     /* Routed. Checked against the memory-model warning above rather than
      * assumed mechanical: NtResumeThread takes a handle token and writes a
      * 4-byte suspend count through an optional out-parameter. Guest ULONG and
@@ -3387,10 +3452,19 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* case 250: bridge_ObfDereferenceObject */
     /* case 252: bridge_PhyGetLinkState */
     /* case 253: bridge_PhyInitialize */
-    /* case 335: bridge_XcSHAInit */
-    /* case 336: bridge_XcSHAUpdate */
-    /* case 337: bridge_XcSHAFinal */
-    /* case 340: bridge_XcHMAC */
+    /* Routed. The memory-model note above already names this group as the
+     * safe kind: each one reads or writes bytes at an address the caller
+     * supplied, and none allocates, frees, or hands back a host pointer.
+     *
+     * Unbridged they returned 0 without hashing anything, which is invisible
+     * until something checks a digest. The Xbox Dashboard verifies each XIP
+     * archive it loads against a 20-byte digest in its own table
+     * (sub_00034924) and calls HalReturnToFirmware(4) when the compare fails
+     * -- so a no-op SHA does not corrupt anything, it reboots the console. */
+    case 335: return bridge_XcSHAInit;
+    case 336: return bridge_XcSHAUpdate;
+    case 337: return bridge_XcSHAFinal;
+    case 340: return bridge_XcHMAC;
     /* case 346: bridge_XcDESKeyParity */
 
     default:  return NULL;
