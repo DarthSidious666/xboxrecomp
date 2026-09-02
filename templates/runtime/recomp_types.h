@@ -746,14 +746,14 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  * The caller must PUSH32 the guest return address before this macro.
  * If not found, pops it back off to keep the stack balanced.
  *
- * RECOMP_ICALL_IS_CODE skips garbage VAs that
- * come from uninitialized vtable pointers. Adjust this range based
- * on your game's .text section boundaries. Kernel thunks at
- * 0xFE000000+ must NOT be blocked.
+ * RECOMP_ICALL_IS_CODE skips garbage VAs that come from uninitialized vtable
+ * pointers. Kernel thunks at 0xFE000000+ are never blocked.
  *
- * CUSTOMIZE: Change the VA range check to match your game's code range.
- * Your .text section typically spans 0x00010000 to ~0x003XXXXX.
- * Any VA outside .text and below 0xFE000000 is likely garbage.
+ * Nothing to customize: the range comes from g_xbox_code_lo/g_xbox_code_hi,
+ * which the memory layout fills in from the sections it actually mapped. This
+ * used to say "change the VA range check to match your game's code range",
+ * left over from a hardcoded 0x00400000 cutoff that was only ever right for
+ * one title. Editing this header per project is no longer a thing.
  */
 #define RECOMP_ICALL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \

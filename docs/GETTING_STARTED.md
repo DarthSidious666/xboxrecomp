@@ -103,6 +103,48 @@ This classifies functions into categories:
 - **GAME** — Game-specific code — your main focus
 - **STUB** — Empty/trivial functions — safe to ignore
 
+## Step 4.5 (optional): Recover real names with Ghidra
+
+Everything is `sub_0004F8B5` by default, and reading a 500,000-line call graph
+of those is the slow part of every bring-up. If you have Ghidra, its Function ID
+databases recognise the statically linked MSVC CRT and XDK helpers and give a
+few hundred of them their real names — `malloc`, `_ftol`, `__SEH_prolog`,
+`memcpy`, the 64-bit math helpers. Those are exactly the functions you would
+otherwise waste a day identifying by hand.
+
+Do it **before** Step 5. The recompiler reads the `name` field out of
+`functions.json` and emits it as the C function name, so names applied now show
+up in the generated code, in crash traces, and in `RECOMP_ABI_CHECK` reports.
+
+```bash
+# Analyse the XBE headless and export what Ghidra found
+XBE=game_files/default.xbe tools/ghidra_naming/run_ghidra.sh
+
+# Turn the export into a clean {address: name} map, and write the names into
+# functions.json. Without --apply it only reports what it would do.
+py -3 tools/ghidra_naming/merge_names.py --apply
+```
+
+Only meaningful names survive the merge — Ghidra's own `FUN_*`/`LAB_*`/`DAT_*`
+placeholders are dropped, names are sanitised to valid C identifiers, and
+collisions get the address appended.
+
+Expect a few hundred names, not thousands: proprietary game code has no
+signatures to match, so it keeps `sub_`. On the Xbox Dashboard this recovered
+133 CRT/XDK names including the LZX and XIP decompressors, which is what made
+the asset loader legible at all.
+
+Ghidra 12.x has no XBE loader, so the pipeline flattens the XBE into a raw
+image at the right base address first — that is why the addresses line up with
+`functions.json` exactly. Set `GHIDRA_HOME` if yours is not at
+`/c/tools/ghidra/ghidra_12.0.3_PUBLIC`. Full detail, including optional
+decompilation and why function seeding is off by default, is in
+[tools/ghidra_naming/README.md](../tools/ghidra_naming/README.md).
+
+Re-run Step 3 after this and the names are lost — `tools.disasm` rewrites
+`functions.json` from scratch. Re-apply with `merge_names.py --apply`; the
+Ghidra export is cached, so it takes seconds.
+
 ## Step 5: Recompile
 
 Steps 2-5 all run from inside the `xboxrecomp` clone (that's where `tools/` lives).
@@ -143,8 +185,18 @@ my_xbox_game/
 +-- src/
     +-- main.c              # Host entry: loads XBE, inits kernel, calls the guest
     +-- recomp_manual.c     # Your hand-written function overrides
-    +-- recomp/gen/         # Generated code from Step 5
+    +-- recomp/gen/         # Generated code from Step 5, including:
+        +-- recomp_funcs.h     #   declarations for every lifted function
+        +-- recomp_types.h     #   the runtime register model, MEM/ICALL macros
+        +-- recomp_0000.c ...  #   the code itself
 ```
+
+`recomp_types.h` is written there by Step 5, not something you supply. It used
+to live only in `templates/runtime/`, and the first sign of that was
+`error C1083: Cannot open include file: 'recomp_types.h'` at build time. If you
+see that error, Step 5 did not complete — check its output for the
+`wrote .../recomp_types.h` line. The pipeline never overwrites an existing copy,
+so an edited one survives regeneration; delete it to get the current one back.
 
 **1. `CMakeLists.txt`** — set the project name and the path to your toolkit clone:
 

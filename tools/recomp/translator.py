@@ -1327,6 +1327,37 @@ class BatchTranslator:
         with open(header_path, "w", encoding="utf-8") as f:
             f.write("\n".join(header_lines))
 
+        # recomp_types.h goes with it.
+        #
+        # recomp_funcs.h includes it, and a quoted include searches the
+        # including file's own directory first, so putting it here is all it
+        # takes for the generated code to compile. It used to live only in
+        # templates/runtime/, which every new project discovered the same way:
+        # `error C1083: Cannot open include file: 'recomp_types.h'`, then a hunt
+        # through the tree. It is the runtime's register model, not something a
+        # project writes, so the pipeline should hand it over like everything
+        # else it generates.
+        #
+        # Never overwritten. A project that has edited this copy keeps its
+        # edits across a regen, which is the opposite of how the .c files
+        # behave -- but this is a header a project may reasonably touch, and
+        # silently reverting someone's change on every regen is worse than
+        # letting a stale one persist. Delete it to get the current one back.
+        types_dst = os.path.join(output_dir, "recomp_types.h")
+        if not os.path.exists(types_dst):
+            types_src = os.path.join(os.path.dirname(__file__), "..", "..",
+                                     "templates", "runtime", "recomp_types.h")
+            try:
+                with open(types_src, "r", encoding="utf-8") as src:
+                    with open(types_dst, "w", encoding="utf-8") as dst:
+                        dst.write(src.read())
+                print(f"  wrote {types_dst} (runtime register model)",
+                      file=sys.stderr)
+            except OSError as e:
+                print(f"  WARNING: could not write recomp_types.h ({e}); copy "
+                      f"it from templates/runtime/ by hand or the build will "
+                      f"not find it", file=sys.stderr)
+
         # Split translations into chunks and write .c files
         generated_files = [header_path]
         chunks = [translations[i:i+chunk_size]
