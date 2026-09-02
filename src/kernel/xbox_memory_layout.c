@@ -1681,6 +1681,8 @@ static int g_heap_block_count = 0;
  * whole 8 MB is gone. Xbox VAs, not host memory: recompiled code addresses its
  * stack through MEM32() like any other Xbox pointer.
  */
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
+
 #define XBOX_THREAD_STACK_SIZE  (512 * 1024)
 #define XBOX_MAX_THREAD_STACKS  8
 
@@ -1693,12 +1695,69 @@ uint32_t xbox_AllocThreadStack(void)
     if (g_thread_stacks_used >= XBOX_MAX_THREAD_STACKS) {
         return 0;
     }
-    base = XBOX_STACK_BASE +
-           (uint32_t)g_thread_stacks_used * XBOX_THREAD_STACK_SIZE;
+
+    /* From the heap, not from XBOX_STACK_BASE.
+     *
+     * The stack region begins at 0x00780000, which is fine only while the
+     * title's image ends below that. Half-Life 2's image runs to 0x009B68C0,
+     * so the first thread stack (0x00780000..0x00800000) landed inside its
+     * .rdata and .data: the worker spawned during engine init wrote its
+     * frames over the game's own static data. Nothing faults -- the pages are
+     * mapped and writable -- so it shows up later as globals that were
+     * correct when written and wrong when read.
+     *
+     * The heap already starts above the image and knows how big it is, so
+     * taking slices from it is correct for any image size instead of only
+     * for small ones.
+     */
+    base = xbox_HeapAlloc(XBOX_THREAD_STACK_SIZE, 4096);
+    if (!base)
+        return 0;
     g_thread_stacks_used++;
 
     /* Top of the slice, 16-byte aligned, growing down. */
     return base + XBOX_THREAD_STACK_SIZE - 16;
+}
+
+/* Bump allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
+ *
+ * MmAllocateContiguousMemory hands back physical memory, and on Xbox physical
+ * page P is visible at 0x80000000 + P. Drivers rely on that being an exact
+ * round trip: Xbox D3D writes its pushbuffer position to the NV2A as
+ * `VA & 0x0FFFFFFF` and reads the GPU's position back as `GET | 0x80000000`,
+ * then compares the two. That holds for any address in this window and for
+ * nothing in the general heap, whose position depends on what the title
+ * reserved first -- Half-Life 2 reserves 128 MB and then 200 MB before D3D
+ * allocates its pushbuffer, which put the buffer at 0x15782000 and left the
+ * engine comparing 0x857844C0 against it forever.
+ *
+ * Grows up from the base; XBOX_GPU_INSTANCE_DEFAULT is carved off the top by
+ * the GPU-instance bridge, so the two do not meet until the window is full.
+ * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
+ * title allocates once. */
+static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+
+uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t result;
+
+    if (alignment < 4096) alignment = 4096;
+    result = (g_contig_next + alignment - 1) & ~(alignment - 1);
+
+    /* Leave the top of the window for GPU instance memory. */
+    if ((uint64_t)result + size >
+            (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
+                - XBOX_GPU_INSTANCE_DEFAULT) {
+        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
+                size, g_contig_next - XBOX_CONTIG_BASE,
+                (unsigned)XBOX_CONTIG_SIZE);
+        fflush(stderr);
+        return 0;
+    }
+
+    g_contig_next = result + size;
+    memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    return result;
 }
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)

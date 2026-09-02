@@ -513,8 +513,11 @@ static void bridge_MmAllocateContiguousMemory(void)
 {
     uint32_t size = STACK_ARG(0);
 
-    /* Allocate from Xbox heap so MEM32(result) works correctly */
-    uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    /* From the contiguous window, not the general heap: the caller is
+     * entitled to assume (VA & 0x0FFFFFFF) | 0x80000000 == VA, because that
+     * is how a driver converts between the address it holds and the one it
+     * hands the hardware. See xbox_ContiguousAlloc. */
+    uint32_t xbox_va = xbox_ContiguousAlloc(size, 4096);
 
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemory: size=%u → Xbox VA 0x%08X\n",
@@ -575,7 +578,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     }
 
     if (align < 4096) align = 4096;
-    xbox_va = xbox_HeapAlloc(size, align);
+    xbox_va = xbox_ContiguousAlloc(size, align);
 
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
