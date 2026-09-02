@@ -32,6 +32,7 @@
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+extern void xbox_FramebufferWindowStart(void);
 
 /* NV097 methods this executor acts on. */
 #define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
@@ -307,6 +308,20 @@ static void clear_surface(uint32_t param)
      * renders into the back buffer, so following AvSetDisplayMode's address
      * would show the one nothing is writing. */
     xbox_FramebufferWindowSet(s_gpu.color_offset, s_gpu.pitch);
+
+    /* And open the window, rather than waiting for AvSetDisplayMode to do it.
+     *
+     * That was the only caller, so a title which draws before setting a display
+     * mode -- or never sets one at all -- got no window however much it
+     * rendered. The Xbox Dashboard clears a 1280x960 surface at 0x00088000 on
+     * its first frame and had not called AvSetDisplayMode by then, so
+     * RECOMP_FB_WINDOW=1 was set, the executor knew the address and the pitch,
+     * and nothing appeared.
+     *
+     * Here is the better trigger anyway: this runs when a surface address is
+     * known to be real, because a clear just used it. Idempotent and gated on
+     * RECOMP_FB_WINDOW, so the cost is one interlocked compare per clear. */
+    xbox_FramebufferWindowStart();
 }
 
 

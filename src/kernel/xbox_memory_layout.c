@@ -80,6 +80,25 @@ static void *g_nv2a_memory = NULL;
 #define XBOX_MCPX_BASE 0xFE800000u
 #define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
 static void *g_mcpx_memory = NULL;
+
+/* Flash ROM. The console's 256 KB flash is mirrored through the top of the
+ * address space, and the MCPX span above stops one page short of it -- so a
+ * title that touches it faulted on an address that is perfectly ordinary on
+ * hardware.
+ *
+ * The Xbox Dashboard does, from two directions at once: its XIP workers hash
+ * 64 KB from 0xFF000000 (it verifies archives against digests), and its render
+ * path writes to 0xFF000040. Both are hard faults today, and they kill the
+ * process a few dozen lines after its first frame clears.
+ *
+ * Plain memory, like the other two apertures, and mapped for the same stated
+ * reason: a read of zero is survivable, a fault is not. Zeros are not the
+ * console's BIOS, so a digest taken over this will not match one taken over
+ * real flash -- that is a separate question from whether the access should
+ * fault, and this is the half that has an obviously right answer. */
+#define XBOX_FLASH_BASE 0xFF000000u
+#define XBOX_FLASH_SIZE (1u * 1024u * 1024u)
+static void *g_flash_memory = NULL;
 /* How much of the tiled aperture can exist.
  *
  * Two ceilings, both below the mapped RAM size once that is large:
@@ -1438,6 +1457,27 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             fprintf(stderr, "  WARNING: MCPX aperture at 0x%08X failed "
                     "(error %lu); USB/audio register access will fault\n",
                     XBOX_MCPX_BASE, GetLastError());
+        }
+    }
+
+    /* Flash ROM aperture -- see XBOX_FLASH_BASE for why. */
+    {
+        uintptr_t flash_native = XBOX_FLASH_BASE + g_memory_offset;
+
+        g_flash_memory = VirtualAlloc(
+            (LPVOID)flash_native,
+            XBOX_FLASH_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE
+        );
+        if (g_flash_memory) {
+            fprintf(stderr, "  Flash ROM aperture: %u MB at Xbox VA "
+                    "0x%08X (zeroed, not a real BIOS image)\n",
+                    XBOX_FLASH_SIZE / (1024 * 1024), XBOX_FLASH_BASE);
+        } else {
+            fprintf(stderr, "  WARNING: flash aperture at 0x%08X failed "
+                    "(error %lu); a title reading flash will fault\n",
+                    XBOX_FLASH_BASE, GetLastError());
         }
     }
 

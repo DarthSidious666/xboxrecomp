@@ -313,6 +313,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         fprintf(stderr, "[BOOT] flat dispatch unavailable; "
                         "indirect calls will use the binary search\n");
 
+    /* Arm the hang watchdog. Does nothing unless RECOMP_WATCHDOG_SECS is set,
+     * and must be called from this thread -- the guest registers it samples are
+     * thread-local, so it has to be handed the copies belonging to the thread
+     * that runs guest code.
+     *
+     * Not optional boilerplate: without this call RECOMP_WATCHDOG_SECS is
+     * silently inert, and the one diagnostic that tells a hang from slowness
+     * does nothing while appearing to be set. */
+    xbox_WatchdogStart();
+
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");
     fflush(stdout);
