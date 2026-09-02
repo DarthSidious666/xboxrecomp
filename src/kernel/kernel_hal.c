@@ -439,8 +439,21 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
 
     switch (Option) {
     case AV_OPTION_QUERY_AVPACK:
-        /* Report HDTV/Component pack - allows games to offer 480p/720p */
-        *Result = AV_PACK_HDTV;
+        /* Pack type, video standard and refresh rate, in one word.
+         *
+         * D3D keys its display-mode table on all three: the row flags carry
+         * the pack in 0x000000FF, the standard in 0x0000FF00 and the refresh
+         * in 0x00C00000 (Half-Life 2's 640x480 60Hz row is 0x00480104).
+         * Returning the pack alone left the standard as 0, which matches no
+         * row, so the mode scan ran off the end of the table and device
+         * creation failed with E_FAIL.
+         *
+         * HDTV pack keeps 480p/720p available to titles that offer them;
+         * NTSC-M and 60Hz are the North American retail default, and match
+         * the region reported by ExQueryNonVolatileSetting. */
+        *Result = AV_PACK_HDTV
+                | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
+                | AV_REFRESH_60Hz;
         break;
 
     case AV_OPTION_QUERY_MODE:
