@@ -663,6 +663,7 @@ class FunctionTranslator:
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
+        self.lifter.needs_flags = has_conditionals
 
         # Flag snapshot temporaries: a cmp/test records its operands here,
         # zero- and sign-extended to the compare's own width, so the branch
@@ -1120,6 +1121,8 @@ class BatchTranslator:
         are still declared and still count as defined for stub purposes. This
         is how a game replaces a recompiled XDK routine (a D3D8 entry point,
         say) with one that drives the host runtime instead of the hardware.
+        Direct calls and tail jumps to these addresses use the same manual-first
+        lookup as indirect calls, so every call path reaches the override.
 
         Returns dict with stats and list of generated files.
         """
@@ -1130,6 +1133,7 @@ class BatchTranslator:
         func_list = [item for item in func_list
                      if item[0] not in self.translator.owned_function_starts]
         manual = set(manual or ())
+        self.translator.lifter.manual_functions = manual
         manual_decls = {}
 
         # Translate all functions first, collecting results

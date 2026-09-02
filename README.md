@@ -114,6 +114,8 @@ cmake --build build --config Release
 
 This produces 6 static libraries in `build/src/*/Release/`. Link your game project against `xboxrecomp` (umbrella target) or individual libraries.
 
+**This repo builds libraries only — there is no game `.exe` here, and building it will never produce one.** The executable is built by *your* game project, which lives in its own directory and links these libraries. Start it by copying [`templates/new-game/`](templates/new-game/): it has the `CMakeLists.txt` that produces the `.exe` and the `main.c` that boots the guest. See [Getting Started, Step 6](docs/GETTING_STARTED.md#step-6-create-your-game-project).
+
 ### Integration Pattern
 
 Your recompiled game provides two callback functions that the kernel bridge calls to resolve function addresses:
@@ -196,20 +198,25 @@ py -3 -m tools.abi_analysis game_files/default.xbe -v
 #    Skipping this still "works", but every function falls back to
 #    cdecl / 0 params / int-or-void, so the generated signatures are guesses.
 
-# 7. Lift to C — the big one
-py -3 -m tools.recomp game_files/default.xbe --all --split 1000
-#    Output: src/game/recomp/gen/ (millions of lines of C)
+# 7. Create your game project — this is what becomes the .exe
+#    The toolkit is a library; the executable lives in your own project.
+cp -r templates/new-game ../mygame        # Windows cmd: xcopy /E /I templates\new-game ..\mygame
+#    Then edit:
+#      ../mygame/CMakeLists.txt  -> project name, XBOXRECOMP_DIR path
+#      ../mygame/src/main.c      -> YOUR_GAME_ENTRY_POINT / XBE path from step 3
 
-# 8. Set up runtime shims (see docs/runtime/ for templates)
-#    - Xbox kernel replacement (152 ordinals routed)
-#    - D3D8 -> D3D11 translation layer
-#    - Memory layout reproduction
-#    - Input system
+# 8. Lift to C — the big one
+#    --gen-dir writes the generated code into your game project, where the
+#    template's CMakeLists globs src/recomp/gen/*.c. Without it the output
+#    lands in this repo (src/game/recomp/gen/) and nothing compiles it.
+py -3 -m tools.recomp game_files/default.xbe --all --split 1000 --gen-dir ../mygame/src/recomp/gen
+#    Output: recomp_0000.c ... recomp_dispatch.c, recomp_funcs.h (millions of lines of C)
 
-# 9. Build and run
+# 9. Build and run — from the game project, not from xboxrecomp
+cd ../mygame
 cmake -S . -B build
 cmake --build build --config Release
-bin/your_game.exe
+build\Release\your_game_recomp.exe          # named after project() in your CMakeLists
 ```
 
 ### What To Expect
@@ -250,6 +257,9 @@ xboxrecomp/
 │   └── input/                   # xbox_input  - Gamepad → XInput
 ├── include/xbox/                # Public umbrella header (xboxrecomp.h)
 ├── templates/                   # Starter templates for new projects
+│   ├── new-game/                # ** Copy this to start a game project **
+│   │   ├── CMakeLists.txt       # Builds the game .exe, links xboxrecomp
+│   │   └── src/main.c           # Host entry point: loads XBE, boots guest
 │   └── runtime/                 # Runtime shim templates
 │       ├── recomp_types.h       # Register model + ICALL macros
 │       ├── xbox_memory.h        # Memory layout helpers
