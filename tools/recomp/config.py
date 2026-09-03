@@ -71,6 +71,18 @@ ENTRY_POINT = 0x00052A81
 
 _configured_from: Optional[str] = None
 
+# Display name used in generated-code banners. Title-agnostic default; set it
+# to match the game being recompiled via --game-name (see tools.recomp __main__)
+# or set_game_name().
+GAME_NAME = "Xbox Game"
+
+
+def set_game_name(name: str) -> None:
+    """Set the display name stamped into generated code banners."""
+    global GAME_NAME
+    if name:
+        GAME_NAME = name
+
 
 def _classify(name: str, flags: int) -> bool:
     """Decide whether a section holds code."""

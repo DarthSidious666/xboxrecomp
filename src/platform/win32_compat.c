@@ -1117,6 +1117,8 @@ SHORT GetAsyncKeyState(int vKey)          { (void)vKey; return 0; }
 HWND  FindWindowA(LPCSTR c, LPCSTR w)     { (void)c; (void)w; return NULL; }
 HWND  GetActiveWindow(void)               { return NULL; }
 BOOL  SetWindowTextA(HWND h, LPCSTR t)    { (void)h; (void)t; return TRUE; }
+int   GetWindowTextA(HWND h, LPSTR t, int n) { (void)h; (void)t; (void)n; return 0; }
+BOOL  EnumWindows(WNDENUMPROC p, LPARAM l) { (void)p; (void)l; return FALSE; }
 
 int MessageBoxA(HWND h, LPCSTR text, LPCSTR caption, UINT type)
 {
