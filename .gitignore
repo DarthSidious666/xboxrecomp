@@ -30,3 +30,4 @@ build/
 bin/
 *.obj
 *.exe
+tools/split/output/
