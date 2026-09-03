@@ -545,9 +545,17 @@ HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
 BOOL ReleaseMutex(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_MUTEX) return FALSE;
+    if (!o || o->kind != K_MUTEX) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
     pthread_mutex_lock(&o->lock);
-    if (o->mtx_owner == GetCurrentThreadId() && --o->mtx_recursion <= 0) {
+    if (o->mtx_owner != GetCurrentThreadId()) {
+        pthread_mutex_unlock(&o->lock);
+        SetLastError(ERROR_NOT_OWNER);
+        return FALSE;
+    }
+    if (--o->mtx_recursion <= 0) {
         o->mtx_owner = 0;
         o->mtx_recursion = 0;
         pthread_cond_broadcast(&o->cond);
