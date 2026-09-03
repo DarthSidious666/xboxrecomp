@@ -75,15 +75,26 @@ def va_to_file_offset(va):
 # Populated per-title by configure_from_xbe(); the values below are the
 # reference fallback only.
 
-XDK_SECTIONS = {
-    "D3D":     (0x0034C2E0, 0x0034C2E0 + 83828,  "game_render"),
-    "DSOUND":  (0x002F3F40, 0x002F3F40 + 52668,  "game_audio"),
-    "WMADEC":  (0x00300D00, 0x00300D00 + 105828, "game_audio"),
-    "XMV":     (0x002CC200, 0x002CC200 + 163124, "game_video"),
-    "XONLINE": (0x0031AA80, 0x0031AA80 + 124764, "game_network"),
-    "XNET":    (0x003391E0, 0x003391E0 + 78056,  "game_network"),
-    "XGRPH":   (0x00360A60, 0x00360A60 + 8300,   "game_render"),
-    "XPP":     (0x00362AE0, 0x00362AE0 + 36052,  "game_input"),
+# Section NAME -> category. The VAs must come from the XBE being analysed, not
+# from here: these sections sit at completely different addresses in every
+# title. This table used to carry Burnout 3's VAs, which meant every other
+# title had its own .text misclassified wherever it happened to overlap them --
+# on Half-Life 2 all eight ranges landed inside .text, mislabelling 4,498
+# functions including 2,697 as "game_audio" and 884 as "game_video" in a title
+# that has no video section at all.
+XDK_SECTION_CATEGORIES = {
+    "D3D":     "game_render",
+    "D3DX":    "game_render",
+    "XGRPH":   "game_render",
+    "DSOUND":  "game_audio",
+    "WMADEC":  "game_audio",
+    "DOLBY":   "game_audio",
+    "XACTENG": "game_audio",
+    "XMV":     "game_video",
+    "WMVDEC":  "game_video",
+    "XONLINE": "game_network",
+    "XNET":    "game_network",
+    "XPP":     "game_input",
 }
 
 # Category assigned to a statically linked Xbox SDK section by its name.

@@ -73,9 +73,14 @@ def main():
         metavar="JSON",
         help="JSON file with additional function entry points to seed the detector. "
              "Format: array of objects with 'start' field (hex address string). "
-             "Use identified_functions.json from func_id to feed back vtable thunks, "
-             "or icall_targets.json from tools.recomp.icall_feedback to feed back "
-             "measured indirect-branch targets. "
+             "Use icall_targets.json from tools.recomp.icall_feedback, which holds "
+             "indirect-branch targets the title was measured reaching. "
+             "NOT identified_functions.json from func_id: that is inference, not "
+             "measurement, and it carries addresses that sit at a valid instruction "
+             "boundary *inside* an existing function. The mid-instruction guard below "
+             "does not catch those, and each one clamps the end of the function it "
+             "sits in -- on the Xbox dashboard it cut __heap_init short of its "
+             "epilogue, so the CRT heap was never initialised and nothing said so. "
              "Repeatable: pass it once per file. Hand-maintained seed lists and "
              "machine-generated ones stay separate files rather than being merged "
              "into each other.",

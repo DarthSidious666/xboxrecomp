@@ -108,13 +108,18 @@ def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
         if addr in rw_results or addr in crt_results:
             del stub_results[addr]
 
+    # Section table from the XBE itself. Both label propagation and vtable
+    # scanning need it, and neither may use a hardcoded one -- see
+    # config.XDK_SECTION_CATEGORIES.
+    xbe_sections = _parse_xbe_sections(xbe_data)
+
     # ── Phase 4: Label propagation ───────────────────────────
     if verbose:
         print("\nPhase 4: Label propagation...")
     t4 = time.time()
     propagated = propagate_labels(
         functions, rw_results, crt_results, imm_refs, strings,
-        verbose=verbose
+        verbose=verbose, sections=xbe_sections
     )
     if verbose:
         print(f"  Done in {time.time() - t4:.1f}s")
@@ -124,8 +129,6 @@ def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
         print("\nPhase 5: Vtable scanning...")
     t5 = time.time()
 
-    # Parse section info from XBE for game-agnostic vtable scanning
-    xbe_sections = _parse_xbe_sections(xbe_data)
     if verbose and xbe_sections:
         code_count = sum(1 for s in xbe_sections if s.get("executable"))
         data_count = len(xbe_sections) - code_count

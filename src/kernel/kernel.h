@@ -536,6 +536,9 @@ typedef char  xbox_host_char;
  * Returns TRUE on success, FALSE if the path couldn't be translated.
  * host_path_buf must be at least MAX_PATH characters (not bytes).
  */
+/* Host path produced by the most recent xbox_translate_path call. */
+const wchar_t *xbox_LastHostPath(void);
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
 /* ============================================================================
@@ -838,6 +841,9 @@ NTSTATUS __fastcall xbox_IofCallDriver(PVOID DeviceObject, PVOID Irp);
 VOID     __fastcall xbox_IofCompleteRequest(PVOID Irp, CCHAR PriorityBoost);
 
 NTSTATUS __stdcall xbox_IoCreateSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName, PXBOX_ANSI_STRING DeviceName);
+/* Target of a link registered by xbox_IoCreateSymbolicLink, or NULL.
+ * Looked up by exact link name, e.g. "\\??\\Z:". */
+const char* xbox_LookupSymbolicLink(const char* link);
 NTSTATUS __stdcall xbox_IoDeleteSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName);
 
 /* ============================================================================
@@ -908,6 +914,20 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define AV_PACK_HDTV            0x04
 #define AV_PACK_VGA             0x05
 #define AV_PACK_SVIDEO          0x06
+
+/* ---- Video standard, the second byte of the AVPACK query result ----
+ *
+ * AvSendTVEncoderOption(AV_OPTION_QUERY_AVPACK) does not return the pack type
+ * alone: D3D reads the same word for the pack (0x000000FF), the video standard
+ * (0x0000FF00) and the refresh rate (0x00C00000), and its mode table is keyed
+ * on all three. Returning a bare pack byte leaves the standard as 0, which
+ * matches no row in that table and fails device creation. */
+#define AV_STANDARD_NTSC_M      0x01
+#define AV_STANDARD_NTSC_J      0x02
+#define AV_STANDARD_PAL_I       0x03
+#define AV_STANDARD_SHIFT       8
+#define AV_REFRESH_60Hz         0x00400000
+#define AV_REFRESH_50Hz         0x00800000
 
 /* ---- AV option codes for AvSendTVEncoderOption ---- */
 #define AV_OPTION_QUERY_MODE            0x01

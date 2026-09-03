@@ -113,6 +113,35 @@ direction.
   hints and frame shape, so the generated signatures are real.
 - Also **diagnosed the tail of issue #2**, narrowing it from "recomp crashes"
   to the specific missing tool, and posted a workaround before the PR.
+- **D3D8 texture translation (#17)** — 4,096 lines across the D3D8 layer, and
+  the largest single contribution to it so far. All 66 Xbox `D3DFMT_*` formats
+  mapped to DXGI (33 swizzled, 20 linear, plus the float/16-bit-pair/10-bit and
+  DXN/DXT3A/DXT5A/CTX1 extended set), cube textures as a D3D11 `Texture2DArray`
+  with full mip chains and per-face unswizzle, volume textures as `Texture3D`
+  with 3D Z-order unswizzle, and the software channel conversions for the
+  formats whose memory layout does not map straight onto a DXGI equivalent.
+  Shipped with `tests/d3d8_smoke`, which compiles the real `d3d8_resources.c`
+  against stub device accessors so the format tables, swizzle classification
+  and conversions are checkable with no D3D11 device — which is what made a
+  change this size reviewable at all. `docs/technical/gap-analysis.md` marks
+  the approximate maps that still want in-game validation rather than claiming
+  them.
+- The same PR **took Burnout 3 out of the tooling** — hardcoded title strings
+  in the parser, disassembler, func_id and translator replaced with a shared
+  config, and the Linux default paths made generic.
+
+### dplewis — [@dplewis](https://github.com/dplewis)
+- **`ReleaseMutex` reported success for a release it did not perform (#18)** —
+  the POSIX shim returned `TRUE` unconditionally, so a thread releasing a mutex
+  it did not own got success, and `xbox_NtReleaseMutant` passed
+  `STATUS_SUCCESS` back to the guest for a release that did nothing. The guest
+  then carried on believing the mutex was free while it was still held. Found
+  by reading for a missing `ERROR_NOT_OWNER`, which turned out to be the
+  smaller half of the problem. Also set `ERROR_INVALID_HANDLE` on the
+  bad-handle path, which had been a bare `FALSE` with no error set.
+- **Scoped the macOS port (#19)** — an accurate, specific list of what stands
+  in the way (`MAP_FIXED_NOREPLACE`, `memfd_create`, `GlobalMemoryStatusEx`,
+  SDL2/epoxy) rather than a request, which is the useful kind of issue.
 
 ---
 

@@ -22,7 +22,7 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 ### Recent Changes
 
-**Current version: v0.6.0 — _"Credit Where Due"_ (August 2026).**
+**Current version: v0.7.1 — _"Non-Local"_ (September 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
@@ -103,6 +103,7 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 | **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
 | **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
 | **xbox_input** | Custom | Xbox gamepad → XInput |
+| **xbox_video** | Custom | FMV playback: Media Foundation decode onto a D3D8 texture, plus a window on the guest framebuffer. For titles whose video is a container Windows already decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays |
 
 ### Building the Libraries
 
@@ -276,7 +277,8 @@ xboxrecomp/
 │   ├── audio/                   # xbox_dsound - DirectSound compat
 │   ├── apu/                     # xbox_apu    - MCPX APU emulation (xemu)
 │   ├── nv2a/                    # xbox_nv2a   - NV2A GPU emulation (xemu)
-│   └── input/                   # xbox_input  - Gamepad → XInput
+│   ├── input/                   # xbox_input  - Gamepad → XInput
+│   └── video/                   # xbox_video  - FMV playback + framebuffer window
 ├── include/xbox/                # Public umbrella header (xboxrecomp.h)
 ├── templates/                   # Starter templates for new projects
 │   ├── new-game/                # ** Copy this to start a game project **
@@ -373,7 +375,7 @@ See [docs/technical/candidate-games.md](docs/technical/candidate-games.md) for a
 ## Projects Using This Toolkit
 
 - **[Burnout 3: Takedown](https://github.com/sp00nznet/burnout3)** — The origin title and most mature target. 22,097 functions lifted. An earlier build was playable to the main menu at 60fps, but leaned on hand-written menu and render scaffolding; that is being replaced with genuinely recompiled code, and the honest bring-up currently reaches engine/RenderWare init. Treat the old "playable" claim as retired until the recompiled path gets back there.
-- **[Xbox Dashboard](https://github.com/sp00nznet/xboxdashboard)** — The original Xbox system shell (build 3944). Boots and renders the green orb at 60fps (D3D8→D3D11). Its UI is driven by a **VRML97 + JavaScript scene engine** (text→bytecode compiler + stack-machine VM + node-class reflection registry) — currently being brought online; demonstrates the toolkit on system software, not just games.
+- **[Xbox Dashboard](https://github.com/sp00nznet/xboxdashboard)** — The original Xbox system shell (build 3944); the toolkit on system software rather than a game. Nothing renders yet: the earlier "green orb at 60fps" was the project's own scaffolding drawing a disc, and has been retired along with the fake scene root and hand-rolled asset loader around it. What runs is the dashboard's own code — full init chain, its own D3D8 sizing and allocating its own 640x480 surfaces, its own NV2A pushbuffer, its own `default.xip` read. Its UI is driven by a **VRML97 + JavaScript scene engine** (text→bytecode compiler + stack-machine VM + node-class reflection registry), which is the piece still to come online.
 - **[Wreckless: The Yakuza Missions](https://github.com/sp00nznet/wreckless)** — Xbox launch title (2002). Custom engine, 3,407 functions, boots through CRT init into game main. Debugging early gameplay crash.
 - **[Blood Wake](https://github.com/sp00nznet/bloodwake)** — First-party Microsoft naval combat (2001). Stormfront Studios custom engine. 4,608 functions, 367K lines of C generated (99.1% success). Project scaffolded, working toward first build.
 
@@ -488,6 +490,142 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.7.1 — *"Non-Local"* (September 2026)
+
+*Contributed work, plus what a system application asks for that a game does not.*
+
+**Contributed.**
+
+- **`ReleaseMutex` reported success for a release it never performed** — the
+  POSIX shim returned `TRUE` unconditionally, so a thread releasing a mutex it
+  did not own got success and `NtReleaseMutant` handed `STATUS_SUCCESS` back to
+  the guest. The guest then ran on believing a still-held mutex was free. Also
+  adds the missing `ERROR_NOT_OWNER` and sets `ERROR_INVALID_HANDLE` on the
+  bad-handle path — *[@dplewis](https://github.com/dplewis)* (#18)
+- **D3D8 texture translation**, 4,096 lines and the largest single contribution
+  to that layer. All 66 Xbox `D3DFMT_*` formats mapped to DXGI, cube textures as
+  a `Texture2DArray` with per-face unswizzle, volume textures as `Texture3D`
+  with 3D Z-order unswizzle, and software channel conversion for the formats
+  with no direct DXGI equivalent. Ships `tests/d3d8_smoke`, which builds the real
+  `d3d8_resources.c` against stub device accessors so the format tables are
+  checkable without a D3D11 device. The same PR took hardcoded *Burnout 3*
+  strings out of the tools and the Linux default paths —
+  *[@DarthSidious666](https://github.com/DarthSidious666)* (#17)
+
+Generated-code banners now prefer the title read from the XBE header, with
+`--game-name` as an explicit override — the two mechanisms arrived from
+different directions in the same release and both are worth having.
+
+**The Xbox Dashboard reached its frame loop**, which meant finding four things
+between a title and a first visible frame, none of them in the title:
+
+- **Worker thread stacks were never reclaimed.** The pool counted threads ever
+  created rather than threads alive, so a title that cycles workers exhausted it
+  and `PsCreateSystemThreadEx` began running them *inline* — which deadlocks
+  rather than slows, because the worker finishes before its caller reaches the
+  wait it was going to be signalled from.
+- **`0xFF000000` was not mapped.** The MCPX span stops one page short of the
+  flash ROM, so an access that is ordinary on hardware was a hard fault. Backed
+  as plain memory like the NV2A and MCPX apertures.
+- **The pushbuffer survey read the wrong memory.** `DMA_PUT` holds a physical
+  address and `nv2a_pb_scan` takes guest VAs, so it walked low memory and
+  reported a confident inventory of nothing while the title was submitting
+  methods all along.
+- **The framebuffer window only ever opened from `AvSetDisplayMode`**, so a
+  title that draws before setting a display mode got no window however much it
+  rendered. The pushbuffer executor opens it now, when a clear has just proved a
+  surface address is real.
+
+`RECOMP_WATCHDOG_SECS` also did nothing in any project copied from the template,
+because `xbox_WatchdogStart()` is the host's to call and the template never
+called it — the one diagnostic that separates a hang from slowness, silently
+inert while appearing to be set.
+
+**`tools.split`** — one byte-exact `.s` per function, for decompilation rather
+than recompilation. The bytes are `db` directives and the disassembly is the
+comment beside them, because x86 has multiple encodings per mnemonic and
+reassembling a listing produces code that runs identically and does not *match*.
+Verified against the binary: 2,254 of 2,254 functions in the Xbox Dashboard's
+`.text` are byte-identical, including the ones with MSVC switch tables parked
+mid-body. See [docs/DECOMP.md](docs/DECOMP.md).
+
+**Fixed for new users**, all three from people reporting where they got stuck:
+`recomp_types.h` is now written into `--gen-dir` by the pipeline instead of
+living only in `templates/runtime/`; `tools.disasm` names the analysis JSON it
+wants and the command that writes it; the README's own quick start ran
+`tools.xbe_parser` with no `--json`, which is why the next step could not find
+it. The project template also could not link, defining three ICALL globals the
+runtime already owns.
+
+### v0.7.0 — *"Non-Local"* (August 2026)
+
+*Control flow that leaves a function without returning from it, and the three
+places the toolkit got that wrong.*
+
+**Non-local jumps.** A recompiled function is a real C function, so restoring
+the guest's `esp` is only half of a `longjmp`: the abandoned frames are still on
+the native stack, and control returns into them once the resume point finishes.
+Each guest `jmp_buf` is now paired with a native one taken at the `setjmp` call
+site — the only place a native `setjmp` is valid — and the guest `longjmp`
+becomes a native one, so the frames actually unwind. The CRT's pair is found by
+the `"VC20"` cookie MSVC stamps into every `jmp_buf`. On the title tested this
+turned a correctly caught image-loader exception, which had been re-entering the
+decoder on a dead frame and looping forever, into a clean unwind.
+
+**Frameless callees inherited a dead frame.** A function with no prologue of its
+own reads `ebp` through `g_seh_ebp`, but only tail jumps and the SEH helpers
+ever wrote it — so one reached by an ordinary call got whatever frame the last
+tail jump left behind. It is now published wherever `g_ebp` is. `setjmp` was
+saving that stale frame into the buffer, so the `longjmp` that should have
+resumed a catch restored a frame two calls dead.
+
+**The `fs:` segment prefix was dropped**, putting the TIB at guest address 0 —
+the same address a null pointer dereferences. Two things went wrong there and
+both were silent: a null check written as `cmp byte [ecx], 0` read the exception
+chain head's `0xFF` and decided the pointer was fine, and a store through a null
+pointer overwrote that head instead of faulting. Segment overrides are now
+recorded and based at `XBOX_FS_BASE`, which leaves page zero free —
+`RECOMP_TRAP_NULL=1` then makes a null dereference fault where it happens
+instead of surfacing hundreds of steps later as a NaN.
+
+**Kernel exports that existed but were never dispatched.** `RtlUnwind`,
+`XeLoadSection`/`XeUnloadSection` and `NtSuspendThread` all had implementations
+and no entry in the bridge table, which is worse than an outright stub: each
+returned success without doing anything. `NtSuspendThread` was the costly one —
+a worker that parked itself never stopped, and spun through 289 million kernel
+calls while the title believed it was idle. After bridging: 9,789.
+
+**MCPX APU never started.** The frame thread idles on `pause_requested`, which
+init sets and *only the test tone* ever cleared, so a title that enabled the APU
+through `NV_PAPU_SECTL`/`FECTL` got an APU that stayed asleep. Writing those
+registers now resumes it.
+
+**Instructions.** `cvtps2pi` / `cvttps2pi` implemented — 36 of them sat inside
+one title's WMV decoder as no-op comments.
+
+**Diagnostics**, because a recompiled title offers no debugger and no printf:
+
+- `tools/stackwalk.py` — guest backtraces from a stack dump. The native stack
+  shows only whichever translated function is spinning; the guest stack still
+  carries a return site for every guest frame.
+- `RECOMP_WATCHDOG_SECS` — dumps the guest call stack when a title stops making
+  progress, which is otherwise indistinguishable from working.
+- `RECOMP_TRACE_ARGS` / `RECOMP_TRACE_DEREF` — stack arguments and one level of
+  pointer dereference at each traced entry. Registers alone will not tell you
+  which argument arrived null.
+- `RECOMP_PEEK` / `RECOMP_PEEK_CHAIN` — read guest dwords, or walk a pointer
+  chain, without a run per level.
+- `RECOMP_WATCH_VA` — hardware watchpoint on a guest address, generalised from a
+  single hardcoded one.
+- `RECOMP_PB_SCAN` / `RECOMP_PB_EXEC` — survey a title's NV2A pushbuffer and
+  execute its surface and clear methods. The survey ranks what is *not*
+  implemented, so the remaining work is a list rather than a guess.
+- `RECOMP_FB_WINDOW` — a window on the guest framebuffer. Nothing else scans it
+  out, so however much of the GPU works, none of it is observable without this.
+
+**Fixed:** duplicate trace symbols broke the link for any title defining its own
+`recomp_trace_*`; they now live once in the kernel.
 
 ### v0.6.0 — *"Credit Where Due"* (August 2026)
 

@@ -113,8 +113,20 @@ def _fmt_fpu_operand(op):
 
 
 def _fmt_mem(op):
-    """Format a memory operand as a C expression (the address computation)."""
+    """Format a memory operand as a C expression (the address computation).
+
+    An fs-relative operand is offset by XBOX_FS_BASE. The prefix used to be
+    dropped, which put the TIB at guest address 0 -- the same address a null
+    pointer dereferences. Two things went wrong there and both were silent: a
+    null check written as `cmp byte [ecx], 0` read the TIB's first byte (0xFF,
+    the end-of-chain marker) and decided the pointer was fine, and a store
+    through a null pointer overwrote the exception-chain head instead of
+    faulting. With the TIB moved off page zero, that page can be left
+    unmapped and both become immediate, locatable faults.
+    """
     parts = []
+    if getattr(op, "mem_seg", None) == "fs":
+        parts.append("XBOX_FS_BASE")
     if op.mem_base:
         parts.append(_fmt_reg(op.mem_base))
     if op.mem_index:
@@ -326,7 +338,7 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # comparison happens. Use those rather than re-reading registers that may
     # since have changed.
     SIGNED = {"CMP_L", "CMP_LE", "CMP_G", "CMP_GE", "TEST_S"}
-    if flag_setter in ("cmp", "test") and len(flag_ops) >= 2:
+    if flag_setter in ("cmp", "test", "bsf", "bsr") and len(flag_ops) >= 2:
         signed = (cmp_macro in SIGNED) or (test_macro in SIGNED)
         lhs, rhs = ("_fas", "_fbs") if signed else ("_fa", "_fb")
     elif len(flag_ops) >= 2:
@@ -405,6 +417,19 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if _sf_width is None and len(flag_ops) > 1:
         _sf_width = _operand_width(flag_ops[1])
     _sf_cast = {1: "(int8_t)", 2: "(int16_t)"}.get(_sf_width, "(int32_t)")
+
+    # ── bsf/bsr: ZF is the only flag they define ──
+    #
+    # ZF is set when the SOURCE was zero, not from any subtraction, and the
+    # lifter snapshots that source into _fa with _fb = 0. Everything else --
+    # CF, SF, OF, PF -- is architecturally undefined here, so refuse rather
+    # than invent a condition for it.
+    if flag_setter in ("bsf", "bsr"):
+        if jcc in ("je", "jz", "sete", "setz"):
+            return f"({lhs} == 0)", desc
+        if jcc in ("jne", "jnz", "setne", "setnz"):
+            return f"({lhs} != 0)", desc
+        return None
 
     # ── cmp: flags from (a - b), operands unchanged ──
     if flag_setter == "cmp":
@@ -597,13 +622,6 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
 
     # ── bsf/bsr: bit scan, ZF set if source is zero ──
-    if flag_setter in ("bsf", "bsr"):
-        if jcc in ("je", "jz"):
-            return "_flags", desc
-        if jcc in ("jne", "jnz"):
-            return "!_flags", desc
-        return None
-
     # ── bt/bts/btr/btc: bit test, sets CF ──
     if flag_setter in ("bt", "bts", "btr", "btc"):
         if rhs is None:
@@ -787,11 +805,67 @@ def detect_seh_helpers(func_db, xbe_data, verbose=False):
     return prolog, epilog
 
 
+# MSVC's setjmp/longjmp pair, found by the "VC20" cookie the CRT stamps into
+# every jmp_buf. setjmp stores it, longjmp compares against it, so the two are
+# told apart by the opcode carrying the constant rather than by the constant
+# itself -- which appears in both.
+#
+#   setjmp    mov dword ptr [edx+20h], 56433230h    C7 42 20 30 32 43 56
+#   longjmp   cmp eax, 56433230h                    3D 30 32 43 56
+#
+# Both markers are unique across a whole title's image, so a hit is the
+# function and no size bound is needed.
+_SETJMP_MARKER  = bytes.fromhex("c7422030324356")
+_LONGJMP_MARKER = bytes.fromhex("3d30324356")
+
+
+def detect_setjmp_helpers(func_db, xbe_data, verbose=False):
+    """Locate the CRT's setjmp and longjmp in the target binary.
+
+    Returns (setjmp_addr, longjmp_addr); either may be None. A title whose CRT
+    has neither is normal -- nothing in it uses non-local jumps.
+    """
+    from .config import va_to_file_offset
+
+    if not xbe_data:
+        return None, None
+
+    found = {}
+    for marker, key in ((_SETJMP_MARKER, "setjmp"),
+                        (_LONGJMP_MARKER, "longjmp")):
+        for addr in sorted(func_db):
+            info = func_db[addr]
+            end = info.get("end")
+            if isinstance(end, str):
+                try:
+                    end = int(end, 16)
+                except ValueError:
+                    continue
+            size = (end - addr) if isinstance(end, int) else 0
+            if size <= 0 or size > 512:
+                continue
+            offset = va_to_file_offset(addr)
+            if offset is None or offset + size > len(xbe_data):
+                continue
+            if marker in xbe_data[offset:offset + size]:
+                found[key] = addr
+                break
+
+    if verbose:
+        import sys
+        fmt = lambda a: f"0x{a:08X}" if a else "not found"
+        print(f"  CRT non-local jumps: setjmp {fmt(found.get('setjmp'))}, "
+              f"longjmp {fmt(found.get('longjmp'))}", file=sys.stderr)
+
+    return found.get("setjmp"), found.get("longjmp")
+
+
 class Lifter:
     """Translates x86 instructions to C statements."""
 
     def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None,
-                 seh_prolog=None, seh_epilog=None, manual_functions=None):
+                 seh_prolog=None, seh_epilog=None,
+                 setjmp_fn=None, longjmp_fn=None, manual_functions=None):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
@@ -808,7 +882,6 @@ class Lifter:
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
-        self.needs_flags = True  # Translator disables snapshots with no consumer
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
         self.publishes_ebp = False  # Set per-function: has a real frame
         self.trace_exit_name = None  # Set per-function when traced
@@ -816,6 +889,15 @@ class Lifter:
         # batch translator diffs this against the functions it actually defined
         # so it can stub out the remainder (see translate_batch_split).
         self.referenced_calls = {}
+        # Mnemonics that fell through to the TODO comment, as
+        # {mnemonic: [addr, ...]}. An unimplemented instruction becomes a
+        # comment, which is a silent no-op in the generated C: Wreckless spent
+        # a whole bring-up dying inside RtlAllocateHeap because `bsf eax, ecx`
+        # was a comment, so the heap's free-list bitmap scan returned its own
+        # input and the allocator handed out the address of an empty list head.
+        # The translator reports this at the end of a run, so the next one
+        # costs a line of output instead of an afternoon.
+        self.unimplemented = {}
 
         # Detect if either is missing, so overriding one does not silently
         # leave the other unset -- that is the bug this whole path fixes.
@@ -825,6 +907,8 @@ class Lifter:
             seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
         self.SEH_PROLOG = seh_prolog
         self.SEH_EPILOG = seh_epilog
+        self.SETJMP_FN = setjmp_fn
+        self.LONGJMP_FN = longjmp_fn
         self.jump_table_targets = {}
 
     def _call_target_name(self, addr):
@@ -905,8 +989,6 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
-        if m in ("bsf", "bsr"):
-            return self._lift_bit_scan(ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -967,12 +1049,22 @@ class Lifter:
                 out.append(f"/* bt {insn.op_str}: no CF consumer */")
             return out
 
+        # INT 2D is the Xbox kernel debug trap: eax picks the service, ecx
+        # carries its argument, and service 1 prints the ANSI_STRING ecx points
+        # at. It is always followed by an int3 that the kernel skips over.
+        #
+        # Emitting nothing for that int3 is not laziness about breakpoints: a
+        # __debugbreak() there terminates the process with STATUS_BREAKPOINT,
+        # which is exit code 3 and no message at all. Wreckless hit it the
+        # first time it tried to print a debug line, after a full boot.
+        if m == "int" and ops and ops[0].type == "imm" and ops[0].imm == 0x2D:
+            return ["recomp_debug_service(eax, ecx); /* int 0x2d */"]
         if m == "int3":
-            return ["__debugbreak(); /* int3 */"]
+            return ["/* int3: debug-trap slide byte, stepped over */"]
         if m in ("leave",):
             return ["esp = ebp;", "POP32(esp, ebp); /* leave */"]
         if m in ("cld", "std"):
-            return [f"/* {m} - direction flag */"]
+            return [f"g_df = {0 if m == 'cld' else 1}; /* {m} */"]
         if m == "lahf":
             return ["/* lahf - load AH from flags (used in FPU compare idiom) */"]
         if m == "sahf":
@@ -986,7 +1078,11 @@ class Lifter:
                 return [f"/* bt {_fmt_operand_read(ops[0])}, {_fmt_operand_read(ops[1])} - bit test */"]
             return [f"/* bt {insn.op_str} */"]
         if m == "emms":
-            return ["/* emms - empty MMX state */"]
+            # A statement rather than a comment: emms genuinely has no
+            # effect here (mm/x87 aliasing is not modelled), and a
+            # comment-only lift is how the conformance suite reports a
+            # silently dropped instruction.
+            return ["(void)0; /* emms - empty MMX state */"]
         if m in ("xlat", "xlatb"):
             # AL indexes the byte table at EBX. With an address-size override,
             # the effective offset is calculated and wrapped at 16 bits.
@@ -1004,6 +1100,22 @@ class Lifter:
             return self._lift_cmovcc(insn, ops, m)
 
         # ── SSE (scalar float) ──
+        # Non-temporal SSE stores differ from the ordinary ones only in
+        # cache behaviour, which nothing here models -- but they are
+        # stores, and dropping them loses the data. Wreckless writes 50
+        # of them in its texture upload path.
+        if m in ("movntps", "movntpd", "movntdq"):
+            m = "movaps"
+
+        # ── MMX ──
+        # Dispatched on the operands rather than the mnemonic, because the
+        # integer SIMD names are shared with SSE: `paddw mm0, mm1` and
+        # `paddw xmm0, xmm1` differ only in register file.
+        if any(op.type == "reg" and op.reg and op.reg.startswith("mm")
+               and not op.reg.startswith("xmm") for op in ops) or m in (
+                   "emms", "femms"):
+            return self._lift_mmx(insn, m, ops)
+
         if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps",
                  "movlhps", "movhlps", "movapd", "movupd",
                  "addss", "subss", "mulss", "divss", "sqrtss",
@@ -1034,13 +1146,57 @@ class Lifter:
         # following adc/sbb reads kept whatever the last arithmetic left in it.
         # Only worth emitting when something downstream consumes CF -- that is
         # also the only time the enclosing function declares _cf.
+        # Cache hints and store fences: nothing to model on a single-threaded
+        # interpreter over coherent host memory. Named so they stop showing up
+        # in the unimplemented report as if they were missing work.
+        if m.startswith("prefetch") or m in ("sfence", "lfence", "mfence"):
+            return [f"(void)0; /* {m}: cache/ordering hint, nothing to model */"]
+
         if m in ("stc", "clc", "cmc"):
             if not self.needs_cf:
                 return [f"/* {m}: no adc/sbb in this function consumes CF */"]
             expr = {"stc": "1", "clc": "0", "cmc": "!_cf"}[m]
             return [f"_cf = {expr}; /* {m} */"]
 
+        # ── Bit scan ──
+        # Index of the lowest (bsf) or highest (bsr) set bit. When the source
+        # is zero the destination is left untouched and ZF is set; that is the
+        # whole contract, and callers branch on ZF to tell the cases apart.
+        #
+        # The CRT heap leans on this: RtlAllocateHeap picks a size bucket by
+        # bsf-ing its free-list-in-use bitmap, so a bsf that does nothing hands
+        # back the address of an empty list head and the heap eats itself.
+        #
+        # ZF is published through the same _fa/_fb snapshot a `cmp src, 0`
+        # would leave, which is what _make_condition reads for a following jcc.
+        # The other flags are architecturally undefined here, so a jcc that
+        # reads them was already meaningless.
+        if m in ("bsf", "bsr"):
+            if len(ops) < 2:
+                self.unimplemented.setdefault(m, []).append(insn.address)
+                return [f"/* TODO: {m} {insn.op_str} */"]
+            dst = _fmt_operand_read(ops[0])
+            src = _fmt_operand_read(ops[1])
+            width = (_operand_width(ops[1]) or 4) * 8
+            if m == "bsr":
+                init, cond, step = f"{width - 1}", "_bs_i >= 0", "_bs_i--"
+            else:
+                init, cond, step = "0", f"_bs_i < {width}", "_bs_i++"
+            return [
+                f"{{ uint32_t _bs_v = (uint32_t)({src}); int _bs_i;",
+                f"  _fa = _bs_v; _fb = 0; _fas = (int32_t)_fa; _fbs = 0;"
+                f" /* {m}: ZF = src == 0 */",
+                "  if (_bs_v) {",
+                f"    for (_bs_i = {init}; {cond}; {step})",
+                "      if (_bs_v & (1u << _bs_i)) break;",
+                "    " + _fmt_operand_write(ops[0], "(uint32_t)_bs_i") + ";",
+                f"  }} else {{ (void)({dst}); }} }}",
+            ]
+
         # ── Unhandled ──
+        #
+        # Recorded, not merely commented -- see self.unimplemented.
+        self.unimplemented.setdefault(m, []).append(insn.address)
         return [f"/* TODO: {m} {insn.op_str} */"]
 
     # ── MOV family ──
@@ -1059,6 +1215,15 @@ class Lifter:
         if (ops[0].type == "reg" and ops[0].reg == "ebp" and
                 ops[1].type == "reg" and ops[1].reg == "esp"):
             out.append("g_ebp = ebp; /* publish frame for frameless callees */")
+            # g_seh_ebp too. A callee with no prologue inherits through
+            # g_seh_ebp, not g_ebp, but only tail jumps and the SEH helpers
+            # ever wrote it -- so one reached by an ordinary call read whatever
+            # frame the last tail jump had left behind. Wreckless hit this in
+            # setjmp: it saved that stale ebp into the jmp_buf, and the longjmp
+            # that should have resumed the catch restored a frame two calls
+            # dead, so the exception unwound past every handler and off the top
+            # of the stack.
+            out.append("g_seh_ebp = ebp;")
         return out
 
     def _lift_movzx(self, insn, ops):
@@ -1316,39 +1481,6 @@ class Lifter:
         func = "ROL32" if m == "rol" else "ROR32"
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
 
-    def _lift_bit_scan(self, ops, mnemonic):
-        if len(ops) < 2:
-            return [f"/* {mnemonic}: bad operands */"]
-
-        src = _fmt_operand_read(ops[1])
-        width = _operand_width(ops[1]) or _operand_width(ops[0]) or 4
-        bits = width * 8
-        value = (f"(uint32_t)(uint16_t)({src})" if width == 2
-                 else f"(uint32_t)({src})")
-        if mnemonic == "bsr":
-            initial_index = bits - 1
-            step = "--_bs_index"
-        else:
-            initial_index = 0
-            step = "++_bs_index"
-        write = _fmt_operand_write(ops[0], "_bs_index")
-        statements = [
-            "{",
-            f"    uint32_t _bs_value = {value};",
-        ]
-        if self.needs_flags:
-            statements.append("    _flags = (_bs_value == 0);")
-        statements.extend([
-            "    if (_bs_value != 0) {",
-            f"        uint32_t _bs_index = {initial_index};",
-            "        while (((_bs_value >> _bs_index) & 1u) == 0u) "
-            f"{step};",
-            f"        {write}",
-            "    }",
-            f"}} /* {mnemonic} */",
-        ])
-        return statements
-
     # ── Compare / Test (standalone) ──
 
     # Widths for the flag snapshot below.
@@ -1380,11 +1512,35 @@ class Lifter:
         sx = self._SNAP_SX[size]
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
-        return [
+        out = [
             f"_fa = (uint32_t)({lhs}) & {mask}; _fb = (uint32_t)({rhs}) & {mask};",
             f"_fas = (int32_t){sx}(_fa); _fbs = (int32_t){sx}(_fb);"
             f" /* {kind} {lhs}, {rhs} ({size*8}-bit) */",
         ]
+        # A cmp sets the carry flag too, and sbb/adc/setc/rcl read it directly
+        # rather than through _fa/_fb. Leaving CF alone here let those pick up
+        # whatever an earlier instruction had left in it.
+        #
+        # MSVC's branchless tolower, in the _stricmp every Source string
+        # compare goes through, is exactly that shape:
+        #
+        #     sub al, 0x41      ; CF = al < 'A'
+        #     cmp al, 0x1A      ; CF = "is a letter"  <- the one sbb wants
+        #     sbb cl, cl
+        #     and cl, 0x20
+        #     add al, cl        ; fold to lowercase
+        #
+        # With CF still coming from the sub, no uppercase letter was ever
+        # folded and _stricmp quietly became strcmp.
+        #
+        # _fa and _fb are already masked to the operand width, so their
+        # unsigned comparison is CF at that width.
+        if self.needs_cf:
+            if kind == "cmp":
+                out.append("_cf = (int)(_fa < _fb);")
+            else:
+                out.append("_cf = 0; /* test/cmp-logical clears CF */")
+        return out
 
     def _lift_cmp(self, insn, ops):
         if len(ops) < 2:
@@ -1421,6 +1577,10 @@ class Lifter:
     SEH_PROLOG = None
     SEH_EPILOG = None
 
+    # The CRT's setjmp/longjmp, detected by detect_setjmp_helpers().
+    SETJMP_FN = None
+    LONGJMP_FN = None
+
     def _lift_call(self, insn, ops):
         # x86 'call' pushes the address of the following instruction, then jumps.
         # Push that real guest address, not a placeholder: the value is visible
@@ -1433,6 +1593,7 @@ class Lifter:
         # value -- so writing the true address costs nothing at the return side.
         ret_va = insn.end_address
         if insn.call_target:
+            name = self._call_target_name(insn.call_target)
             lines = []
             # Re-publish this function's frame before every call, not just once
             # at `mov ebp, esp`. g_ebp is "the last frame established anywhere",
@@ -1444,16 +1605,56 @@ class Lifter:
             # [ebp-0xa0] onto Xbox VA 4 and 6: exactly the fs:[4] corruption.
             if self.publishes_ebp:
                 lines.append("g_ebp = ebp; /* frame stays current across calls */")
-            if insn.call_target in self.manual_functions:
+                lines.append("g_seh_ebp = ebp;")
+            # Non-local jumps have to move the native stack, not just the
+            # guest one. Every recompiled function is a real C function, so a
+            # guest longjmp that only rewrites esp leaves the abandoned frames
+            # sitting on the native stack: the resume point runs, returns, and
+            # C unwinds straight back into frames the guest has already left,
+            # which then keep executing against a stack pointer that moved. In
+            # Wreckless that turned a correctly caught image-loader exception
+            # into the decoder being re-entered with a garbage context, and
+            # then an endless drain loop.
+            #
+            # So each guest jmp_buf gets a native one taken here, in the frame
+            # that calls setjmp -- the only place a native setjmp is valid --
+            # and the guest longjmp becomes a native longjmp back to it. The
+            # frames unwind for real and execution resumes exactly where the
+            # guest buffer says.
+            #
+            # Both keep the guest call as a fallback: a buffer armed by a
+            # setjmp that was reached some other way has no native counterpart,
+            # and the old behaviour is still better than ignoring the jump.
+            if insn.call_target == self.SETJMP_FN:
+                lines.append(
+                    "{ int _sjv = setjmp(*recomp_setjmp_slot(MEM32(esp)));"
+                    " if (_sjv) { ebp = g_seh_ebp; eax = (uint32_t)_sjv; }"
+                    f" else {{ PUSH32(esp, 0x{ret_va:08X}u); {name}(); }} }}"
+                    f" /* setjmp 0x{insn.call_target:08X} */")
+            elif insn.call_target == self.LONGJMP_FN:
+                lines.append(
+                    "if (!recomp_guest_longjmp(MEM32(esp), MEM32(esp + 4)))"
+                    f" {{ PUSH32(esp, 0x{ret_va:08X}u); {name}(); }}"
+                    f" /* longjmp 0x{insn.call_target:08X} */")
+            elif insn.call_target in self.manual_functions:
+                # A function the project replaces by hand. recomp_lookup_manual
+                # is consulted on indirect calls, and without this a direct
+                # caller went straight to the generated body and bypassed the
+                # replacement silently. Contributed in #15.
                 lines.append(
                     f"PUSH32(esp, 0x{ret_va:08X}u); "
                     f"RECOMP_ICALL_SAFE(0x{insn.call_target:08X}u, "
                     "_icall_esp); "
                     f"/* manual call 0x{insn.call_target:08X} */")
             else:
-                name = self._call_target_name(insn.call_target)
+                # Routed through RECOMP_ABI_CALL so -DRECOMP_ABI_CHECK covers
+                # direct calls too. Without it the check sees only indirect
+                # ones, and CRT and static-init paths -- where callee-saved
+                # clobbers actually bite -- are almost entirely direct. Expands
+                # to a plain call when the flag is off.
                 lines.append(
-                    f"PUSH32(esp, 0x{ret_va:08X}u); {name}(); "
+                    f"PUSH32(esp, 0x{ret_va:08X}u); "
+                    f"RECOMP_ABI_CALL(0x{insn.call_target:08X}u, {name}); "
                     f"/* call 0x{insn.call_target:08X} */")
             # esp immediately after the callee returns. A per-call delta is the
             # only way to attribute a leak to one callee rather than to the
@@ -1559,9 +1760,31 @@ class Lifter:
             targets = self._read_jump_table(table_va)
         if not targets:
             return []
-        # Check that ALL targets are within the current function
-        if all(self.func_start <= t < self.func_end for t in targets):
-            return targets
+        # Truncate at the first entry outside the function rather than
+        # demanding that every entry be inside it.
+        #
+        # _read_jump_table stops at the first value that is not a plausible
+        # code address, but a switch table is followed by ordinary code, and
+        # the next function's bytes routinely read as a valid .text address --
+        # so the read overruns the real table and picks up garbage. Requiring
+        # ALL entries to be in range then threw the whole switch away because
+        # of entries that were never part of it.
+        #
+        # A switch table's arms all land inside their own function, so the
+        # first entry that does not is exactly where the table ends. On
+        # Half-Life 2's CRT format parser (sub_005B9EB0) the table at
+        # 0x005BA617 has 8 real arms followed by code; the old rule resolved
+        # none of them, the indexed jump became an unresolvable indirect call,
+        # and sprintf silently produced the wrong string.
+        inside = []
+        for target in targets:
+            if not (self.func_start <= target < self.func_end):
+                break
+            inside.append(target)
+        # Two arms is the smallest thing worth calling a switch; one is more
+        # likely a coincidence than a jump table.
+        if len(inside) >= 2:
+            return inside
         return []
 
     def _lift_jmp(self, insn, ops):
@@ -1649,78 +1872,287 @@ class Lifter:
     # ── String operations ──
 
     def _lift_rep_string(self, insn, m):
+        # Every one of these steps by RECOMP_DF_STEP(size) rather than a
+        # literal, because EFLAGS.DF decides the direction and the block
+        # forms (memcpy/memset) are only valid forwards. See g_df in
+        # recomp_types.h for what a missing direction flag actually costs.
         if "movsb" in m:
-            return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx);",
-                    "esi += ecx; edi += ecx; ecx = 0; /* rep movsb */"]
+            return ["if (!g_df) { memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx);"
+                    " esi += ecx; edi += ecx; }",
+                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM8(edi - _i) = MEM8(esi - _i); esi -= ecx; edi -= ecx; }",
+                    "ecx = 0; /* rep movsb */"]
         if "movsd" in m:
-            return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 4);",
-                    "esi += ecx * 4; edi += ecx * 4; ecx = 0; /* rep movsd */"]
+            return ["if (!g_df) { memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 4);"
+                    " esi += ecx * 4; edi += ecx * 4; }",
+                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM32(edi - _i*4) = MEM32(esi - _i*4); esi -= ecx * 4; edi -= ecx * 4; }",
+                    "ecx = 0; /* rep movsd */"]
         if "movsw" in m:
-            return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 2);",
-                    "esi += ecx * 2; edi += ecx * 2; ecx = 0; /* rep movsw */"]
+            return ["if (!g_df) { memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 2);"
+                    " esi += ecx * 2; edi += ecx * 2; }",
+                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM16(edi - _i*2) = MEM16(esi - _i*2); esi -= ecx * 2; edi -= ecx * 2; }",
+                    "ecx = 0; /* rep movsw */"]
         if "stosb" in m:
-            return ["memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx);",
-                    "edi += ecx; ecx = 0; /* rep stosb */"]
+            return ["if (!g_df) { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
+                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM8(edi - _i) = LO8(eax); edi -= ecx; }",
+                    "ecx = 0; /* rep stosb */"]
         if "stosd" in m:
             return [
-                "{ uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM32(edi + _i*4) = eax; }",
-                "edi += ecx * 4; ecx = 0; /* rep stosd */"
+                "{ uint32_t _i; int32_t _st = RECOMP_DF_STEP(4);"
+                " for (_i = 0; _i < ecx; _i++) MEM32(edi + _i*_st) = eax;"
+                " edi += ecx * _st; }",
+                "ecx = 0; /* rep stosd */"
             ]
         if "stosw" in m:
             return [
-                "{ uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*2) = LO16(eax); }",
-                "edi += ecx * 2; ecx = 0; /* rep stosw */"
+                "{ uint32_t _i; int32_t _st = RECOMP_DF_STEP(2);"
+                " for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*_st) = LO16(eax);"
+                " edi += ecx * _st; }",
+                "ecx = 0; /* rep stosw */"
             ]
         if "cmpsb" in m:
             continue_on_equal = "repne" not in m and "repnz" not in m
             stop_condition = "!_flags" if continue_on_equal else "_flags"
             return [
+                "{ int32_t _st = RECOMP_DF_STEP(1);",
                 "while (ecx != 0) {",
                 "    _flags = (MEM8(esi) == MEM8(edi));",
-                "    esi++; edi++; ecx--;",
+                "    esi += _st; edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
-                f"}} /* {m} */",
+                f"}} }} /* {m} */",
             ]
         if "scasb" in m:
             continue_on_equal = "repne" not in m and "repnz" not in m
             stop_condition = "!_flags" if continue_on_equal else "_flags"
             return [
+                "{ int32_t _st = RECOMP_DF_STEP(1);",
                 "while (ecx != 0) {",
                 "    _flags = (LO8(eax) == MEM8(edi));",
-                "    edi++; ecx--;",
+                "    edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
-                f"}} /* {m} */",
+                f"}} }} /* {m} */",
             ]
+        # The word and dword forms, same shape as the byte forms above. They
+        # used to be a bare comment: nothing compared, esi/edi never advanced,
+        # and the flags kept whatever the previous instruction left, so the jcc
+        # reading them went wherever that pointed. D3DX compares two 1 KB
+        # palettes with `repe cmpsd` before deciding whether a surface copy is
+        # legal, and as a no-op that always answered "identical".
         if "cmpsw" in m or "cmpsd" in m:
-            return [f"/* {m} - string compare, ecx iterations */"]
+            wide = "cmpsd" in m
+            step, acc = (4, "MEM32") if wide else (2, "MEM16")
+            continue_on_equal = "repne" not in m and "repnz" not in m
+            stop_condition = "!_flags" if continue_on_equal else "_flags"
+            return [
+                f"{{ int32_t _st = RECOMP_DF_STEP({step});",
+                "while (ecx != 0) {",
+                f"    _flags = ({acc}(esi) == {acc}(edi));",
+                "    esi += _st; edi += _st; ecx--;",
+                f"    if ({stop_condition}) break;",
+                f"}} }} /* {m} */",
+            ]
         if "scasw" in m or "scasd" in m:
-            return [f"/* {m} - string scan, ecx iterations */"]
+            wide = "scasd" in m
+            step, acc = (4, "MEM32") if wide else (2, "MEM16")
+            value = "eax" if wide else "LO16(eax)"
+            continue_on_equal = "repne" not in m and "repnz" not in m
+            stop_condition = "!_flags" if continue_on_equal else "_flags"
+            return [
+                f"{{ int32_t _st = RECOMP_DF_STEP({step});",
+                "while (ecx != 0) {",
+                f"    _flags = ({value} == {acc}(edi));",
+                "    edi += _st; ecx--;",
+                f"    if ({stop_condition}) break;",
+                f"}} }} /* {m} */",
+            ]
         return [f"/* {m} */"]
 
     def _lift_string_op(self, insn, m):
+        # Unprefixed forms; direction still comes from EFLAGS.DF.
         if m == "movsb":
-            return ["MEM8(edi) = MEM8(esi); esi++; edi++; /* movsb */"]
+            return ["MEM8(edi) = MEM8(esi); esi += RECOMP_DF_STEP(1);"
+                    " edi += RECOMP_DF_STEP(1); /* movsb */"]
         if m == "movsd":
-            return ["MEM32(edi) = MEM32(esi); esi += 4; edi += 4; /* movsd */"]
+            return ["MEM32(edi) = MEM32(esi); esi += RECOMP_DF_STEP(4);"
+                    " edi += RECOMP_DF_STEP(4); /* movsd */"]
         if m == "stosb":
-            return ["MEM8(edi) = LO8(eax); edi++; /* stosb */"]
+            return ["MEM8(edi) = LO8(eax); edi += RECOMP_DF_STEP(1); /* stosb */"]
         if m == "stosd":
-            return ["MEM32(edi) = eax; edi += 4; /* stosd */"]
+            return ["MEM32(edi) = eax; edi += RECOMP_DF_STEP(4); /* stosd */"]
         if m == "lodsb":
-            return ["SET_LO8(eax, MEM8(esi)); esi++; /* lodsb */"]
+            return ["SET_LO8(eax, MEM8(esi)); esi += RECOMP_DF_STEP(1); /* lodsb */"]
         if m == "lodsd":
-            return ["eax = MEM32(esi); esi += 4; /* lodsd */"]
+            return ["eax = MEM32(esi); esi += RECOMP_DF_STEP(4); /* lodsd */"]
         if m == "movsw":
-            return ["MEM16(edi) = MEM16(esi); esi += 2; edi += 2; /* movsw */"]
+            return ["MEM16(edi) = MEM16(esi); esi += RECOMP_DF_STEP(2);"
+                    " edi += RECOMP_DF_STEP(2); /* movsw */"]
         if m == "stosw":
-            return ["MEM16(edi) = LO16(eax); edi += 2; /* stosw */"]
+            return ["MEM16(edi) = LO16(eax); edi += RECOMP_DF_STEP(2); /* stosw */"]
         if m == "lodsw":
-            return ["SET_LO16(eax, MEM16(esi)); esi += 2; /* lodsw */"]
+            return ["SET_LO16(eax, MEM16(esi)); esi += RECOMP_DF_STEP(2); /* lodsw */"]
         return [f"/* {m} */"]
 
     # ── FPU (x87) ──
 
     # ── SSE (scalar/packed float) ──
+
+
+    # ── MMX ──────────────────────────────────────────────────────
+    #
+    # Pentium III, so MMX is fair game and every XDK codec uses it. These were
+    # all TODO comments, which is a silent no-op leaving the destination
+    # holding its previous value -- a decoder written this way emits the last
+    # frame, or garbage, and never says why.
+    #
+    # mm0..mm7 alias the x87 stack on hardware; they do not here. A title that
+    # mixes the two issues emms between, and emms is a no-op for us, so the
+    # aliasing buys nothing and would cost the separate x87 model.
+    _MMX_BINARY = {
+        "paddb": "MMX_PADDB", "paddw": "MMX_PADDW", "paddd": "MMX_PADDD",
+        "psubb": "MMX_PSUBB", "psubw": "MMX_PSUBW", "psubd": "MMX_PSUBD",
+        "paddsb": "MMX_PADDSB", "paddsw": "MMX_PADDSW",
+        "psubsb": "MMX_PSUBSB", "psubsw": "MMX_PSUBSW",
+        "paddusb": "MMX_PADDUSB", "psubusb": "MMX_PSUBUSB",
+        "pmullw": "MMX_PMULLW", "pmulhw": "MMX_PMULHW",
+        "pmaddwd": "MMX_PMADDWD",
+        "pavgb": "MMX_PAVGB", "pavgw": "MMX_PAVGW",
+        "pminsw": "MMX_PMINSW", "pmaxsw": "MMX_PMAXSW",
+        "pcmpeqb": "MMX_PCMPEQB", "pcmpeqw": "MMX_PCMPEQW",
+        "pcmpeqd": "MMX_PCMPEQD",
+        "pcmpgtb": "MMX_PCMPGTB", "pcmpgtw": "MMX_PCMPGTW",
+        "pcmpgtd": "MMX_PCMPGTD",
+        "punpcklbw": "MMX_PUNPCKLBW", "punpckhbw": "MMX_PUNPCKHBW",
+        "punpcklwd": "MMX_PUNPCKLWD", "punpckhwd": "MMX_PUNPCKHWD",
+        "punpckldq": "MMX_PUNPCKLDQ", "punpckhdq": "MMX_PUNPCKHDQ",
+        "packsswb": "MMX_PACKSSWB", "packuswb": "MMX_PACKUSWB",
+        "packssdw": "MMX_PACKSSDW",
+        "psadbw": "MMX_PSADBW",
+        "pand": "MMX_PAND", "pandn": "MMX_PANDN",
+        "por": "MMX_POR", "pxor": "MMX_PXOR",
+    }
+    _MMX_SHIFT = {
+        "psllw": "MMX_PSLLW", "psrlw": "MMX_PSRLW", "psraw": "MMX_PSRAW",
+        "pslld": "MMX_PSLLD", "psrld": "MMX_PSRLD", "psrad": "MMX_PSRAD",
+        "psllq": "MMX_PSLLQ", "psrlq": "MMX_PSRLQ",
+    }
+
+    def _lift_mmx(self, insn, m, ops):
+        """MMX, when at least one operand is an mm register."""
+        def is_mm(op):
+            return (op.type == "reg" and op.reg
+                    and op.reg.startswith("mm") and not op.reg.startswith("xmm"))
+
+        def src(op):
+            if is_mm(op):
+                return op.reg
+            if op.type == "mem":
+                return f"MMX_MEM({_fmt_mem(op)})"
+            if op.type == "reg":
+                return f"MMX_FROM32({op.reg})"
+            return None
+
+        if not ops:
+            return [f"/* {m}: no operands */"]
+
+        # emms/femms: only the x87 tag word, which is not modelled.
+        if m in ("emms", "femms"):
+            # A real statement, not a comment: this instruction genuinely has
+            # no effect in this model, and the conformance suite treats a
+            # comment-only lift as a silently dropped instruction -- which is
+            # exactly the signal that must stay meaningful for the ones that
+            # really are missing.
+            return [f"(void)0; /* {m}: mm/x87 aliasing is not modelled */"]
+
+        dst = ops[0]
+
+        if m in self._MMX_BINARY and len(ops) >= 2:
+            a, b = src(dst), src(ops[1])
+            if a is None or b is None:
+                return [f"/* TODO: {m} {insn.op_str} */"]
+            if is_mm(dst):
+                return [f"{dst.reg} = {self._MMX_BINARY[m]}({a}, {b}); /* {m} */"]
+            return [f"/* TODO: {m} {insn.op_str} (dst not mm) */"]
+
+        if m in self._MMX_SHIFT and len(ops) >= 2 and is_mm(dst):
+            count = ops[1]
+            if count.type == "imm":
+                cnt = f"{count.imm & 0xFF}u"
+            elif is_mm(count):
+                cnt = f"{count.reg}.q"
+            elif count.type == "mem":
+                cnt = f"MMX_MEM({_fmt_mem(count)}).q"
+            else:
+                return [f"/* TODO: {m} {insn.op_str} */"]
+            return [f"{dst.reg} = {self._MMX_SHIFT[m]}({dst.reg}, {cnt}); /* {m} */"]
+
+        # cvtps2pi / cvttps2pi: two singles in, two dwords out. The source is
+        # an xmm register or a 64-bit memory operand -- never an mm register,
+        # so it does not go through src() above.
+        if m in ("cvtps2pi", "cvttps2pi") and len(ops) >= 2 and is_mm(dst):
+            trunc = "1" if m == "cvttps2pi" else "0"
+            s_op = ops[1]
+            if s_op.type == "reg" and s_op.reg and s_op.reg.startswith("xmm"):
+                lo, hi = f"{s_op.reg}.f[0]", f"{s_op.reg}.f[1]"
+            elif s_op.type == "mem":
+                addr = _fmt_mem(s_op)
+                lo, hi = f"MEMF({addr})", f"MEMF(({addr}) + 4)"
+            else:
+                return [f"/* TODO: {m} {insn.op_str} */"]
+            return [f"{dst.reg} = MMX_FROM_PS({lo}, {hi}, {trunc}); /* {m} */"]
+
+        if m == "pshufw" and len(ops) >= 3 and is_mm(dst):
+            a = src(ops[1])
+            if a is None:
+                return [f"/* TODO: {m} {insn.op_str} */"]
+            return [f"{dst.reg} = MMX_PSHUFW({a}, {ops[2].imm & 0xFF}u); /* pshufw */"]
+
+        if m == "pinsrw" and len(ops) >= 3 and is_mm(dst):
+            v = (f"{ops[1].reg}" if ops[1].type == "reg"
+                 else f"MEM16({_fmt_mem(ops[1])})" if ops[1].type == "mem" else None)
+            if v is None:
+                return [f"/* TODO: {m} {insn.op_str} */"]
+            return [f"{dst.reg} = MMX_PINSRW({dst.reg}, {v}, "
+                    f"{ops[2].imm & 0xFF}u); /* pinsrw */"]
+
+        if m == "pextrw" and len(ops) >= 3 and is_mm(ops[1]):
+            return [f"{dst.reg} = MMX_PEXTRW({ops[1].reg}, "
+                    f"{ops[2].imm & 0xFF}u); /* pextrw */"]
+
+        if m == "pmovmskb" and len(ops) >= 2 and is_mm(ops[1]):
+            return [f"{dst.reg} = MMX_PMOVMSKB({ops[1].reg}); /* pmovmskb */"]
+
+        # movq / movd between mm, memory and GPRs.
+        if m in ("movq", "movd") and len(ops) >= 2:
+            wide = (m == "movq")
+            if is_mm(dst):
+                if is_mm(ops[1]):
+                    return [f"{dst.reg} = {ops[1].reg}; /* {m} */"]
+                if ops[1].type == "mem":
+                    return ([f"{dst.reg} = MMX_MEM({_fmt_mem(ops[1])}); /* movq */"]
+                            if wide else
+                            [f"{dst.reg} = MMX_FROM32(MEM32({_fmt_mem(ops[1])}));"
+                             " /* movd */"])
+                if ops[1].type == "reg":
+                    return [f"{dst.reg} = MMX_FROM32({ops[1].reg}); /* movd */"]
+            if is_mm(ops[1]):
+                if dst.type == "mem":
+                    return ([f"MMX_STORE({_fmt_mem(dst)}, {ops[1].reg}); /* movq */"]
+                            if wide else
+                            [f"MEM32({_fmt_mem(dst)}) = {ops[1].reg}.ud[0];"
+                             " /* movd */"])
+                if dst.type == "reg":
+                    return [f"{dst.reg} = {ops[1].reg}.ud[0]; /* movd */"]
+            return [f"/* TODO: {m} {insn.op_str} */"]
+
+        # movntq: a non-temporal store. The hint is irrelevant; the store is not.
+        if m == "movntq" and len(ops) >= 2 and dst.type == "mem" and is_mm(ops[1]):
+            return [f"MMX_STORE({_fmt_mem(dst)}, {ops[1].reg}); /* movntq */"]
+
+        self.unimplemented.setdefault(m, []).append(insn.address)
+        return [f"/* TODO: {m} {insn.op_str} */"]
 
     def _lift_sse(self, insn, m, ops):
         """Translate SSE instructions to C float operations."""
