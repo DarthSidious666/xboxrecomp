@@ -33,6 +33,51 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
+extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
+
+/* Would writing this surface land on the title's own image?
+ *
+ * NV097_SET_SURFACE_COLOR_OFFSET is an offset within the colour DMA object,
+ * not a guest virtual address, and this executor has always used it as one.
+ * That is harmless while the two happen to agree and catastrophic when they do
+ * not: the Xbox Dashboard names surface 0x00088000 at 1280x960x4, so clearing
+ * it wrote 4.9 MB of opaque black from 0x00088000 to 0x00538000 -- straight
+ * over its own code, its D3D context at 0x000BBFC0 and the register-block
+ * pointer at 0x000BE2C4. The symptom was a title that submitted one perfect
+ * frame and then spun forever in a pushbuffer-full loop, three layers away,
+ * with every D3D global reading 0xFF000000: the clear colour.
+ *
+ * So refuse, and say so. Getting the address right needs the DMA object base
+ * this ignores (NV097_SET_CONTEXT_DMA_COLOR); until that exists, writing
+ * nothing is strictly better than writing over the guest, and a title that
+ * cannot draw is easier to debug than one that has been overwritten.
+ */
+static int surface_hits_image(uint32_t base, uint32_t bytes)
+{
+    if (!g_xbox_image_hi || !bytes)
+        return 0;
+    return base < g_xbox_image_hi && base + bytes > g_xbox_image_lo;
+}
+
+static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
+{
+    static int said;
+
+    if (!surface_hits_image(base, bytes))
+        return 0;
+    if (!said) {
+        said = 1;
+        fprintf(stderr,
+                "  [GPU] REFUSING to %s surface 0x%08X..0x%08X: that overlaps "
+                "the loaded image (0x%08X..0x%08X).\n"
+                "  [GPU]   SET_SURFACE_COLOR_OFFSET is a DMA-object offset, not "
+                "a guest VA, and this executor treats it as one. Writing here "
+                "would destroy the title's own code and globals.\n",
+                what, base, base + bytes, g_xbox_image_lo, g_xbox_image_hi);
+        fflush(stderr);
+    }
+    return 1;
+}
 
 /* NV097 methods this executor acts on. */
 #define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
@@ -231,6 +276,10 @@ static void clear_surface(uint32_t param)
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
+    if (surface_write_refused(s_gpu.color_offset,
+                              (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch,
+                              "clear"))
+        return;
 
     for (y = 0; y < s_gpu.clip_h; y++) {
         uint8_t *row = mem + s_gpu.color_offset
@@ -349,6 +398,12 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
         return;
     if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
+        return;
+    /* Same reason the clear checks: a rasterised triangle writes guest memory
+     * too, and a surface address that lands on the image is no safer one pixel
+     * at a time than 4.9 MB at once. */
+    if (surface_hits_image(s_gpu.color_offset,
+                           (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return;
     row = mem + s_gpu.color_offset + (size_t)y * s_gpu.pitch;
     if (bpp == 4) {

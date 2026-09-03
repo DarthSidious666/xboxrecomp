@@ -499,7 +499,22 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     }
                 }
                 last_put = put; last_put_ms = now_ms;
-                fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X\n", put);
+                /* GET as well as PUT. A title that stops submitting has either
+                 * finished or is spinning on the GPU catching up, and only GET
+                 * tells those apart -- D3D waits for GET to reach PUT before it
+                 * reuses the buffer, so GET stuck behind PUT is the shape of a
+                 * pushbuffer-full hang. Also show the same pair as the Xbox
+                 * Dashboard reads them: its D3D holds a register-block pointer
+                 * in its device struct rather than assuming 0xFD800000, and
+                 * mirroring the wrong block leaves it spinning on a GET that
+                 * never moves. */
+                {
+                    uint32_t g = *(volatile uint32_t *)
+                                 ((char *)regs + NV2A_USER_DMA_GET);
+                    fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
+                            "0x%08X%s\n", put, g,
+                            g == put ? "" : "  (GPU behind)");
+                }
                 fflush(stderr);
             }
         }
@@ -566,6 +581,8 @@ ptrdiff_t g_xbox_mem_offset = 0;
  *
  * Zero until the layout is initialised, which the macro treats as "allow" so
  * nothing breaks before the title is loaded. */
+uint32_t g_xbox_image_lo = 0;
+uint32_t g_xbox_image_hi = 0;
 uint32_t g_xbox_code_lo = 0;
 uint32_t g_xbox_code_hi = 0;
 
@@ -1067,6 +1084,16 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             if (copy_size > 0 && sec_raw_off + copy_size <= xbe_size) {
                 memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
             }
+
+            /* Every loaded section, executable or not. Anything that writes
+             * guest memory from outside the title -- the pushbuffer executor
+             * clearing a surface, say -- needs to know where the title itself
+             * lives, because scribbling on it is not a rendering artefact, it
+             * is the title's code and globals gone. */
+            if (!g_xbox_image_lo || sec_va < g_xbox_image_lo)
+                g_xbox_image_lo = sec_va;
+            if (sec_va + sec_vsize > g_xbox_image_hi)
+                g_xbox_image_hi = sec_va + sec_vsize;
 
             /* Executable sections define the range indirect calls may target.
              * XBE section flag 0x04 is EXECUTABLE. */

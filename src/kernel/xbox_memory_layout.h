@@ -91,6 +91,12 @@ uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align);
  * without including the generated-code header, which redefines `eax` and
  * friends as macros.
  */
+/* Full extent of the loaded XBE image -- every section, not just the
+ * executable ones. Anything writing guest memory on the title's behalf must
+ * stay out of this range. */
+extern uint32_t g_xbox_image_lo;
+extern uint32_t g_xbox_image_hi;
+
 extern uint32_t g_xbox_code_lo;
 extern uint32_t g_xbox_code_hi;
 void xbox_SetTotalRam(size_t bytes);
