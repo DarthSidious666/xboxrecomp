@@ -1158,6 +1158,27 @@ class Lifter:
             expr = {"stc": "1", "clc": "0", "cmc": "!_cf"}[m]
             return [f"_cf = {expr}; /* {m} */"]
 
+        # ── Time stamp counter ──
+        #
+        # The guest reads wall-clock time through it. Xbox's
+        # QueryPerformanceCounter is literally `rdtsc`, and its
+        # QueryPerformanceFrequency returns the CPU clock as a constant --
+        # Half-Life 2's is 0x2BB5C755 (733,333,333 Hz) at 0x0059C6C7. So a
+        # frame timer computes seconds as counter / 733333333, and an rdtsc
+        # that does nothing leaves the counter fixed: every "now - last" is
+        # zero, and a loop waiting for time to pass never finishes. HL2 spins
+        # 300 million times in sub_0040F4E0 doing exactly that.
+        #
+        # The runtime scales the host's counter to the console's clock rate
+        # rather than returning the host TSC, so the guest's own division by
+        # its hardcoded frequency yields real seconds.
+        if m == "rdtsc":
+            return [
+                "{ uint64_t _tsc = xbox_ReadTimeStampCounter();",
+                "  eax = (uint32_t)_tsc; edx = (uint32_t)(_tsc >> 32); }"
+                "  /* rdtsc */",
+            ]
+
         # ── Bit scan ──
         # Index of the lowest (bsf) or highest (bsr) set bit. When the source
         # is zero the destination is left untouched and ZF is set; that is the

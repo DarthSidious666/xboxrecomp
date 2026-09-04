@@ -276,6 +276,15 @@ void recomp_icall_not_code_log(uint32_t va);
  * init calls does it not come back from", and answering that by
  * overriding a function loses the body you were trying to observe.
  */
+/* The guest's time source.
+ *
+ * Xbox's QueryPerformanceCounter is a bare rdtsc and its
+ * QueryPerformanceFrequency returns the CPU clock as a constant, so the guest
+ * divides this by 733,333,333 to get seconds. Returning the host TSC would
+ * make that division wrong by the ratio of the two clocks; the runtime scales
+ * to the console's rate instead. */
+uint64_t xbox_ReadTimeStampCounter(void);
+
 void recomp_trace_enter(const char *name, uint32_t va);
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
 void recomp_trace_exit(const char *name, uint32_t va);
