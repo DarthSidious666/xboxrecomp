@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -57,6 +58,36 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
     if (!g_xbox_image_hi || !bytes)
         return 0;
     return base < g_xbox_image_hi && base + bytes > g_xbox_image_lo;
+}
+
+/* Where a surface offset actually lives.
+ *
+ * NV097_SET_SURFACE_COLOR_OFFSET is an offset inside the colour DMA object,
+ * and for a framebuffer that object covers physical memory -- so the offset
+ * is a physical address, not a guest VA. Those are the same number in this
+ * runtime, which is why treating it as a VA works until it does not: on
+ * hardware the image is mapped at VA 0x00010000 from arbitrary physical
+ * pages, so a framebuffer at physical 0x84000 does not overlap it. Here it
+ * would.
+ *
+ * The title tells us which it is by where it allocated. Half-Life 2's
+ * framebuffer comes from MmAllocateContiguousMemory, which this runtime
+ * serves from the window at XBOX_CONTIG_BASE, so physical P is visible at
+ * XBOX_CONTIG_BASE + P -- clear of the image, and the same bytes the title's
+ * own writes and the framebuffer window reach.
+ *
+ * So: use the offset as a VA when that is credible, and fall back to the
+ * physical mirror exactly when it is not. Titles whose surfaces already sit
+ * in ordinary RAM (Wreckless renders to the tiled alias of physical
+ * 0x01954000) keep the first path and are unaffected.
+ */
+static uint32_t surface_resolve(uint32_t offset)
+{
+    if (!surface_hits_image(offset, 1))
+        return offset;
+    if ((uint64_t)offset < XBOX_CONTIG_SIZE)
+        return XBOX_CONTIG_BASE + offset;
+    return offset;                         /* nothing better to offer */
 }
 
 static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
@@ -113,7 +144,7 @@ static struct {
     uint32_t   idx_count;
     uint32_t   draws, verts, nonzero_draws;
     float      min_x, max_x, min_y, max_y;
-    uint32_t color_offset, pitch, format;
+    uint32_t color_offset, color_base, pitch, format;
     uint32_t clip_x, clip_w, clip_y, clip_h;
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
@@ -233,7 +264,7 @@ static void dump_surface_bmp(void)
 
     /* BMP rows run bottom-up. */
     for (y = h; y-- > 0; ) {
-        const uint8_t *row = mem + s_gpu.color_offset
+        const uint8_t *row = mem + surface_resolve(s_gpu.color_offset)
                            + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
         for (x = 0; x < w; x++) {
             uint8_t bgr[3];
@@ -276,13 +307,17 @@ static void clear_surface(uint32_t param)
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
-    if (surface_write_refused(s_gpu.color_offset,
-                              (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch,
-                              "clear"))
-        return;
+    {
+        uint32_t base = surface_resolve(s_gpu.color_offset);
+        if (surface_write_refused(base,
+                                  (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch,
+                                  "clear"))
+            return;
+        s_gpu.color_base = base;
+    }
 
     for (y = 0; y < s_gpu.clip_h; y++) {
-        uint8_t *row = mem + s_gpu.color_offset
+        uint8_t *row = mem + s_gpu.color_base
                      + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
         if (bpp == 4) {
             uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
@@ -356,7 +391,9 @@ static void clear_surface(uint32_t param)
     /* Show the surface actually being drawn into. A title that double-buffers
      * renders into the back buffer, so following AvSetDisplayMode's address
      * would show the one nothing is writing. */
-    xbox_FramebufferWindowSet(s_gpu.color_offset, s_gpu.pitch);
+    /* The window has to read where the pixels actually are, which is the
+     * resolved address rather than the DMA-object offset. */
+    xbox_FramebufferWindowSet(surface_resolve(s_gpu.color_offset), s_gpu.pitch);
 
     /* And open the window, rather than waiting for AvSetDisplayMode to do it.
      *
@@ -402,10 +439,10 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     /* Same reason the clear checks: a rasterised triangle writes guest memory
      * too, and a surface address that lands on the image is no safer one pixel
      * at a time than 4.9 MB at once. */
-    if (surface_hits_image(s_gpu.color_offset,
+    if (surface_hits_image(surface_resolve(s_gpu.color_offset),
                            (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return;
-    row = mem + s_gpu.color_offset + (size_t)y * s_gpu.pitch;
+    row = mem + surface_resolve(s_gpu.color_offset) + (size_t)y * s_gpu.pitch;
     if (bpp == 4) {
         ((uint32_t *)row)[x] = argb;
     } else if (bpp == 2) {

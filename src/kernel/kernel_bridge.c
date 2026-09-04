@@ -1429,7 +1429,20 @@ static void bridge_AvSetDisplayMode(void)
          * to show and no pitch to interpret it with. */
         extern void xbox_FramebufferWindowSet(uint32_t, uint32_t);
         extern void xbox_FramebufferWindowStart(void);
-        xbox_FramebufferWindowSet(fb, pitch);
+        uint32_t fb_va = fb;
+
+        /* AvSetDisplayMode reports the scanout address the way the CRTC wants
+         * it -- a physical address. The window has to read it the way the CPU
+         * sees it. Where the title allocated says which: a framebuffer from
+         * MmAllocateContiguousMemory lives in the window at XBOX_CONTIG_BASE,
+         * so physical P is visible at XBOX_CONTIG_BASE + P. Reading P
+         * directly lands in the loaded image instead, which is why the window
+         * showed black while the executor was clearing and rasterising
+         * correctly a few megabytes away. */
+        if (fb_va && fb_va < XBOX_CONTIG_SIZE)
+            fb_va = XBOX_CONTIG_BASE + fb_va;
+
+        xbox_FramebufferWindowSet(fb_va, pitch);
         xbox_FramebufferWindowStart();
     }
     xbox_AvSetDisplayMode(XBOX_TO_NATIVE(addr), step, mode, format, pitch, fb);
