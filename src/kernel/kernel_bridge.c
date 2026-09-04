@@ -1206,11 +1206,27 @@ static void bridge_NtWaitForSingleObjectEx(void)
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
-/* NtWaitForMultipleObjectsEx (ordinal 235, 5 args = 20 bytes)
+/* NtWaitForMultipleObjectsEx (ordinal 235, 6 args = 24 bytes)
  *
  * NTSTATUS NtWaitForMultipleObjectsEx(ULONG Count, HANDLE *Handles,
- *                                     ULONG WaitType, BOOLEAN Alertable,
+ *                                     WAIT_TYPE WaitType,
+ *                                     KPROCESSOR_MODE WaitMode,
+ *                                     BOOLEAN Alertable,
  *                                     PLARGE_INTEGER Timeout);
+ *
+ * Six, not five: WaitMode sits between WaitType and Alertable. Half-Life 2's
+ * own call site settles it -- sub_0059BE0F pushes six dwords before the
+ * thunk (esi, eax, ebx, 1, [ebp+0x18], edi) and the callee is expected to pop
+ * them all.
+ *
+ * Getting it wrong cost 4 bytes of guest stack per call and shifted every
+ * argument after WaitType, so the wait read Alertable as its timeout pointer
+ * and reported INFINITE for every wait. The leak was invisible to the esp
+ * invariant because sub_0059BE0F restores esp with `leave`: its own frame
+ * came back correct while `pop edi; pop esi; pop ebx` took their values one
+ * slot out, so the caller's `this` -- kept in ebx by sub_005ACDC0 -- came
+ * back holding what esi had, and the next [ebx+0x94] read a string as a
+ * pointer.
  *
  * xbox_NtWaitForMultipleObjectsEx has been in kernel_sync.c all along; only
  * the bridge wrapper was missing, so the thunk fell through to the fallback
@@ -1229,8 +1245,11 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     uint32_t count       = STACK_ARG(0);
     uint32_t handles_va  = STACK_ARG(1);
     uint32_t wait_type   = STACK_ARG(2);
-    uint32_t alertable   = STACK_ARG(3);
-    uint32_t timeout_ptr = STACK_ARG(4);
+    uint32_t wait_mode   = STACK_ARG(3);   /* KernelMode / UserMode */
+    uint32_t alertable   = STACK_ARG(4);
+    uint32_t timeout_ptr = STACK_ARG(5);
+
+    (void)wait_mode;
     HANDLE   handles[MAXIMUM_WAIT_OBJECTS];
     uint32_t i;
 
@@ -3133,7 +3152,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 232: return 12;  /* NtUserIoApcDispatcher (3) */
     case 233: return 12;  /* NtWaitForSingleObject (3) */
     case 234: return 16;  /* NtWaitForSingleObjectEx (4) */
-    case 235: return 20;  /* NtWaitForMultipleObjectsEx (5) */
+    case 235: return 24;  /* NtWaitForMultipleObjectsEx (6) */
     case 236: return 32;  /* NtWriteFile (8) */
     case 237: return 32;  /* NtWriteFileGather (8) */
     case 238: return  0;  /* NtYieldExecution (void) */
