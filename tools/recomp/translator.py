@@ -524,6 +524,35 @@ class FunctionTranslator:
             return "thiscall"
         return "cdecl"
 
+    _CARRY_CC = frozenset({
+        "b", "nae", "c", "ae", "nb", "nc", "be", "na", "a", "nbe",
+    })
+
+    @staticmethod
+    def _function_needs_cf(instructions):
+        """True when something in the function reads CF."""
+        from .lifter import (FLAG_SETTERS, CF_TRACKED,
+                             _EFLAGS_SETTERS, _FLAGS_UNDEFINED)
+
+        last_setter = None
+        for insn in instructions:
+            m = insn.mnemonic
+            if m in ("adc", "sbb", "stc", "clc", "cmc"):
+                return True
+            cc = None
+            if m.startswith("j") and len(m) > 1:
+                cc = m[1:]
+            elif m.startswith("set"):
+                cc = m[3:]
+            if (cc in FunctionTranslator._CARRY_CC
+                    and last_setter in CF_TRACKED):
+                return True
+            if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
+                last_setter = m
+            elif m in _FLAGS_UNDEFINED:
+                last_setter = None
+        return False
+
     def _func_has_prologue(self, instructions):
         """Check if function starts with push ebp; mov ebp, esp."""
         if len(instructions) < 2:
@@ -770,9 +799,15 @@ class FunctionTranslator:
             # width, so the branch tests what the compare saw.
 
 
-        # Add _cf for carry-dependent instructions (sbb, adc)
-        has_carry = any(insn.mnemonic in ("sbb", "adc")
-                        for insn in instructions)
+        # Add _cf for carry-dependent instructions.
+        #
+        # adc/sbb read CF directly, and so does a jb/jae whose flags came from
+        # arithmetic rather than a cmp -- the bit-stream decoders in the Xbox
+        # XCompress code are nothing but "add reg,reg" followed by jae. Which
+        # setter a branch reads is the lifter's tracking rule, mirrored here so
+        # only the functions that consume CF declare it: computing it beside
+        # every add in the image would be a line per add in 48,000 functions.
+        has_carry = self._function_needs_cf(instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
         # Only functions that consume CF pay for producing it: an adc/sbb

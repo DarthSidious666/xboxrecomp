@@ -246,6 +246,16 @@ FLAG_SETTERS = frozenset({
     "comiss", "comisd", "ucomiss", "ucomisd",  # SSE float compare
 })
 
+# Arithmetic whose carry-out the lifter computes into _cf next to the write.
+#
+# A jb/jae reading CF after one of these is exact, which matters because the
+# generic fallback is a _flags variable nothing ever assigns -- the condition
+# came out always-false. MSVC's bit-oriented decoders are built entirely from
+# this shape: "add reg, reg" to shift the top bit into CF, then jae on it.
+CF_TRACKED = frozenset({
+    "add", "sub", "adc", "sbb", "shl", "shr", "sar",
+})
+
 # Additional instructions that modify EFLAGS (tracked but handled as generic)
 _EFLAGS_SETTERS = frozenset({
     "shld", "shrd", "rol", "ror", "rcl", "rcr",  # Shifts/rotates set CF
@@ -467,6 +477,26 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc == "jnp":
             return f"(!RECOMP_PARITY8(({lhs}) & ({rhs})))", desc
         return None
+
+    # ── carry conditions, from the _cf the arithmetic already produced ──
+    #
+    # Ahead of the per-mnemonic rules below, which reconstruct CF from the
+    # operands after the write: that reconstruction is wrong whenever the
+    # destination is also the source, because both sides then read the result.
+    # "add edx, edx" -- the way MSVC shifts a bit into the carry -- turned into
+    # "edx < edx", always false. _cf is computed before the write, so it holds
+    # for every operand shape, and the translator declares it exactly when a
+    # branch like this one is going to read it.
+    if flag_setter in CF_TRACKED:
+        if jcc in ("jb", "jnae", "jc"):
+            return "_cf", desc
+        if jcc in ("jae", "jnb", "jnc"):
+            return "!_cf", desc
+        # ZF as well: after these the destination holds the result.
+        if jcc in ("jbe", "jna"):
+            return f"(_cf || {lhs} == 0)", desc
+        if jcc in ("ja", "jnbe"):
+            return f"(!_cf && {lhs} != 0)", desc
 
     # ── sub: a = a - b, flags from (a_orig - b) ──
     if flag_setter == "sub":
@@ -1870,11 +1900,25 @@ class Lifter:
 
         cond_info = COND_MAP.get(jcc)
         desc = cond_info[2] if cond_info else jcc
+
+        # Flag tracking resets at a block boundary, because which predecessor
+        # arrives is not known here. _cf survives it: it is a real variable
+        # holding the carry, so a jb/jae landing on a label still reads the
+        # right bit while the generic _flags fallback -- which nothing ever
+        # assigns -- is silently always false. The XCompress bit reader jumps
+        # into the middle of its refill exactly this way.
+        cond = "_flags"
+        if self.needs_cf:
+            if jcc in ("jb", "jnae", "jc"):
+                cond = "_cf"
+            elif jcc in ("jae", "jnb", "jnc"):
+                cond = "!_cf"
+
         if target:
             if self._is_external_target(target):
                 name = self._call_target_name(target)
-                return [f"if (_flags /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
-            return [f"if (_flags /* {jcc}: {desc} */) goto loc_{target:08X};"]
+                return [f"if ({cond} /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
+            return [f"if ({cond} /* {jcc}: {desc} */) goto loc_{target:08X};"]
         return [f"/* {jcc}: {desc} - no target */"]
 
     # ── SETcc / CMOVcc ──
