@@ -896,6 +896,39 @@ static void bridge_NtFreeVirtualMemory(void)
  * Titles read region, language and AV settings from EEPROM through this very
  * early in boot. Ordinal 24 was previously routed to bridge_ExQueryPoolBlockSize,
  * so the call returned a pool size where the game expected a settings blob. */
+/* ── FscGetCacheSize (35) / FscSetCacheSize (37) ───────────
+ *
+ * The Xbox filesystem cache, sized in 4 KB pages. A title that streams from a
+ * pack file resizes it around the work: Half-Life 2's pack scanner
+ * (sub_0041E650) reads the current size, sets 1 MB for the scan, and puts the
+ * old value back when it is done.
+ *
+ * There is no cache here -- reads go to the host filesystem, which has its
+ * own -- so the size is only ever a number the title stores and restores.
+ * Keeping it is still worth doing: unbridged, the getter returned 0, and a
+ * title that saves that and restores it later is restoring a cache size of
+ * zero pages. 64 KB is the console's own default.
+ */
+#define XBOX_FSCACHE_DEFAULT_PAGES 16u      /* 64 KB in 4 KB pages */
+
+static uint32_t g_fscache_pages = XBOX_FSCACHE_DEFAULT_PAGES;
+
+static void bridge_FscGetCacheSize(void)
+{
+    g_eax = g_fscache_pages;
+}
+
+static void bridge_FscSetCacheSize(void)
+{
+    uint32_t pages = STACK_ARG(0);
+
+    /* The kernel rejects a request it cannot satisfy and leaves the current
+     * size alone; the caller checks for a negative status. Nothing here can
+     * fail, so accept it and remember what was asked for. */
+    g_fscache_pages = pages;
+    g_eax = STATUS_SUCCESS;
+}
+
 static void bridge_ExQueryNonVolatileSetting(void)
 {
     uint32_t value_index  = STACK_ARG(0);
@@ -3300,7 +3333,11 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
 
     /* ── Crypto ── */
 
-    default:  return  0;  /* DATA exports or truly unknown */
+    /* Not 0: a genuine zero-argument function and an ordinal nobody has
+     * written down are both "pop nothing", but only one of them is a
+     * problem, and the warning below could not tell them apart -- it
+     * accused FscGetCacheSize, which really does take no arguments. */
+    default:  return -1;  /* DATA exports or truly unknown */
     }
 }
 
@@ -3351,6 +3388,8 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case  14: return bridge_ExAllocatePool;
     case  15: return bridge_ExAllocatePoolWithTag;
     case  23: return bridge_ExQueryPoolBlockSize;
+    case  35: return bridge_FscGetCacheSize;
+    case  37: return bridge_FscSetCacheSize;
     case  24: return bridge_ExQueryNonVolatileSetting;
 
     /* IRQL */
@@ -3547,6 +3586,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
 static bridge_func_t g_slot_bridges[XBOX_KERNEL_THUNK_TABLE_SIZE];
 static int g_slot_arg_bytes[XBOX_KERNEL_THUNK_TABLE_SIZE];
+static uint8_t g_slot_arg_unknown[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
 /* Xbox VA to sample around each bridge call; 0 = off. See dispatch. */
 uint32_t g_kernel_watch_va = 0;
@@ -3674,7 +3714,7 @@ static void kernel_thunk_dispatch(void)
              * returns with its callee-saved registers rotated -- silently,
              * frames away from here. Say so, because a title that dies of this
              * looks nothing like a title that is missing a kernel function. */
-            if (g_slot_arg_bytes[slot] == 0)
+            if (g_slot_arg_unknown[slot])
                 fprintf(stderr, "  [KERNEL]   ordinal %u has no entry in "
                         "stdcall_args_for_ordinal(). If it takes arguments, "
                         "this call is corrupting the caller's stack -- add its "
@@ -3844,7 +3884,9 @@ void xbox_kernel_bridge_init(void)
 
             /* FUNCTION export: use synthetic VA for dispatch */
             g_slot_bridges[i] = bridge_for_ordinal(ordinal);
-            g_slot_arg_bytes[i] = stdcall_args_for_ordinal(ordinal);
+            { int _n = stdcall_args_for_ordinal(ordinal);
+              g_slot_arg_unknown[i] = (uint8_t)(_n < 0);
+              g_slot_arg_bytes[i] = (_n < 0) ? 0 : _n; }
             if (g_slot_bridges[i]) {
                 bridged++;
             } else {
@@ -3899,7 +3941,9 @@ void xbox_kernel_bridge_init(void)
 
             g_slot_ordinals[slot] = current & 0x7FFFFFFF;
             g_slot_bridges[slot] = bridge_for_ordinal(g_slot_ordinals[slot]);
-            g_slot_arg_bytes[slot] = stdcall_args_for_ordinal(g_slot_ordinals[slot]);
+            { int _n = stdcall_args_for_ordinal(g_slot_ordinals[slot]);
+              g_slot_arg_unknown[slot] = (uint8_t)(_n < 0);
+              g_slot_arg_bytes[slot] = (_n < 0) ? 0 : _n; }
             BRIDGE_MEM32(va) = KERNEL_VA_BASE + slot * 4;
             resolved++;
             if (g_slot_bridges[slot]) bridged++; else unbridged++;
