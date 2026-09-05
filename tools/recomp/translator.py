@@ -562,6 +562,31 @@ class FunctionTranslator:
                 instructions[1].mnemonic == "mov" and
                 instructions[1].op_str == "ebp, esp")
 
+    def _func_owns_a_frame(self, instructions):
+        """True when the function has a frame, however it got one.
+
+        __SEH_prolog builds its caller's frame for it -- "lea ebp, [esp+0x10]"
+        inside the helper, after stashing the old ebp in the new frame -- so a
+        function that calls it owns a real frame without ever writing ebp
+        itself. Judging only on "push ebp; mov ebp, esp" calls those frameless,
+        and then the frame is never re-published across their calls: any
+        callee with a frame overwrites g_seh_ebp on entry and nothing puts it
+        back, so the next frameless callee inherits a dead frame.
+
+        Half-Life 2 hits this on its __finally funclets, which are ordinary
+        calls into a shared tail that reads the parent's locals through
+        g_seh_ebp. One of them leaves a critical section via
+        [[ebp-0x2c]+0x580]; with a stale frame that read a KeyValues string as
+        a pointer.
+        """
+        if self._func_has_prologue(instructions):
+            return True
+        seh_prolog = getattr(self.lifter, "SEH_PROLOG", None)
+        if seh_prolog is None:
+            return False
+        return any(getattr(insn, "call_target", None) == seh_prolog
+                   for insn in instructions)
+
     def translate_function(self, func_addr, func_info):
         """
         Translate a single function to C code.
@@ -815,7 +840,7 @@ class FunctionTranslator:
         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
         # idiom MSVC emits for odd trailing elements.
         self.lifter.needs_cf = has_carry
-        self.lifter.publishes_ebp = self._func_has_prologue(instructions)
+        self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
 
         # SSE and MMX are architectural state, declared globally by the
         # runtime exactly like the GPRs and the x87 stack. Declaring either
