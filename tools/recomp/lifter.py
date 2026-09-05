@@ -656,6 +656,22 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if flag_setter in ("bt", "bts", "btr", "btc"):
         if rhs is None:
             return None
+        # Same bit-string rule as the lifter above: a memory bit base with a
+        # register offset addresses a string, so the dword is chosen by
+        # offset/32 and only then is the bit offset%32. This is the half that
+        # does the testing -- MSVC's strpbrk loop is "bt [esp], eax" fused with
+        # the jae that follows it.
+        if (len(flag_ops) >= 2 and flag_ops[0].type == "mem"
+                and flag_ops[1].type != "imm"):
+            base = _fmt_mem(flag_ops[0])
+            off = _fmt_operand_read(flag_ops[1])
+            bit = (f"((MEM32(({base}) + (((int32_t)({off}) >> 5) * 4))"
+                   f" >> (({off}) & 31)) & 1)")
+            if jcc in ("jb", "jnae", "jc"):
+                return bit, desc
+            if jcc in ("jae", "jnb", "jnc"):
+                return f"!{bit}", desc
+            return None
         if jcc in ("jb", "jnae", "jc"):
             return f"(({lhs} >> ({rhs} & 31)) & 1)", desc
         if jcc in ("jae", "jnb", "jnc"):
@@ -1062,6 +1078,45 @@ class Lifter:
         # a comment and the bit was silently left alone.
         if m in ("bt", "btr", "bts", "btc") and nops >= 2:
             dst, bit = ops[0], ops[1]
+
+            # A memory bit base with a *register* offset is a bit string, not a
+            # dword: the operand addresses the byte holding bit 0, and the
+            # offset then runs over the whole string, so the hardware reads the
+            # dword at base + (offset/32)*4 and takes bit offset%32. Masking the
+            # offset to 31 instead -- which is right only for a register bit
+            # base, where the offset really is taken modulo the operand size --
+            # folds the entire string onto its first dword.
+            #
+            # MSVC builds strpbrk, strspn and strcspn out of exactly this: eight
+            # zero dwords pushed as a 256-bit character map, "bts [esp], eax"
+            # per character of the set, "bt [esp], eax" per character of the
+            # string. Folded onto one dword the map aliases mod 32, so '?'
+            # (0x3F) sets the same bit '_' (0x5F) tests. Half-Life 2 stats every
+            # file for wildcards before opening it, and its archives are
+            # zip0_xbox.xzp and zip0_xbox_english.xzp -- every path with an
+            # underscore came back "contains a wildcard" and the engine loaded
+            # no content at all.
+            #
+            # An immediate offset is genuinely limited to 0..31 within the
+            # addressed dword, so it keeps the simple form.
+            if dst.type == "mem" and bit.type != "imm":
+                base = _fmt_mem(dst)
+                off = _fmt_operand_read(bit)
+                word = f"MEM32(({base}) + (((int32_t)({off}) >> 5) * 4))"
+                index = f"(({off}) & 31)"
+                out = []
+                if self.needs_cf:
+                    out.append(f"_cf = (int)(({word} >> {index}) & 1u);"
+                               f" /* {m}: CF = bit */")
+                update = {"btr": f"{word} & ~(1u << {index})",
+                          "bts": f"{word} | (1u << {index})",
+                          "btc": f"{word} ^ (1u << {index})"}.get(m)
+                if update:
+                    out.append(f"{word} = ({update}); /* {m} */")
+                elif not out:
+                    out.append(f"/* bt {insn.op_str}: no CF consumer */")
+                return out
+
             index = (f"({_fmt_imm(bit.imm)})" if bit.type == "imm"
                      else f"({_fmt_operand_read(bit)} & 31)")
             value = _fmt_operand_read(dst)
