@@ -2360,10 +2360,22 @@ static void bridge_NtReadFile(void)
     {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
-        fprintf(stderr, "  [READ] want=%u got=%u st=0x%08X %02X %02X %02X %02X\n",
-                length, got, (uint32_t)ios.Status,
-                got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
-                got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+        /* The offset matters as much as the length. A title streaming a pack
+         * file reads sector-aligned chunks, so the first bytes belong to
+         * whatever precedes the file it actually wants, and a read that stops
+         * early looks identical to one that never started -- until you can
+         * see where each one landed. */
+        if (poff)
+            fprintf(stderr, "  [READ] @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    (long long)off.QuadPart, length, got,
+                    (uint32_t)ios.Status,
+                    got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
+                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+        else
+            fprintf(stderr, "  [READ] @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    length, got, (uint32_t)ios.Status,
+                    got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
+                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         fflush(stderr);
     }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
