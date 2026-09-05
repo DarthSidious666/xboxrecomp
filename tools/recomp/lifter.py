@@ -1996,21 +1996,49 @@ class Lifter:
         # literal, because EFLAGS.DF decides the direction and the block
         # forms (memcpy/memset) are only valid forwards. See g_df in
         # recomp_types.h for what a missing direction flag actually costs.
+        # Forward "rep movs" is NOT memcpy. The hardware copies one element at
+        # a time, so when the ranges overlap with the destination ahead of the
+        # source the copy reads bytes it has already written and the pattern
+        # propagates -- which is exactly how every LZ decompressor emits a run:
+        # a match of distance 1 and length N repeats one byte N times. memcpy
+        # is undefined on overlap, and a vectorised one reads ahead and writes
+        # the pre-copy bytes, so runs come out wrong while everything else
+        # looks fine.
+        #
+        # Half-Life 2's disc archives decompressed to exactly the right length
+        # with 165,448 wrong bytes in them, spread over 352 of 26,530 blocks:
+        # every difference a zero where a repeated byte belonged. The backward
+        # (DF=1) path was already an explicit loop and was already correct;
+        # only the common direction took the shortcut.
+        #
+        # memcpy is still used when the ranges provably do not overlap, which
+        # is the overwhelming majority of calls.
         if "movsb" in m:
-            return ["if (!g_df) { memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx);"
-                    " esi += ecx; edi += ecx; }",
+            return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
+                    " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx;",
+                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  else { uint32_t _i; for (_i = 0; _i < _n; _i++) _d[_i] = _s[_i]; }",
+                    "  esi += ecx; edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM8(edi - _i) = MEM8(esi - _i); esi -= ecx; edi -= ecx; }",
                     "ecx = 0; /* rep movsb */"]
         if "movsd" in m:
-            return ["if (!g_df) { memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 4);"
-                    " esi += ecx * 4; edi += ecx * 4; }",
+            return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
+                    " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 4;",
+                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM32(edi + _i*4) = MEM32(esi + _i*4); }",
+                    "  esi += ecx * 4; edi += ecx * 4; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM32(edi - _i*4) = MEM32(esi - _i*4); esi -= ecx * 4; edi -= ecx * 4; }",
                     "ecx = 0; /* rep movsd */"]
         if "movsw" in m:
-            return ["if (!g_df) { memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 2);"
-                    " esi += ecx * 2; edi += ecx * 2; }",
+            return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
+                    " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 2;",
+                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM16(edi + _i*2) = MEM16(esi + _i*2); }",
+                    "  esi += ecx * 2; edi += ecx * 2; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM16(edi - _i*2) = MEM16(esi - _i*2); esi -= ecx * 2; edi -= ecx * 2; }",
                     "ecx = 0; /* rep movsw */"]
