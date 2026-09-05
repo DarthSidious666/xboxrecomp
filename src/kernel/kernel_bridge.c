@@ -929,6 +929,58 @@ static void bridge_FscSetCacheSize(void)
     g_eax = STATUS_SUCCESS;
 }
 
+/* ── RtlCompareMemory (268) / RtlCompareMemoryUlong (269) ──
+ *
+ * Both answer "how far do these match", counted in bytes from the start, and
+ * both are used to decide whether a buffer needs work rather than to do it.
+ * Unbridged they returned 0, which reads as "differs at the first byte" -- the
+ * safe-looking answer that is wrong whenever the caller is checking for a
+ * region it can skip.
+ *
+ * RtlCompareMemoryUlong compares against a repeating ULONG and only ever
+ * examines whole ULONGs, so a length that is not a multiple of four leaves the
+ * remainder uncompared; the count it returns is still in bytes.
+ */
+static void bridge_RtlCompareMemory(void)
+{
+    uint32_t a_va   = STACK_ARG(0);
+    uint32_t b_va   = STACK_ARG(1);
+    uint32_t length = STACK_ARG(2);
+    const uint8_t *a, *b;
+    uint32_t i;
+
+    if (!a_va || !b_va || !length) {
+        g_eax = 0;
+        return;
+    }
+    a = (const uint8_t *)XBOX_TO_NATIVE(a_va);
+    b = (const uint8_t *)XBOX_TO_NATIVE(b_va);
+    for (i = 0; i < length; i++) {
+        if (a[i] != b[i])
+            break;
+    }
+    g_eax = i;
+}
+
+static void bridge_RtlCompareMemoryUlong(void)
+{
+    uint32_t base_va = STACK_ARG(0);
+    uint32_t length  = STACK_ARG(1);
+    uint32_t pattern = STACK_ARG(2);
+    uint32_t i;
+
+    if (!base_va) {
+        g_eax = 0;
+        return;
+    }
+    length &= ~3u;                      /* whole ULONGs only */
+    for (i = 0; i < length; i += 4) {
+        if (BRIDGE_MEM32(base_va + i) != pattern)
+            break;
+    }
+    g_eax = i;
+}
+
 static void bridge_ExQueryNonVolatileSetting(void)
 {
     uint32_t value_index  = STACK_ARG(0);
@@ -3388,6 +3440,8 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case  14: return bridge_ExAllocatePool;
     case  15: return bridge_ExAllocatePoolWithTag;
     case  23: return bridge_ExQueryPoolBlockSize;
+    case 268: return bridge_RtlCompareMemory;
+    case 269: return bridge_RtlCompareMemoryUlong;
     case  35: return bridge_FscGetCacheSize;
     case  37: return bridge_FscSetCacheSize;
     case  24: return bridge_ExQueryNonVolatileSetting;

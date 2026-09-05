@@ -278,14 +278,29 @@ class FunctionDetector:
                 cc_run_length = i - cc_start
 
                 if cc_run_length >= config.MIN_CC_RUN and i < len(data):
-                    # Check if instruction before CC run was a ret
+                    # Check what the CC run interrupts.
+                    #
+                    # A `ret` is the obvious terminator, but a tail call ends a
+                    # function just as completely: MSVC turns "return f(x)" into
+                    # a bare `jmp f` and pads to the next boundary exactly as it
+                    # would after a `ret`. Only accepting `ret` left the
+                    # function before such a jmp running on through the padding
+                    # and swallowing the next function whole -- and a vtable
+                    # slot pointing into the middle of that merged range then
+                    # has no function to resolve to, so the indirect call is
+                    # skipped at runtime rather than made.
+                    #
+                    # The back-scan has to reach 5 bytes for `jmp rel32`; at 3
+                    # it could not have seen one even if it had looked. Only
+                    # instructions the sweep actually decoded at that address
+                    # are considered, so this cannot invent a misaligned one.
                     before_addr = va_start + cc_start
-                    # Look for a ret instruction ending right at the CC run
                     found_ret = False
-                    for check_offset in range(1, 4):  # ret can be 1-3 bytes
+                    for check_offset in range(1, 8):
                         check_addr = before_addr - check_offset
                         insn = self.engine.get_instruction(check_addr)
-                        if insn and insn.is_ret and insn.end_address == before_addr:
+                        if (insn and insn.end_address == before_addr
+                                and (insn.is_ret or insn.is_jump)):
                             found_ret = True
                             break
 
