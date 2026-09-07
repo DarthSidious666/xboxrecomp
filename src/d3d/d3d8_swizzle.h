@@ -61,42 +61,26 @@ static inline uint32_t swizzle_compact(uint32_t v)
 }
 
 /**
- * Compute the swizzled (Morton code) offset for coordinates (x, y)
- * within a texture of dimensions (width, height).
+ * Deposit the low bits of `v` into the set bits of `mask`, lowest to lowest.
  *
- * For non-square textures, the larger dimension's bits are spread
- * and the smaller dimension is masked. This handles the "folding"
- * behavior where the swizzle pattern wraps within power-of-2 tiles.
+ * This is the scalar form of BMI2's PDEP, and it is what interleaving a
+ * coordinate into a Morton code actually requires. The bit-spreading trick
+ * one function below only produces the even positions, so it can fill an X
+ * mask and never a Y mask -- see the note on swizzle_offset.
  */
-static inline uint32_t swizzle_offset(uint32_t x, uint32_t y,
-                                       uint32_t width, uint32_t height)
+static inline uint32_t swizzle_deposit(uint32_t v, uint32_t mask)
 {
-    /* Build masks for X and Y based on texture dimensions.
-     * For a 256x64 texture: x uses bits 0,2,4,6,8,10,12,14 (8 bits for 256)
-     *                        y uses bits 1,3,5,7,9,11 (6 bits for 64)
-     * But the Y bits only occupy positions where they "fit" within the
-     * square tiles. */
-
-    uint32_t x_mask = 0, y_mask = 0;
+    uint32_t result = 0;
     uint32_t bit = 1;
-    uint32_t w = width, h = height;
 
-    /* Interleave bit allocation: alternate between X and Y,
-     * but stop allocating bits for a dimension once it's exhausted. */
-    while (w > 1 || h > 1) {
-        if (w > 1) {
-            x_mask |= bit;
-            bit <<= 1;
-            w >>= 1;
-        }
-        if (h > 1) {
-            y_mask |= bit;
-            bit <<= 1;
-            h >>= 1;
-        }
+    while (mask) {
+        uint32_t low = mask & (~mask + 1u);   /* lowest set bit of mask */
+        if (v & bit)
+            result |= low;
+        mask &= mask - 1u;                    /* clear it */
+        bit <<= 1;
     }
-
-    return (swizzle_spread(x) & x_mask) | (swizzle_spread(y) & y_mask);
+    return result;
 }
 
 /**
@@ -117,6 +101,35 @@ static inline void xbox_swizzle_masks(uint32_t width, uint32_t height,
     *mask_x = x;
     *mask_y = y;
 }
+
+/**
+ * Compute the swizzled (Morton code) offset for coordinates (x, y)
+ * within a texture of dimensions (width, height).
+ *
+ * For non-square textures the larger dimension keeps taking bits after the
+ * smaller one is exhausted, so the masks are not a simple alternation and the
+ * deposit has to be general.
+ *
+ * This previously spread both coordinates and masked: `(spread(x) & mask_x) |
+ * (spread(y) & mask_y)`. Spreading puts a coordinate's bits on even positions
+ * only, while mask_y selects odd ones, so the Y term was almost always zero --
+ * for 512x512, offset(0,1) came back the same as offset(0,0) and 261,632 of
+ * the 262,144 coordinates collided. Nothing called this until a texture
+ * sampler did, and then it sampled a column of the image for every row and
+ * drew vertical stripes.
+ *
+ * The masks come from xbox_swizzle_masks, the same generator the row-walking
+ * unswizzle uses, so the two cannot disagree about where a texel lives.
+ */
+static inline uint32_t swizzle_offset(uint32_t x, uint32_t y,
+                                       uint32_t width, uint32_t height)
+{
+    uint32_t mask_x, mask_y;
+
+    xbox_swizzle_masks(width, height, &mask_x, &mask_y);
+    return swizzle_deposit(x, mask_x) | swizzle_deposit(y, mask_y);
+}
+
 
 /**
  * Unswizzle a texture from Xbox swizzled (Z-order/Morton) layout
@@ -281,11 +294,127 @@ static inline void xbox_swizzle_box(void *dst, const void *src,
     }
 }
 
+/* An N-bit colour channel widened to 8 bits: 5 bits of white must come back
+ * as 0xFF and not 0xF8, so scale rather than shift. One formula, because a
+ * decoded block and the texels beside it have to agree what a 5-bit red is. */
+static inline uint32_t d3d8_expand_channel(uint32_t v, uint32_t bits)
+{
+    return v * 255u / ((1u << bits) - 1u);
+}
+
+/**
+ * Bytes per 4x4 block for the DXT formats a CPU sampler can decode, or 0 if
+ * the format is not one of them.
+ *
+ * The three listed here are the ones with a decoder (see nv2a_pb_exec.c).
+ * d3d8_format_is_swizzled() below also calls DXN, DXT3A, DXT5A and CTX1
+ * compressed -- correctly, they are -- but those are different block layouts
+ * with no decoder, so they return 0 here and are left unsampled rather than
+ * decoded as something they are not.
+ */
+static inline uint32_t d3d8_format_dxt_block_bytes(uint32_t fmt)
+{
+    switch (fmt) {
+    case 0x0C: return 8;    /* DXT1: colour block only          */
+    case 0x0E: return 16;   /* DXT3: explicit alpha + colour    */
+    case 0x0F: return 16;   /* DXT5: interpolated alpha + colour */
+    default:   return 0;
+    }
+}
+
 /**
  * Check if an Xbox D3D8 format is swizzled (vs linear/compressed).
  * Xbox formats with "LIN_" prefix are linear; DXT formats are block-compressed.
  * All other uncompressed formats are swizzled by default.
  */
+/* Decode one texel out of a DXT1/DXT3/DXT5 image.
+ *
+ * These are the only formats here that are neither linear nor swizzled: texels
+ * live in 4x4 blocks, so there is no offset to compute and read -- the block
+ * has to be decoded to get at one texel.
+ *
+ * ponytail: decodes the whole 4x4 block for every texel, so a filled triangle
+ * decodes each block up to sixteen times. It is ~20 arithmetic ops on 16 bytes
+ * that are already in L1 from the neighbouring texel, and the menu draws at
+ * 640x480. Cache the last block by index if a textured 3D scene ever runs
+ * through here.
+ */
+static inline int d3d8_dxt_decode_texel(const uint8_t *base, uint32_t fmt,
+                                        uint32_t u, uint32_t v,
+                                        uint32_t width, uint32_t *argb)
+{
+    uint32_t block_bytes = d3d8_format_dxt_block_bytes(fmt);
+    uint32_t blocks_per_row = (width + 3u) / 4u;
+    const uint8_t *b;
+    uint32_t bx = u & 3u, by = v & 3u, texel = by * 4u + bx;
+    uint32_t c[4], idx, alpha = 255u;
+    uint32_t c0, c1, i;
+
+    if (!block_bytes || !blocks_per_row)
+        return 0;
+    b = base + ((size_t)(v >> 2) * blocks_per_row + (u >> 2)) * block_bytes;
+
+    /* Alpha comes first in DXT3 and DXT5; the colour block follows it. */
+    if (block_bytes == 16) {
+        if (fmt == 0x0E) {                 /* DXT3: 4 bits per texel, packed */
+            uint32_t nib = b[texel >> 1];
+            alpha = d3d8_expand_channel((texel & 1u) ? (nib >> 4) : (nib & 0x0Fu), 4);
+        } else {                           /* DXT5: two endpoints + 3-bit index */
+            uint32_t a0 = b[0], a1 = b[1], a[8], sel;
+            uint64_t bits = 0;
+            for (i = 0; i < 6; i++)
+                bits |= (uint64_t)b[2 + i] << (8 * i);
+            a[0] = a0; a[1] = a1;
+            if (a0 > a1)
+                for (i = 1; i < 7; i++)
+                    a[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+            else {
+                for (i = 1; i < 5; i++)
+                    a[i + 1] = ((5 - i) * a0 + i * a1) / 5;
+                a[6] = 0; a[7] = 255;
+            }
+            sel = (uint32_t)((bits >> (3 * texel)) & 7u);
+            alpha = a[sel];
+        }
+        b += 8;
+    }
+
+    c0 = (uint32_t)b[0] | ((uint32_t)b[1] << 8);
+    c1 = (uint32_t)b[2] | ((uint32_t)b[3] << 8);
+    for (i = 0; i < 2; i++) {
+        uint32_t rgb = i ? c1 : c0;
+        c[i] = (d3d8_expand_channel((rgb >> 11) & 0x1Fu, 5) << 16)
+             | (d3d8_expand_channel((rgb >>  5) & 0x3Fu, 6) <<  8)
+             |  d3d8_expand_channel( rgb        & 0x1Fu, 5);
+    }
+
+    /* c0 <= c1 selects the three-colour, one-bit-alpha mode -- but only for
+     * DXT1. DXT3 and DXT5 carry their own alpha, so their colour block is
+     * always the four-colour form regardless of how the endpoints compare. */
+    if (c0 > c1 || block_bytes == 16) {
+        for (i = 0; i < 3; i++) {
+            uint32_t sh = i * 8, m0 = (c[0] >> sh) & 0xFFu, m1 = (c[1] >> sh) & 0xFFu;
+            c[2] = (c[2] & ~(0xFFu << sh)) | (((2 * m0 + m1) / 3) << sh);
+            c[3] = (c[3] & ~(0xFFu << sh)) | (((m0 + 2 * m1) / 3) << sh);
+        }
+    } else {
+        for (i = 0; i < 3; i++) {
+            uint32_t sh = i * 8, m0 = (c[0] >> sh) & 0xFFu, m1 = (c[1] >> sh) & 0xFFu;
+            c[2] = (c[2] & ~(0xFFu << sh)) | (((m0 + m1) / 2) << sh);
+        }
+        c[3] = 0;                          /* transparent black */
+    }
+
+    idx = ((uint32_t)b[4] | ((uint32_t)b[5] << 8)
+        | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24)) >> (2 * texel);
+    idx &= 3u;
+    if (block_bytes == 8 && c0 <= c1 && idx == 3)
+        alpha = 0;                         /* DXT1's one bit of alpha */
+
+    *argb = (alpha << 24) | (c[idx] & 0x00FFFFFFu);
+    return 1;
+}
+
 static inline int d3d8_format_is_swizzled(uint32_t fmt)
 {
     /* Linear formats (0x10-0x41 range excludes the non-LIN 0x19-0x3C range) */

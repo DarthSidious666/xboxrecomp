@@ -5,6 +5,8 @@
  * software conversions without needing a D3D11 device:
  *   - d3d8_to_dxgi_format, d3d8_format_bpp, d3d8_format_is_*
  *   - d3d8_format_is_swizzled / unswizzle round-trip (d3d8_swizzle.h)
+ *   - swizzle_offset agreeing with xbox_swizzle_rect, texel for texel
+ *   - DXT1/3/5 block decode (d3d8_dxt_decode_texel)
  *   - d3d8_convert_linear_pixels (channel swaps, sign extension)
  *
  * The D3D8 resource file is compiled alongside this driver; the handful of
@@ -173,6 +175,133 @@ static void test_unswizzle_roundtrip(void)
     }
 }
 
+/* swizzle_offset must land on the same byte that xbox_swizzle_rect wrote.
+ *
+ * The two are separate implementations of Morton order: xbox_swizzle_rect
+ * walks rows and is what unswizzling (and therefore the D3D11 path) trusts,
+ * while swizzle_offset computes one texel's address and is what the software
+ * sampler calls per pixel. If they disagree, a texture decodes correctly in
+ * one path and wrongly in the other -- which is how this was found: the
+ * sampler read a column of the image for every row and drew vertical stripes.
+ *
+ * The old implementation spread both coordinates onto even bit positions and
+ * masked, so the Y term was almost always zero: at 512x512 offset(0,1) equalled
+ * offset(0,0) and 261,632 of 262,144 coordinates collided. Any size here with
+ * height > 1 catches that.
+ */
+static void test_swizzle_offset(void)
+{
+    struct { UINT w, h; } cases[] = {
+        { 4, 4 }, { 8, 8 }, { 64, 64 },
+        { 16, 4 }, { 4, 16 }, { 32, 8 }, { 256, 64 },   /* non-square: uneven bit runs */
+    };
+    int c;
+
+    printf("test_swizzle_offset\n");
+    for (c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); c++) {
+        UINT w = cases[c].w, h = cases[c].h, bpp = 4, n = w * h * bpp;
+        UINT32 *lin = (UINT32 *)malloc(n), *swz = (UINT32 *)malloc(n);
+        UINT bad = 0, x, y;
+
+        /* One distinct value per texel, so a wrong address cannot alias. */
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++)
+                lin[y * w + x] = 0xC0DE0000u | (y << 8) | x;
+        xbox_swizzle_rect((BYTE *)swz, (const BYTE *)lin, w, h, bpp);
+
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++)
+                if (swz[swizzle_offset(x, y, w, h)] != lin[y * w + x])
+                    bad++;
+        {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "swizzle_offset agrees %ux%u", w, h);
+            CHECK_INT(nm, (int)bad, 0);
+        }
+        free(lin); free(swz);
+    }
+}
+
+/* DXT1/3/5 decode, against blocks built here rather than a captured texture.
+ *
+ * Every case pins something a plausible bug would move: which endpoint is c0,
+ * that a 5-bit channel widens to 0xFF and not 0xF8, that the 1/3 and 2/3
+ * interpolants are not swapped, that c0 <= c1 means three colours and a
+ * transparent index 3 -- but only for DXT1, because DXT3 and DXT5 carry their
+ * own alpha and keep the four-colour block whatever the endpoints say.
+ */
+static void put16(BYTE *p, UINT v) { p[0] = (BYTE)(v & 0xFF); p[1] = (BYTE)(v >> 8); }
+
+static void test_dxt_decode(void)
+{
+    BYTE blk[16];
+    UINT32 argb;
+    const UINT RED = 0xF800, BLUE = 0x001F;   /* RGB565 */
+
+    printf("test_dxt_decode\n");
+
+    CHECK_INT("dxt block bytes DXT1", (int)d3d8_format_dxt_block_bytes(0x0C), 8);
+    CHECK_INT("dxt block bytes DXT3", (int)d3d8_format_dxt_block_bytes(0x0E), 16);
+    CHECK_INT("dxt block bytes DXT5", (int)d3d8_format_dxt_block_bytes(0x0F), 16);
+    CHECK_INT("dxt block bytes A8R8G8B8", (int)d3d8_format_dxt_block_bytes(0x06), 0);
+
+    /* DXT1, four-colour mode (c0 > c1): index 0 is pure red, 1 pure blue,
+     * 2 is two thirds red, 3 is one third red. All opaque. */
+    memset(blk, 0, sizeof blk);
+    put16(blk + 0, RED); put16(blk + 2, BLUE);
+    blk[4] = 0x00 | (0x1 << 2) | (0x2 << 4) | (0x3 << 6);   /* texels 0..3 */
+    CHECK("dxt1 idx0 red",  d3d8_dxt_decode_texel(blk, 0x0C, 0, 0, 4, &argb) && argb == 0xFFFF0000u);
+    CHECK("dxt1 idx1 blue", d3d8_dxt_decode_texel(blk, 0x0C, 1, 0, 4, &argb) && argb == 0xFF0000FFu);
+    d3d8_dxt_decode_texel(blk, 0x0C, 2, 0, 4, &argb);
+    CHECK_INT("dxt1 idx2 red channel", (int)((argb >> 16) & 0xFF), 170);   /* (2*255+0)/3 */
+    d3d8_dxt_decode_texel(blk, 0x0C, 3, 0, 4, &argb);
+    CHECK_INT("dxt1 idx3 red channel", (int)((argb >> 16) & 0xFF), 85);    /* (255+0)/3  */
+
+    /* DXT1, three-colour mode (c0 <= c1): index 2 is the midpoint, index 3 is
+     * transparent. Getting this branch backwards is the classic DXT1 bug. */
+    memset(blk, 0, sizeof blk);
+    put16(blk + 0, BLUE); put16(blk + 2, RED);
+    blk[4] = (0x2 << 0) | (0x3 << 2);
+    d3d8_dxt_decode_texel(blk, 0x0C, 0, 0, 4, &argb);
+    CHECK_INT("dxt1 3-colour midpoint red", (int)((argb >> 16) & 0xFF), 127);
+    CHECK("dxt1 3-colour idx3 transparent",
+          d3d8_dxt_decode_texel(blk, 0x0C, 1, 0, 4, &argb) && (argb >> 24) == 0);
+
+    /* Same endpoints as a DXT5 block: alpha is its own, and the colour block
+     * stays four-colour even though c0 <= c1. */
+    memset(blk, 0, sizeof blk);
+    blk[0] = 255; blk[1] = 0;                    /* a0 > a1: eight alphas */
+    blk[2] = 0x00;                               /* texel 0 selects a0    */
+    put16(blk + 8, BLUE); put16(blk + 10, RED);
+    blk[12] = (0x2 << 0);
+    d3d8_dxt_decode_texel(blk, 0x0F, 0, 0, 4, &argb);
+    CHECK_INT("dxt5 alpha from a0", (int)(argb >> 24), 255);
+    /* 85 is (2*c0 + c1)/3 with c0 = blue: the four-colour interpolant. Three-
+     * colour mode would put the midpoint, 127, here instead, so this one
+     * value separates the two branches. */
+    CHECK_INT("dxt5 keeps 4-colour block", (int)((argb >> 16) & 0xFF), 85);
+
+    /* DXT3's alpha is a raw 4-bit nibble per texel, low nibble first. */
+    memset(blk, 0, sizeof blk);
+    blk[0] = 0x0F;                               /* texel 0 = 15, texel 1 = 0 */
+    put16(blk + 8, RED); put16(blk + 10, BLUE);
+    d3d8_dxt_decode_texel(blk, 0x0E, 0, 0, 4, &argb);
+    CHECK_INT("dxt3 alpha 15 -> 255", (int)(argb >> 24), 255);
+    d3d8_dxt_decode_texel(blk, 0x0E, 1, 0, 4, &argb);
+    CHECK_INT("dxt3 alpha 0 -> 0", (int)(argb >> 24), 0);
+
+    /* Block addressing: texel (4,0) is the second block along, not texel 4 of
+     * the first. A wrong blocks-per-row shows up here and nowhere else. */
+    {
+        BYTE img[32];
+        memset(img, 0, sizeof img);
+        put16(img + 0, RED);  put16(img + 2, RED);    /* block 0: all red   */
+        put16(img + 8, BLUE); put16(img + 10, BLUE);  /* block 1: all blue  */
+        CHECK("dxt1 block 0", d3d8_dxt_decode_texel(img, 0x0C, 0, 0, 8, &argb) && argb == 0xFFFF0000u);
+        CHECK("dxt1 block 1", d3d8_dxt_decode_texel(img, 0x0C, 4, 0, 8, &argb) && argb == 0xFF0000FFu);
+    }
+}
+
 /* Forward the D3D8 conversion helper through a tiny local wrapper so we
  * test the real d3d8_resources.c implementation. */
 static void test_convert_linear(void)
@@ -264,6 +393,8 @@ int main(void)
     test_predicates();
     test_swizzle_classification();
     test_unswizzle_roundtrip();
+    test_swizzle_offset();
+    test_dxt_decode();
     test_convert_linear();
     test_fvf_position();
 

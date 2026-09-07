@@ -246,8 +246,7 @@ HRESULT d3d8_CreateImageSurfaceImpl(UINT Width, UINT Height, D3DFORMAT Format,
  * as D3D8Texture. */
 ID3D11ShaderResourceView *d3d8_base_srv(IDirect3DBaseTexture8 *texture);
 
-/* Read the D3DFORMAT / palette stage of any base texture via the shared
- * D3D8Texture layout overlay. */
+/* Read the D3DFORMAT of any base texture. */
 D3DFORMAT d3d8_base_format(IDirect3DBaseTexture8 *texture);
 void      d3d8_base_set_palette(IDirect3DBaseTexture8 *texture, UINT palette);
 
@@ -282,8 +281,8 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
 HRESULT d3d8_shaders_init(void);
 void    d3d8_shaders_shutdown(void);
 
-/* Bind shaders + input layout for the given FVF, upload transform CBs */
-void    d3d8_shaders_prepare_draw(DWORD fvf);
+/* Select programmable/FVF vertex state and refresh fixed-function pixel state. */
+void    d3d8_shaders_prepare_draw(DWORD handle);
 
 /* ================================================================
  * NV2A Register Combiner pixel shaders (d3d8_combiners.c)

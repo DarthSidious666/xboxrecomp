@@ -292,6 +292,9 @@ static void kernel_data_init(void)
 static ULONG g_slot_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
 /* Log counter - limit output to avoid flooding */
+/* Calls per ordinal, for the ranking in the periodic summary. 378 counters
+ * is smaller than one of the strings this file prints. */
+static unsigned long long g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
 static int g_kernel_call_count = 0;
 
 /* How many kernel calls get logged before the log goes quiet.
@@ -1620,7 +1623,6 @@ static void bridge_AvSetDisplayMode(void)
                     " pitch=%u fb=0x%08X\n", mode, format, pitch, fb);
     fflush(stderr);
 
-    xbox_SetDisplayFramebuffer(fb, pitch);
     {
         /* Point the framebuffer window at whatever the title just set, and
          * start it on the first display mode -- before that there is nothing
@@ -1642,6 +1644,15 @@ static void bridge_AvSetDisplayMode(void)
 
         xbox_FramebufferWindowSet(fb_va, pitch);
         xbox_FramebufferWindowStart();
+
+        /* Record the resolved address, not the physical one the title passed.
+         * Every reader of this wants to read guest memory with it, and the
+         * physical form lands in the loaded image -- so the checksum probe
+         * reported an unchanging zero while the title was drawing correctly a
+         * few megabytes away, and so did every dump that asked for "the"
+         * framebuffer. Resolving once here is the fix; resolving in each
+         * caller is how there came to be two of them disagreeing. */
+        xbox_SetDisplayFramebuffer(fb_va, pitch);
     }
     xbox_AvSetDisplayMode(XBOX_TO_NATIVE(addr), step, mode, format, pitch, fb);
     g_eax = 0;
@@ -4643,6 +4654,8 @@ static void kernel_thunk_dispatch(void)
     bridge = g_slot_bridges[slot];
 
     g_kernel_call_count++;
+    if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
+        g_ordinal_calls[ordinal]++;
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the
@@ -4663,6 +4676,28 @@ static void kernel_thunk_dispatch(void)
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
             fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
+            /* And which ones, ranked. "Latest" names whatever the sample
+             * happened to land on; the question behind this line is what a
+             * title sitting still is actually asking the kernel for, and
+             * that wants counting rather than sampling. */
+            {
+                static unsigned char shown_ord[XBOX_KERNEL_THUNK_TABLE_SIZE];
+                int r, shown;
+
+                memset(shown_ord, 0, sizeof shown_ord);
+                for (shown = 0; shown < 6; shown++) {
+                    int best = -1;
+                    for (r = 0; r < XBOX_KERNEL_THUNK_TABLE_SIZE; r++)
+                        if (g_ordinal_calls[r] && !shown_ord[r]
+                            && (best < 0 || g_ordinal_calls[r] > g_ordinal_calls[best]))
+                            best = r;
+                    if (best < 0)
+                        break;
+                    shown_ord[best] = 1;
+                    fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
+                            (unsigned long long)g_ordinal_calls[best]);
+                }
+            }
             fflush(stderr);
             last_summary_tick = now;
         }

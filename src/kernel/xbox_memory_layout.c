@@ -289,6 +289,78 @@ static int fence_readable(uint32_t va, uint32_t bytes)
 }
 
 /*
+ * Two counters inside the device, one of which the GPU owns.
+ *
+ * D3D's swap throttle is a pair: the title bumps "frames submitted" itself and
+ * waits for "frames completed", which on hardware only the GPU moves. The Xbox
+ * dashboard's is exactly that, at guest 0x000AF121 --
+ *
+ *     eax = [esi+0x2518]        ; completed
+ *     ecx = [esi+0x2B60]        ; submitted
+ *     ecx = ecx - eax
+ *     if (ecx < 2) proceed      ; else spin on a 400-iteration delay loop
+ *
+ * -- and with nothing moving completed it spins there forever once two frames
+ * are outstanding. That delay loop was 99.8 million of the dashboard's calls,
+ * against 35 thousand for the next function down.
+ *
+ * This differs from xbox_Nv2aFrameCounter, which advances a counter on a 60 Hz
+ * clock, in the way that matters for this pair: a free-running counter can
+ * pass submitted, and then submitted - completed underflows to about four
+ * billion, which is >= 2, and the spin never ends again. Mirroring cannot do
+ * that, because completed is only ever whatever submitted already is.
+ *
+ * It is also simply true here. The pushbuffer is executed at submit, so by the
+ * time the title asks whether the frame is finished, it is.
+ */
+#define XBOX_MAX_COUNTER_MIRRORS 4
+
+static struct {
+    uint32_t device_ptr_va;
+    uint32_t src_off, dst_off;
+} g_counter_mirrors[XBOX_MAX_COUNTER_MIRRORS];
+static int g_counter_mirror_count = 0;
+
+int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
+                           uint32_t src_off, uint32_t dst_off)
+{
+    if (g_counter_mirror_count >= XBOX_MAX_COUNTER_MIRRORS)
+        return -1;
+    g_counter_mirrors[g_counter_mirror_count].device_ptr_va = device_ptr_va;
+    g_counter_mirrors[g_counter_mirror_count].src_off = src_off;
+    g_counter_mirrors[g_counter_mirror_count].dst_off = dst_off;
+    g_counter_mirror_count++;
+    fprintf(stderr, "  NV2A counter mirror: device at 0x%08X,"
+            " +0x%X -> +0x%X\n", device_ptr_va, src_off, dst_off);
+    return 0;
+}
+
+static void counter_mirrors_tick(void)
+{
+    for (int i = 0; i < g_counter_mirror_count; i++) {
+        uint32_t dev;
+
+        if (!fence_readable(g_counter_mirrors[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_counter_mirrors[i].device_ptr_va
+                                     + g_memory_offset);
+        if (!fence_readable(dev + g_counter_mirrors[i].src_off, 4)
+                || !fence_readable(dev + g_counter_mirrors[i].dst_off, 4))
+            continue;
+        {
+            volatile uint32_t *dst =
+                (volatile uint32_t *)((uintptr_t)(dev + g_counter_mirrors[i].dst_off)
+                                      + g_memory_offset);
+            uint32_t src =
+                *(volatile uint32_t *)((uintptr_t)(dev + g_counter_mirrors[i].src_off)
+                                       + g_memory_offset);
+            if (*dst != src)
+                *dst = src;
+        }
+    }
+}
+
+/*
  * Frame counters the title polls to pace itself.
  *
  * D3D keeps a swap count inside the device and bumps it once per presented
@@ -392,6 +464,24 @@ void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch)
     s_fb_pitch = pitch;
 }
 
+/* Where the title last said its framebuffer is, for anything that wants to read
+ * guest pixels directly. There was only a setter, so every such reader carried
+ * its own hardcoded address instead -- and a title that moves its framebuffer
+ * (which is most of them, once it owns one) left that constant pointing at
+ * uninitialised memory. A dump taken there is not empty, it is noise, which
+ * reads as "the title drew garbage" rather than "you read the wrong page".
+ *
+ * This is the resolved address, not the physical one AvSetDisplayMode states:
+ * the caller resolves before storing, because a physical framebuffer address
+ * read directly lands in the loaded image. Getting that wrong is the same bug
+ * twice over -- once in the probe below, once in a caller of this. */
+uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch)
+{
+    if (pitch)
+        *pitch = s_fb_pitch;
+    return s_fb_va;
+}
+
 static void framebuffer_probe_tick(void)
 {
     static DWORD last_ms;
@@ -448,6 +538,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             }
         }
         fence_mirrors_tick();
+        counter_mirrors_tick();
         frame_counters_tick();
         framebuffer_probe_tick();
 

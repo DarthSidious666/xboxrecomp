@@ -823,9 +823,7 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
     if (vertex_count == 0) return E_INVALIDARG;
 
     /* Prepare pipeline: shaders, input layout, constant buffers, render states */
-    /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
-        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -845,8 +843,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     if (index_count == 0) return E_INVALIDARG;
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
-        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -890,8 +887,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
         0, 1, &g_up_ring_buffer, &VertexStreamZeroStride, &ring_offset);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
-        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -955,8 +951,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
         tmp_ib, ib_fmt, 0);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
-        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 

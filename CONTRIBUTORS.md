@@ -117,6 +117,34 @@ helpers the lift emits — was not in the PRs and was added on integration.)*
   `apu_core.c` against the real `dsound_device.c` rather than a copy of either,
   so it cannot drift from what actually runs.
 
+*Depth/stencil, A8 and audio (#29, #30, #31)*
+- **The depth/stencil state cache keyed on a partial XOR hash (#29)** — it left
+  out `STENCILWRITEMASK`, `STENCILFAIL`, `STENCILZFAIL` and `STENCILPASS`, so
+  changing one of those alone reused a stale D3D11 state object, and being an
+  XOR it could also cancel: moving the stencil reference 0 to 16 while the read
+  mask went 0xFF to 0xFE produced the same key. It compares the whole
+  zero-initialised descriptor now, keeps the stencil reference separate because
+  that is passed to `OMSetDepthStencilState` rather than stored in the
+  descriptor, and only updates the cached copy after the state object is
+  actually created.
+- **Xbox A8 sampled with zero RGB instead of white (#30)** — an alpha-only
+  texture is `(1, 1, 1, alpha)`, so every fixed-function and register-combiner
+  path drew A8 content black. Carried as one alpha-only flag per texture stage,
+  restoring white RGB after the sample without touching alpha. The same PR found
+  that a successful programmable vertex-shader setup skipped the fixed-function
+  pixel-state refresh, so a texture change could leave the previous draw's pixel
+  shader, constants and stale A8 metadata bound; all four draw entry points go
+  through one prepare step now. Shipped with a 336-draw WARP regression that
+  reads pixels back, across 2D/cube/volume, mip 1, all four stages and both
+  pixel paths.
+- **XAudio2 failures were reported as success (#31)** — `Start` and
+  `SubmitSourceBuffer` results went unchecked, so a backend that could not start
+  reported itself active, and a rejected buffer still advanced the ring and the
+  accepted-frame count, which eventually reuses storage that is still queued for
+  playback. Also balances `CoInitializeEx` when initialisation then fails on
+  that thread, without uninitialising on `RPC_E_CHANGED_MODE`, and makes repeat
+  initialisation idempotent and repeat shutdown safe after a partial one.
+
 *Also raised: stored code pointers (#13).* The gap is real and was found
 independently while bringing up Half-Life 2 -- functions reachable only as an
 address in a table have no call site, no prologue and no padding boundary, so

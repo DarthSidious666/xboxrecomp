@@ -1646,10 +1646,12 @@ static UINT base_texture_palette(IDirect3DBaseTexture8 *texture)
     return *(UINT *)((BYTE *)texture + offsetof(D3D8Texture, palette));
 }
 
-/* Read the D3DFORMAT of any base texture via the D3D8Texture overlay. */
+/* Volume textures place depth before the format, unlike 2D/cube textures. */
 D3DFORMAT d3d8_base_format(IDirect3DBaseTexture8 *texture)
 {
     if (!texture) return D3DFMT_UNKNOWN;
+    if (IDirect3DBaseTexture8_GetType(texture) == D3DRTYPE_VOLUMETEXTURE)
+        return ((D3D8VolumeTexture *)texture)->d3d8_format;
     return *(D3DFORMAT *)((BYTE *)texture + offsetof(D3D8Texture, d3d8_format));
 }
 

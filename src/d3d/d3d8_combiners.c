@@ -515,6 +515,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    uint   alpha_func;\n");
     EMIT("    uint   alpha_test_enable;\n");
     EMIT("    uint   fog_enable;\n");
+    EMIT("    uint4  alpha_only;\n");
     EMIT("};\n\n");
 
     /* ---- Input structure ---- */
@@ -559,6 +560,9 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d.xy);\n",
                  i, i, i, i);
         }
+        /* Preserve disabled stages and sampled alpha. */
+        if (state->tex_mode[i] != NV2A_TEXMODE_NONE)
+            EMIT("    if (alpha_only[%d]) r_t%d.rgb = 1.0;\n", i, i);
     }
 
     /* Temporary registers: R0 initialized to T0 (NV2A convention),
@@ -1045,6 +1049,10 @@ BOOL d3d8_combiners_prepare_draw(void)
         cb->alpha_func = rs[D3DRS_ALPHAFUNC];
         cb->alpha_test_enable = rs[D3DRS_ALPHATESTENABLE] ? 1 : 0;
         cb->fog_enable = rs[D3DRS_FOGENABLE] ? 1 : 0;
+        for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
+            D3DFORMAT format = d3d8_base_format(d3d8_GetStageTexture(i));
+            cb->alpha_only[i] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
+        }
 
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_combiner_cb, 0);
     }
