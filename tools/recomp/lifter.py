@@ -14,11 +14,27 @@ Memory model:
   - Xbox data sections mapped at original VAs
 """
 
+import os
 import re
 import struct
 
 from .disasm import Instruction, Operand
 from .config import is_code_address, is_data_address, va_to_file_offset
+
+# Function export names of the Windows libraries the host exe links
+# (kernel32/user32/gdi32/advapi32/winmm/ws2_32/ole32/dbghelp/...). A guest
+# function that shares one of these names collides with the import at link
+# time (LNK2005) -- every Xbox-era game re-exports shims named like Win32
+# APIs (CreateThread, GetLastError, QueryPerformanceCounter, SetEvent, ...).
+# Generated from the x64 import libs of the Windows SDK with:
+#   Get-ChildItem "$env:WINSDK/Lib/*/um/x64" -Filter *.lib | ForEach-Object {
+#     & dumpbin /exports $_ }  # then keep the indent-only identifier lines
+_WIN32_EXPORTS = set()
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_WIN32_EXPORTS_FILE = os.path.join(_DATA_DIR, "win32_api_names.txt")
+if os.path.exists(_WIN32_EXPORTS_FILE):
+    with open(_WIN32_EXPORTS_FILE, encoding="ascii") as _f:
+        _WIN32_EXPORTS.update(line.strip() for line in _f if line.strip())
 
 
 # C identifiers a recompiled function name must not be: the generated TUs
@@ -27,8 +43,11 @@ from .config import is_code_address, is_data_address, va_to_file_offset
 # of the CRT helpers -- Black has a function literally named `onexit`.
 # Emitting `void onexit(void);` next to UCRT's `onexit_t __cdecl onexit(
 # onexit_t)` is a redefinition with different type modifiers and cl fails with
-# C2373. Mangle with the address, the same suffixed-<addr> scheme func_id
-# already uses for duplicate names.
+# C2373. The host Win32 export names are folded in too: the host exe links
+# kernel32.lib et al., and Xbox games re-export shims named exactly like the
+# APIs they wrap, so the same clash happens there for the linker. Mangle with
+# the address, the same suffixed-<addr> scheme func_id already uses for
+# duplicate names.
 _FUNC_RESERVED_IDENT = frozenset({
     # C and C++ keywords
     "asm", "auto", "break", "case", "char", "const", "continue",
@@ -54,7 +73,9 @@ _FUNC_RESERVED_IDENT = frozenset({
     "wcstombs",
     # <setjmp.h>
     "longjmp", "setjmp",
-})
+    # Host Win32 API export names (data/win32_api_names.txt) so a guest
+    # function named like a linked import does not collide at link time.
+}) | _WIN32_EXPORTS
 
 
 def _func_ident(addr, name):

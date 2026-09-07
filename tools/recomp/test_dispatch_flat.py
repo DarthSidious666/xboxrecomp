@@ -157,6 +157,18 @@ def test_reserved_name_mangled_everywhere():
     assert _func_ident(0x000A1C60, None) == "sub_000A1C60"
 
 
+def test_win32_api_name_mangled():
+    # Nightfire re-exports shims named exactly like the Win32 APIs they wrap;
+    # `void CreateThread(void)` collides with kernel32.lib's import at link
+    # time (LNK2005). The host export names come from data/win32_api_names.txt.
+    from tools.recomp.lifter import _func_ident, _WIN32_EXPORTS
+
+    assert "CreateThread" in _WIN32_EXPORTS
+    assert "QueryPerformanceCounter" in _WIN32_EXPORTS
+    assert _func_ident(0x0006B1B0, "CreateThread") == "CreateThread_0006B1B0"
+    assert _func_ident(0x0006B1B0, "sub_0006B1B0") == "sub_0006B1B0"
+
+
 def test_reserved_dispatch_row_uses_mangled_name():
     with tempfile.TemporaryDirectory() as tmp:
         disp = os.path.join(tmp, "d.c")
