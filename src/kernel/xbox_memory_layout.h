@@ -207,6 +207,9 @@ void *xbox_GetMemoryBase(void);
  * Returns 0 if memory is mapped at original Xbox addresses (ideal case).
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
+/* Bytes of guest address space mapped, for bounds-checking a guest pointer
+ * that came out of guest memory rather than from this side. */
+size_t xbox_GetMappedSize(void);
 void xbox_ProtectMirrorsForDebug(void);
 
 /* Dump the guest call stack and abort if the title has not exited within

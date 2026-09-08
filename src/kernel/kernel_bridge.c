@@ -51,6 +51,9 @@ extern ptrdiff_t g_xbox_mem_offset;
 /* Dispatch table lookup (for function pointer args) */
 typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(uint32_t xbox_va);
+/* Timer DPCs run on a host thread, which needs a guest stack under it. */
+int  xbox_worker_stack_alloc(void);
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
 /* Memory access - same as recomp_types.h MEM32 but without the #define guard */
@@ -1711,6 +1714,272 @@ static void bridge_HalReadSMCTrayState(void)
     g_eax = 0;
 }
 
+/* -- KeInsertQueueDpc (ordinal 119) ------------------------
+ * BOOLEAN KeInsertQueueDpc(PKDPC Dpc, PVOID SystemArgument1,
+ *                          PVOID SystemArgument2)
+ *
+ * Unbridged this returned 0, which reads to a driver as "already queued" and
+ * means the deferred routine never runs. That is not a small loss: an
+ * interrupt service routine is expected to do almost nothing except mask the
+ * source and queue a DPC, so with this missing every driver that follows the
+ * normal pattern acknowledges its interrupt and then does none of the work.
+ * Half-Life 2's USB stack does exactly that -- its ISR masks the master
+ * interrupt enable and queues here, and the enumeration it should have started
+ * lives entirely in the deferred routine.
+ *
+ * ponytail: runs the routine inline rather than queueing it. A real DPC runs
+ * at DISPATCH_LEVEL shortly after the ISR returns, and this runs it before the
+ * ISR returns, on whichever thread queued it. That ordering difference has not
+ * mattered for anything here yet; when it does, the upgrade is a real queue
+ * drained by the thread that lowered IRQL, not a second call site.
+ */
+/* Run a DPC's deferred routine on the calling thread.
+ *
+ * VOID DeferredRoutine(PKDPC, PVOID Context, PVOID Arg1, PVOID Arg2),
+ * __stdcall: its `ret 16` consumes the dummy return address and all four
+ * arguments, so g_esp needs no fixup afterwards. The caller must already have
+ * a guest stack -- true on a guest thread, and true on a host thread that has
+ * taken a worker slice.
+ *
+ * Returns 1 if the routine was found and called.
+ */
+static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
+{
+    uint32_t routine, context;
+    recomp_func_t fn;
+
+    if (!dpc_va)
+        return 0;
+    routine = BRIDGE_MEM32(dpc_va + 12);
+    context = BRIDGE_MEM32(dpc_va + 16);
+    if (!routine)
+        return 0;
+
+    fn = recomp_lookup(routine);
+    if (!fn) fn = recomp_lookup_manual(routine);
+    if (!fn) {
+        fprintf(stderr, "  [KERNEL] DPC routine 0x%08X not in dispatch\n",
+                routine);
+        fflush(stderr);
+        return 0;
+    }
+
+    BRIDGE_MEM32(dpc_va + 20) = arg1;
+    BRIDGE_MEM32(dpc_va + 24) = arg2;
+
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = arg2;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = arg1;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    fn();
+    return 1;
+}
+
+/* -- KeSynchronizeExecution (ordinal 153) ------------------
+ * BOOLEAN KeSynchronizeExecution(PKINTERRUPT Interrupt,
+ *                                PKSYNCHRONIZE_ROUTINE SynchronizeRoutine,
+ *                                PVOID SynchronizeContext)
+ *
+ * Runs a routine while holding the interrupt's spinlock at the ISR's IRQL,
+ * which is how a driver touches its hardware from anywhere that is not the
+ * ISR without racing the ISR. Unbridged it returned 0 and the routine never
+ * ran -- the same failure as an unqueued DPC, and just as quiet: the driver
+ * asks for exclusive access, is told it did not get it, and skips the work.
+ *
+ * ponytail: no lock is taken. Nothing else here runs at ISR IRQL, and the one
+ * caller that matters is a device model on its own thread; if two of those
+ * ever contend, this wants the interrupt object's own lock rather than a
+ * global one.
+ */
+static void bridge_KeSynchronizeExecution(void)
+{
+    uint32_t routine = STACK_ARG(1);
+    uint32_t context = STACK_ARG(2);
+    recomp_func_t fn;
+
+    fn = routine ? recomp_lookup(routine) : NULL;
+    if (!fn && routine) fn = recomp_lookup_manual(routine);
+    if (!fn) {
+        fprintf(stderr, "  [KERNEL] KeSynchronizeExecution: routine 0x%08X "
+                        "not in dispatch\n", routine);
+        fflush(stderr);
+        g_eax = 0;
+        return;
+    }
+
+    /* BOOLEAN SynchronizeRoutine(PVOID Context), __stdcall. Its `ret 4` takes
+     * the dummy return address and the argument, so g_esp needs no fixup. */
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    fn();
+    /* g_eax is whatever the routine returned, which is this call's result. */
+}
+
+/* -- KeRemoveQueueDpc (ordinal 137) ------------------------
+ * BOOLEAN KeRemoveQueueDpc(PKDPC Dpc)
+ *
+ * Cancels a queued DPC, returning whether it was still in the queue. DPCs run
+ * inline here (see KeInsertQueueDpc), so by the time anyone can call this the
+ * routine has already run and there is nothing to cancel. FALSE is both the
+ * honest answer and the one that keeps a caller's bookkeeping right.
+ */
+static void bridge_KeRemoveQueueDpc(void)
+{
+    g_eax = 0;
+}
+
+/* The pending DPC queue.
+ *
+ * These used to run inline, on whichever thread queued them, before the caller
+ * returned. That is not what a DPC is: an interrupt service routine masks its
+ * source and queues, and the deferred routine runs afterwards at DISPATCH_LEVEL
+ * -- after the ISR has returned. Running it inline inverts that, so a routine
+ * that re-enables interrupts does it while the ISR that masked them is still on
+ * the stack, and a driver's state machine re-enters itself from inside its own
+ * interrupt.
+ *
+ * Queued properly now, and drained by the timer thread, which is the one thread
+ * here that already has a guest stack and a TIB and runs nothing else urgent.
+ *
+ * ponytail: one queue, no IRQL, no per-processor list, and a DPC queued from a
+ * DPC runs on the next drain rather than immediately. Nothing here depends on
+ * DPC ordering beyond "after the ISR".
+ */
+#define XBOX_MAX_PENDING_DPC 64
+typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
+static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
+static volatile LONG g_dpc_head, g_dpc_tail;
+
+static void bridge_KeInsertQueueDpc(void)
+{
+    uint32_t dpc  = STACK_ARG(0);
+    uint32_t arg1 = STACK_ARG(1);
+    uint32_t arg2 = STACK_ARG(2);
+    LONG tail, next;
+
+    if (!dpc) { g_eax = 0; return; }
+
+    tail = g_dpc_tail;
+    next = (tail + 1) % XBOX_MAX_PENDING_DPC;
+    if (next == g_dpc_head) {
+        fprintf(stderr, "  [KERNEL] DPC queue full, dropping 0x%08X\n", dpc);
+        fflush(stderr);
+        g_eax = 0;
+        return;
+    }
+    g_dpc_queue[tail].dpc  = dpc;
+    g_dpc_queue[tail].arg1 = arg1;
+    g_dpc_queue[tail].arg2 = arg2;
+    g_dpc_tail = next;
+    g_eax = 1;
+}
+
+/* Call a connected interrupt service routine.
+ *
+ * BOOLEAN ServiceRoutine(PKINTERRUPT, PVOID ServiceContext), __stdcall: its
+ * `ret 8` takes the dummy return address and both arguments, so g_esp needs no
+ * fixup. The caller must already have a guest stack and a TIB, which the timer
+ * thread has.
+ *
+ * Returns what the routine returned -- an ISR that does not recognise the
+ * interrupt returns FALSE, and that is worth seeing rather than assuming.
+ */
+static int kernel_raise_interrupt(uint32_t vector)
+{
+    uint32_t kint = xbox_GetConnectedInterrupt(vector);
+    uint32_t routine, context;
+    recomp_func_t fn;
+
+    if (!kint)
+        return -1;
+    routine = BRIDGE_MEM32(kint + 0);
+    context = BRIDGE_MEM32(kint + 4);
+    if (!routine)
+        return -1;
+    fn = recomp_lookup(routine);
+    if (!fn) fn = recomp_lookup_manual(routine);
+    if (!fn)
+        return -1;
+
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    fn();
+    return (int)(g_eax & 1u);
+}
+
+/* The GPU's vertical blank, delivered rather than merely enabled.
+ *
+ * The D3D8 library linked into a title installs an ISR for this and then waits
+ * on it. Nothing ever raised it, so a title whose frame loop waits for vblank
+ * rather than polling stops after its first clear -- which is exactly where
+ * Half-Life 2's loader stops, with its videos open, its 23 MB of UI textures
+ * loaded, and no second frame.
+ *
+ * The ISR reads the NV2A's own interrupt status to decide whether the
+ * interrupt is its business, so the registers have to say vblank before the
+ * routine is called: PCRTC_INTR_0 bit 0 for the vblank itself, and PMC_INTR_0
+ * bit 24 to say the PCRTC block is the source. Without those the handler looks,
+ * finds nothing, and correctly declines.
+ *
+ * ponytail: a fixed 60 Hz off the timer tick rather than anything tied to the
+ * display mode, and no field or interlace handling. A title that measures
+ * refresh rate from this will read 60; a title that needs the real one wants
+ * the mode AvSetDisplayMode was given, which is recorded a few files away.
+ */
+#define XBOX_NV2A_REG_BASE     0xFD000000u
+#define NV2A_PMC_INTR_0        0x00000100u
+#define NV2A_PMC_INTR_PCRTC    (1u << 24)
+#define NV2A_PCRTC_INTR_0      0x00600100u
+#define NV2A_PCRTC_INTR_VBLANK (1u << 0)
+#define NV2A_VECTOR            3u
+
+static void kernel_vblank_tick(void)
+{
+    static int enabled = -1;
+    static long long next_ms;
+    long long now;
+
+    if (enabled < 0)
+        enabled = getenv("RECOMP_VBLANK") != NULL;
+    if (!enabled)
+        return;
+
+    now = (long long)GetTickCount64();
+    if (now < next_ms)
+        return;
+    next_ms = now + 16;                       /* ~60 Hz */
+
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
+        return;
+
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+
+    {
+        static unsigned n;
+        int claimed = kernel_raise_interrupt(NV2A_VECTOR);
+        if (n++ < 3)
+            fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
+                    claimed < 0 ? "not callable" :
+                    claimed ? "claimed it" : "declined it");
+        fflush(stderr);
+    }
+}
+
+/* Run whatever is queued. Called from the timer thread, which has the guest
+ * stack and TIB that a deferred routine needs. */
+static void kernel_drain_dpcs(void)
+{
+    while (g_dpc_head != g_dpc_tail) {
+        LONG head = g_dpc_head;
+        PendingDpc d = g_dpc_queue[head];
+        g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
+        kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+    }
+}
+
 /* ── KeInitializeDpc (ordinal 107) ────────────────────────
  * VOID KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE DeferredRoutine,
  *                       PVOID DeferredContext)
@@ -1780,10 +2049,44 @@ static void bridge_KeInitializeInterrupt(void)
     g_eax = 0;
 }
 
+/* The interrupt objects a title has connected, by vector.
+ *
+ * KeInitializeInterrupt already writes the service routine, its context and
+ * the vector into the guest KINTERRUPT; connecting is what says the title is
+ * ready to be called on it. Recording that is what lets a device model raise
+ * an interrupt at all -- without it the routine is written down in guest
+ * memory and nothing on this side knows it is there.
+ *
+ * A small fixed table rather than a list: an Xbox has 26 interrupt vectors and
+ * a title connects a handful, so the whole thing is smaller than the comment.
+ */
+#define XBOX_MAX_VECTORS 32
+static uint32_t g_connected_isr[XBOX_MAX_VECTORS];   /* KINTERRUPT guest VA */
+
 /* BOOLEAN KeConnectInterrupt(PKINTERRUPT Interrupt) */
 static void bridge_KeConnectInterrupt(void)
 {
+    uint32_t interrupt_va = STACK_ARG(0);
+
+    if (interrupt_va) {
+        uint32_t vector = BRIDGE_MEM32(interrupt_va + 8);
+        if (vector < XBOX_MAX_VECTORS) {
+            g_connected_isr[vector] = interrupt_va;
+            fprintf(stderr, "  [KERNEL] KeConnectInterrupt: vector %u -> "
+                            "routine 0x%08X context 0x%08X\n",
+                    vector, BRIDGE_MEM32(interrupt_va + 0),
+                    BRIDGE_MEM32(interrupt_va + 4));
+            fflush(stderr);
+        }
+    }
     g_eax = 1;  /* connected -- see the note above */
+}
+
+/* The KINTERRUPT a title connected on this vector, or 0. Device models use it
+ * to find the routine to call; the routine and its context are at +0 and +4. */
+uint32_t xbox_GetConnectedInterrupt(uint32_t vector)
+{
+    return (vector < XBOX_MAX_VECTORS) ? g_connected_isr[vector] : 0;
 }
 
 /* ── MmClaimGpuInstanceMemory (ordinal 168) ───────────────
@@ -1838,17 +2141,155 @@ static void bridge_KeInitializeTimerEx(void)
     g_eax = 0;
 }
 
-/* ── KeSetTimer / KeSetTimerEx (ordinal 149/150) ──────────
+/* -- KeSetTimer / KeSetTimerEx (ordinal 149/150) ----------
  * BOOLEAN KeSetTimer(PKTIMER Timer, LARGE_INTEGER DueTime, PKDPC Dpc)
+ * BOOLEAN KeSetTimerEx(PKTIMER Timer, LARGE_INTEGER DueTime, LONG Period,
+ *                      PKDPC Dpc)
  *
- * Sets a timer. We don't actually start timers - just record the state.
- * Returns FALSE (timer was not already set).
+ * These used to return FALSE and do nothing, on the grounds that timers were
+ * not needed for basic execution. They are needed for more than that: a driver
+ * that polls its hardware does it from a timer DPC, and one that never fires
+ * is a state machine that never advances. Half-Life 2's USB stack sets one up
+ * during XInitDevices and enumerates from it.
+ *
+ * A due time is in 100 ns units, negative for relative and positive for an
+ * absolute time since 1601. Only the relative form is honoured here; an
+ * absolute due time is treated as immediate, which is wrong in principle and
+ * has not come up in practice.
+ *
+ * ponytail: one thread, a fixed table, and a 10 ms tick, so a due time is late
+ * by up to a tick and a periodic timer drifts. Nothing here is scheduling
+ * audio off a timer. A title that needs better wants the host's timer queue,
+ * not a smaller sleep.
  */
+#define XBOX_MAX_TIMERS 32
+typedef struct {
+    uint32_t timer_va;      /* the guest KTIMER, 0 for a free slot */
+    uint32_t dpc_va;
+    long long due_ms;       /* host tick when it fires */
+    long      period_ms;    /* 0 for one-shot */
+} XboxTimer;
+static XboxTimer g_timers[XBOX_MAX_TIMERS];
+static CRITICAL_SECTION g_timer_lock;
+static int g_timer_started;
+
+static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+{
+    int slot = xbox_worker_stack_alloc();
+
+    (void)unused;
+    if (slot < 0) {
+        fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
+                        "timer DPCs will not run\n");
+        fflush(stderr);
+        return 0;
+    }
+    g_esp = XBOX_WORKER_STACK_TOP(slot);
+    {
+        /* Its own TIB, for the same reason bridge_thread_main gives one to
+         * every worker: a DPC routine with an SEH prologue reads fs:[0],
+         * and a thread whose g_fs_base is zero faults inside the runtime
+         * before the routine runs. */
+        uint32_t tib = xbox_AllocThreadTib();
+        if (!tib) {
+            fprintf(stderr, "  [KERNEL] timer thread has no TIB; "
+                            "timer DPCs will not run\n");
+            fflush(stderr);
+            return 0;
+        }
+        g_fs_base = tib;
+    }
+
+    for (;;) {
+        long long now;
+        int i;
+
+        Sleep(10);
+        kernel_vblank_tick();  /* the GPU's frame clock */
+        kernel_drain_dpcs();   /* deferred work, before due timers */
+        now = (long long)GetTickCount64();
+
+        for (i = 0; i < XBOX_MAX_TIMERS; i++) {
+            uint32_t dpc;
+
+            EnterCriticalSection(&g_timer_lock);
+            if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
+                LeaveCriticalSection(&g_timer_lock);
+                continue;
+            }
+            dpc = g_timers[i].dpc_va;
+            if (g_timers[i].period_ms > 0)
+                g_timers[i].due_ms = now + g_timers[i].period_ms;
+            else
+                g_timers[i].timer_va = 0;      /* one-shot, done */
+            LeaveCriticalSection(&g_timer_lock);
+
+            /* Outside the lock: the routine can set or cancel timers. */
+            if (dpc)
+                kernel_run_dpc(dpc, 0, 0);
+        }
+    }
+}
+
+/* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */
+static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+                             long period_ms, uint32_t dpc_va)
+{
+    long long delay_ms = (due_100ns < 0) ? (-due_100ns) / 10000 : 0;
+    int i, free_slot = -1;
+    uint32_t was_set = 0;
+
+    if (!g_timer_started) {
+        InitializeCriticalSection(&g_timer_lock);
+        g_timer_started = 1;
+        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+    }
+
+    EnterCriticalSection(&g_timer_lock);
+    for (i = 0; i < XBOX_MAX_TIMERS; i++) {
+        if (g_timers[i].timer_va == timer_va) { free_slot = i; was_set = 1; break; }
+        if (!g_timers[i].timer_va && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0) {
+        g_timers[free_slot].timer_va  = timer_va;
+        g_timers[free_slot].dpc_va    = dpc_va;
+        g_timers[free_slot].due_ms    = (long long)GetTickCount64() + delay_ms;
+        g_timers[free_slot].period_ms = period_ms;
+    }
+    LeaveCriticalSection(&g_timer_lock);
+    g_eax = was_set;
+}
+
 static void bridge_KeSetTimer(void)
 {
-    /* Timer functionality is not needed for basic execution.
-     * Return FALSE = timer was not previously set. */
-    g_eax = 0;
+    /* LARGE_INTEGER is two stack slots. */
+    long long due = (long long)((uint64_t)STACK_ARG(1)
+                              | ((uint64_t)STACK_ARG(2) << 32));
+    kernel_set_timer(STACK_ARG(0), due, 0, STACK_ARG(3));
+}
+
+static void bridge_KeSetTimerEx(void)
+{
+    long long due = (long long)((uint64_t)STACK_ARG(1)
+                              | ((uint64_t)STACK_ARG(2) << 32));
+    kernel_set_timer(STACK_ARG(0), due, (long)STACK_ARG(3), STACK_ARG(4));
+}
+
+/* Drop a timer so it stops firing. Returns whether it was armed. */
+int xbox_kernel_cancel_timer(uint32_t timer_va)
+{
+    int i, was_set = 0;
+
+    if (!g_timer_started)
+        return 0;
+    EnterCriticalSection(&g_timer_lock);
+    for (i = 0; i < XBOX_MAX_TIMERS; i++)
+        if (g_timers[i].timer_va == timer_va) {
+            g_timers[i].timer_va = 0;
+            was_set = 1;
+        }
+    LeaveCriticalSection(&g_timer_lock);
+    return was_set;
 }
 
 /* ── ExQueryPoolBlockSize (ordinal 24) ────────────────────
@@ -3030,8 +3471,11 @@ static void bridge_IoCreateDevice(void)
 /* ── KeCancelTimer (ordinal 97, 1 arg) */
 static void bridge_KeCancelTimer(void)
 {
-    g_eax = (uint32_t)xbox_KeCancelTimer(
-        (PXBOX_KTIMER)XBOX_TO_NATIVE(STACK_ARG(0)));
+    /* Both halves: the shadow object this runtime keeps, and the firing
+     * table above, or a cancelled timer keeps calling its DPC. */
+    uint32_t timer_va = STACK_ARG(0);
+    int armed = xbox_kernel_cancel_timer(timer_va);
+    g_eax = (uint32_t)xbox_KeCancelTimer(XBOX_TO_NATIVE(timer_va)) || armed;
 }
 
 /* ── KeDisconnectInterrupt (ordinal 100, 1 arg) */
@@ -4356,10 +4800,13 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 127: return bridge_KeQueryPerformanceFrequency;
     case 128: return bridge_KeQuerySystemTime;
     case 149: return bridge_KeSetTimer;
-    case 150: return bridge_KeSetTimer;  /* KeSetTimerEx */
+    case 150: return bridge_KeSetTimerEx;
 
     /* DPC / Timer init */
     case 107: return bridge_KeInitializeDpc;
+    case 119: return bridge_KeInsertQueueDpc;
+    case 137: return bridge_KeRemoveQueueDpc;
+    case 153: return bridge_KeSynchronizeExecution;
     case 113: return bridge_KeInitializeTimerEx;
 
     /* NV2A interrupt plumbing */
