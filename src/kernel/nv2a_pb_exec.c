@@ -147,6 +147,22 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_TEXTURE_ADDRESS         0x1B08
 #define NV097_SET_TEXTURE_CONTROL1        0x1B10
 #define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
+/* The buffer flip. A title double-buffers by telling the GPU which buffer
+ * the CRTC reads and which it draws into, advancing the write index and
+ * then stalling until the flip has happened. Ignoring these means the
+ * stall never clears: Half-Life 2's loader submits its initialisation,
+ * asks for a flip, and waits for it in a loop that makes no kernel calls
+ * and burns no dispatch, which reads as a hang with no cause.
+ *
+ * ponytail: the flip completes the moment it is asked for, because there is
+ * no scanout to be in the middle of. That makes every frame land instantly
+ * and a title that paces itself on the flip runs as fast as it can draw.
+ * Pacing wants the vblank clock in the kernel, not a sleep in here. */
+#define NV097_SET_FLIP_READ               0x0120
+#define NV097_SET_FLIP_WRITE              0x0124
+#define NV097_SET_FLIP_MODULO             0x0128
+#define NV097_FLIP_INCREMENT_WRITE        0x012C
+#define NV097_FLIP_STALL                  0x0130
 #define NV097_ARRAY_ELEMENT16             0x1800
 #define NV097_INLINE_ARRAY                0x1818
 
@@ -197,6 +213,7 @@ static struct {
     uint32_t clip_x, clip_w, clip_y, clip_h;
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
+    uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
      * identical on screen and want opposite fixes: the batch carried no
@@ -1430,6 +1447,39 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         record_tex_reg(method, param);
         break;
 
+    case NV097_SET_FLIP_READ:
+        s_gpu.flip_read = param;
+        return;
+
+    case NV097_SET_FLIP_WRITE:
+        s_gpu.flip_write = param;
+        return;
+
+    case NV097_SET_FLIP_MODULO:
+        s_gpu.flip_modulo = param;
+        return;
+
+    case NV097_FLIP_INCREMENT_WRITE:
+        s_gpu.flip_write = s_gpu.flip_modulo
+                         ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
+                         : s_gpu.flip_write + 1;
+        s_gpu.flips++;
+        return;
+
+    case NV097_FLIP_STALL:
+        /* The stall ends when the buffer being read is the one just finished.
+         * There is no scanout here to wait for, so that is now. */
+        s_gpu.flip_read = s_gpu.flip_write;
+        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+            static unsigned n;
+            if (n++ < 8) {
+                fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
+                        s_gpu.flips, s_gpu.flip_read, s_gpu.flip_write);
+                fflush(stderr);
+            }
+        }
+        return;
+
     case NV097_SET_TEXTURE_FORMAT:
         s_gpu.tex.color = (param >> 8) & 0xFF;
         /* A swizzled texture carries its own dimensions here, as log2 in
@@ -1705,8 +1755,16 @@ void nv2a_pb_exec_report(void)
     }
 
     /* Top ten by frequency: selection sort over a small table, once every few
-     * seconds, is not worth a better algorithm. */
-    for (i = 0; i < 10 && i < s_unhandled_count; i++) {
+     * seconds, is not worth a better algorithm.
+     *
+     * RECOMP_PB_UNHANDLED_ALL lists every one instead. Ten is the right
+     * default -- the tail is a long list of state registers nobody needs to
+     * read -- but when a title stops and the question is which method it
+     * stopped on, the answer is as likely to be the one seen twice as the
+     * one seen a thousand times, and ten hides it. */
+    {
+        int shown = getenv("RECOMP_PB_UNHANDLED_ALL") ? s_unhandled_count : 10;
+    for (i = 0; i < shown && i < s_unhandled_count; i++) {
         int best = i;
         for (j = i + 1; j < s_unhandled_count; j++)
             if (s_unhandled[j].count > s_unhandled[best].count)
@@ -1719,5 +1777,5 @@ void nv2a_pb_exec_report(void)
         fprintf(stderr, "  [GPU]   0x%04X x%u\n",
                 s_unhandled[i].method, s_unhandled[i].count);
     }
-    fflush(stderr);
+    }    fflush(stderr);
 }

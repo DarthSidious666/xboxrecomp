@@ -111,6 +111,18 @@ static void *g_flash_memory = NULL;
  * Asking for the full RAM size overlapped both and MapViewOfFileEx failed
  * with ERROR_INVALID_ADDRESS -- a warning at startup and then a fault on the
  * title's first surface write, with nothing connecting the two. */
+/* How much guest address space is mapped.
+ *
+ * For anything that dereferences an address it read out of guest memory --
+ * a descriptor pointer a device model follows, say. Those are attacker-ish
+ * input in the only sense that matters here: the title can leave one
+ * uninitialised, and 0xCCCCCCCC dereferenced is a crash in the runtime
+ * rather than a fault the title would have taken. */
+size_t xbox_GetMappedSize(void)
+{
+    return g_memory_size;
+}
+
 static size_t xbox_TiledApertureSize(void)
 {
     uint64_t end = XBOX_NV2A_BASE < 0x100000000ULL
