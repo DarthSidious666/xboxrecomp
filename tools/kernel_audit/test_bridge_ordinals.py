@@ -58,11 +58,6 @@ def test_every_route_matches_its_ordinal():
                 f"ordinal {ordinal} -> bridge_{name}, but ordinal {ordinal} "
                 f"is {expected}")
 
-    # KeSetTimerEx is knowingly served by the KeSetTimer bridge; the extra
-    # Period argument is dropped. Tracked, not silently accepted.
-    known = {"ordinal 150 -> bridge_KeSetTimer, but ordinal 150 is KeSetTimerEx"}
-    bad = [b for b in bad if b not in known]
-
     assert not bad, "misrouted kernel ordinals:\n  " + "\n  ".join(bad)
     print(f"ok  every_route_matches_its_ordinal ({len(load_routes())} routes)")
 

@@ -2149,21 +2149,46 @@ static void bridge_HalRegisterShutdownNotification(void)
     g_eax = 0;
 }
 
+/* ── Kernel timers (ordinals 113, 149, 150, 97) ───────────
+ *
+ * Timers are waitable: KeInitializeTimerEx backs every guest KTIMER with a
+ * Win32 event in the shadow table (manual reset for notification timers, auto
+ * reset for synchronization timers), so a KeWaitForSingleObject on a timer
+ * sleeps on a real object. KeSetTimer/KeSetTimerEx arm the polling table below
+ * whose thread fires DPCs and signals that event; KeCancelTimer clears both.
+
 /* ── KeInitializeTimerEx (ordinal 113) ────────────────────
  * VOID KeInitializeTimerEx(PKTIMER Timer, TIMER_TYPE Type)
- *
- * Initializes a timer object. Xbox KTIMER is 40 bytes.
  */
 static void bridge_KeInitializeTimerEx(void)
 {
     uint32_t timer_va = STACK_ARG(0);
-    uint32_t type = STACK_ARG(1);
+    uint32_t type     = STACK_ARG(1);
+    HANDLE   ev;
 
-    /* Zero the structure (40 bytes) */
+    if (!timer_va) {
+        g_eax = 0;
+        return;
+    }
+
     memset(XBOX_TO_NATIVE(timer_va), 0, 40);
 
-    /* Set Type (0x08 = TimerNotificationObject, 0x09 = TimerSynchronizationObject) */
-    BRIDGE_MEM16(timer_va + 0) = (uint16_t)(0x08 + (type & 1));
+    /* Dispatcher header. 0x08 = notification timer, 0x09 = synchronization. */
+    BRIDGE_MEM8(timer_va + 0)  = (uint8_t)(0x08 + (type & 1));
+    BRIDGE_MEM8(timer_va + 2)  = 40;      /* Size */
+    BRIDGE_MEM8(timer_va + 3)  = 0;       /* Inserted */
+    BRIDGE_MEM32(timer_va + 4) = 0;       /* SignalState */
+    BRIDGE_MEM32(timer_va + 8) = 0;       /* WaitListHead */
+    BRIDGE_MEM32(timer_va + 12) = 0;
+
+    ev = CreateEventW(NULL, (type == 0) ? TRUE : FALSE, FALSE, NULL);
+    if (!ev) {
+        fprintf(stderr, "  [KERNEL] KeInitializeTimerEx: CreateEventW failed "
+                        "(error %u)\n", GetLastError());
+        g_eax = 0;
+        return;
+    }
+    ke_shadow_insert(timer_va, ev);
     g_eax = 0;
 }
 
@@ -2236,13 +2261,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
-            uint32_t dpc;
+            uint32_t dpc, fired_va;
 
             EnterCriticalSection(&g_timer_lock);
             if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
                 LeaveCriticalSection(&g_timer_lock);
                 continue;
             }
+            fired_va = g_timers[i].timer_va;
             dpc = g_timers[i].dpc_va;
             if (g_timers[i].period_ms > 0)
                 g_timers[i].due_ms = now + g_timers[i].period_ms;
@@ -2253,6 +2279,16 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             /* Outside the lock: the routine can set or cancel timers. */
             if (dpc)
                 kernel_run_dpc(dpc, 0, 0);
+
+            /* Wake anyone parked on the timer's shadow event; a timer with no
+             * DPC is just a kernel sleep. */
+            {
+                HANDLE ev = ke_shadow_lookup(fired_va);
+                if (ev) {
+                    SetEvent(ev);
+                    BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
+                }
+            }
         }
     }
 }
@@ -2283,12 +2319,19 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
         g_timers[free_slot].period_ms = period_ms;
     }
     LeaveCriticalSection(&g_timer_lock);
+
+    /* A freshly set timer starts unsignaled, like the real KeSetTimer. */
+    {
+        HANDLE ev = ke_shadow_lookup(timer_va);
+        if (ev)
+            ResetEvent(ev);
+    }
     g_eax = was_set;
 }
 
 static void bridge_KeSetTimer(void)
 {
-    /* LARGE_INTEGER is two stack slots. */
+/* LARGE_INTEGER is two stack slots. */
     long long due = (long long)((uint64_t)STACK_ARG(1)
                               | ((uint64_t)STACK_ARG(2) << 32));
     kernel_set_timer(STACK_ARG(0), due, 0, STACK_ARG(3));
@@ -3494,10 +3537,11 @@ static void bridge_IoCreateDevice(void)
     g_eax = 0;                                          /* STATUS_SUCCESS   */
 }
 
-/* ── KeCancelTimer (ordinal 97, 1 arg) */
+/* ── KeCancelTimer (ordinal 97, 1 arg)
+ * BOOLEAN KeCancelTimer(PKTIMER Timer) -- returns whether it was set. */
 static void bridge_KeCancelTimer(void)
 {
-    /* Both halves: the shadow object this runtime keeps, and the firing
+/* Both halves: the shadow object this runtime keeps, and the firing
      * table above, or a cancelled timer keeps calling its DPC. */
     uint32_t timer_va = STACK_ARG(0);
     int armed = xbox_kernel_cancel_timer(timer_va);
@@ -6519,16 +6563,11 @@ static void bridge_KeInsertQueueApc(void)
     g_eax = 1;
 }
 
-/* --- KeInsertQueueDpc (ordinal 119, 3 args = 12 bytes)
- * Stubbed per the task brief. xbox_KeInsertQueueDpc() exists in kernel_sync.c
- * and could be wired here if DPC dispatch is ever needed. */
-static void bridge_KeInsertQueueDpc(void)
-{
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    g_eax = 0;
-}
+/* --- KeInsertQueueDpc (ordinal 119) ---
+ * BOOLEAN KeInsertQueueDpc(PKDPC Dpc, PVOID SystemArgument1,
+ *                          PVOID SystemArgument2)
+ *
+ * Enqueues a DPC for the timer thread to drain. See the queue above. */
 
 /* --- KeIsExecutingDpc (ordinal 121, 0 args = 0 bytes) --- */
 static void bridge_KeIsExecutingDpc(void)
@@ -6578,14 +6617,10 @@ static void bridge_KeRemoveQueue(void)
     g_eax = 0;
 }
 
-/* --- KeRemoveQueueDpc (ordinal 137, 1 arg = 4 bytes)
- * Stubbed per the task brief. xbox_KeRemoveQueueDpc() exists in kernel_sync.c
- * and could be wired here if DPC dispatch is ever needed. */
-static void bridge_KeRemoveQueueDpc(void)
-{
-    (void)STACK_ARG(0);
-    g_eax = 0;
-}
+/* --- KeRemoveQueueDpc (ordinal 137, 1 arg = 4 bytes) ---
+ * BOOLEAN KeRemoveQueueDpc(PKDPC Dpc)
+ *
+ * Removes a queued DPC. See the queue above. */
 
 /* --- KeRundownQueue (ordinal 141, 1 arg = 4 bytes) --- */
 static void bridge_KeRundownQueue(void)
@@ -6668,34 +6703,6 @@ static void bridge_KeSetDisableBoostThread(void)
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
-}
-
-/* --- KeSynchronizeExecution (ordinal 153, 3 args = 12 bytes)
- * BOOLEAN KeSynchronizeExecution(PKINTERRUPT Interrupt,
- *                                PKSYNCHRONIZE_ROUTINE SynchronizeRoutine,
- *                                PVOID SynchronizeContext);
- * Calls the guest routine with the guest context as its single argument and
- * returns TRUE. User mode cannot raise IRQL to mask the interrupt, so the
- * call runs synchronously on this thread. */
-static void bridge_KeSynchronizeExecution(void)
-{
-    uint32_t routine_va = STACK_ARG(1);
-    uint32_t context    = STACK_ARG(2);
-    recomp_func_t fn;
-
-    (void)STACK_ARG(0);
-
-    fn = recomp_lookup(routine_va);
-    if (!fn)
-        fn = recomp_lookup_manual(routine_va);
-    if (fn) {
-        /* Guest stdcall: push context, then a fake return address. */
-        g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
-        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-        fn();
-        g_esp += 8;
-    }
-    g_eax = 1;  /* TRUE */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -7283,104 +7290,289 @@ static void bridge_RtlRaiseStatus(void)
     g_eax = 0;
 }
 
-/* --- RtlSnprintf (ordinal 361, 3 args = 12 bytes, __cdecl)
- * int RtlSnprintf(char* buffer, size_t count, const char* format, ...);
- * Varargs follow on the guest stack; mimic vsnprintf by copying the format
- * string (bounded), which is exact for argument-free format strings. */
+/* --- Rtl* printf family (ordinals 361-364) ---
+ *
+ * int RtlSnprintf(char*, size_t count, const char* fmt, ...)
+ * int RtlSprintf(char*, const char* fmt, ...)
+ * int RtlVsnprintf(char*, size_t count, const char* fmt, va_list)
+ * int RtlVsprintf(char*, const char* fmt, va_list)
+ *
+ * All four are __cdecl on the console, so the stdcall table pops nothing
+ * ("caller cleans", like DbgPrint) and the varargs stay readable on the guest
+ * stack while the bridge runs. The V* variants take an x86 va_list, which is
+ * just a guest pointer to where the argument slots begin.
+ *
+ * The x64 CRT's vsnprintf cannot consume an x86 va_list, so these bridges used
+ * to copy the format string verbatim ("%d" came out as the literal text) and
+ * read the wrong fixed arguments for the two non-counted variants: RtlSprintf's
+ * "count" was the format pointer, and the vararg list started one slot early.
+ * This walks the format itself and formats each conversion with the host CRT,
+ * reading 32-bit argument slots from guest memory (64-bit args 8-aligned, as
+ * on x86).
+ */
+
+/* Guest cursor over the variadic argument slots. */
+static uint32_t bridge_va_next32(uint32_t *pos)
+{
+    uint32_t v = BRIDGE_MEM32(*pos);
+    *pos += 4;
+    return v;
+}
+
+static uint64_t bridge_va_next64(uint32_t *pos)
+{
+    uint32_t p = (*pos + 7) & ~7u;
+    uint32_t lo = BRIDGE_MEM32(p);
+    uint32_t hi = BRIDGE_MEM32(p + 4);
+    *pos = p + 8;
+    return (uint64_t)lo | ((uint64_t)hi << 32);
+}
+
+/* Format fmt, pulling varargs from guest memory at `pos`, into out (at most
+ * cap-1 chars, NUL-terminated). Returns the number of characters written. */
+static int bridge_format_printf(char *out, size_t cap, const char *fmt,
+                                uint32_t pos)
+{
+    size_t used = 0;
+    size_t i = 0;
+
+    if (!out || cap == 0)
+        return 0;
+
+    while (fmt[i] && used + 1 < cap) {
+        if (fmt[i] != '%') {
+            out[used++] = fmt[i++];
+            continue;
+        }
+        i++;
+        if (fmt[i] == '%') {
+            out[used++] = '%';
+            i++;
+            continue;
+        }
+
+        {
+            char flags[8];
+            int  nflags = 0;
+            char conv[32];
+            char *cp = conv;
+            int  width = 0, have_width = 0, width_star = 0;
+            int  prec  = 0, have_prec  = 0, prec_star  = 0;
+            char len = 0;          /* 0 none, 1 h, 2 hh, 3 l, 4 ll */
+            char spec;
+            char tmp[512];
+            size_t tlen;
+
+            while (fmt[i] && strchr("-+ 0#", fmt[i]) && nflags < 7)
+                flags[nflags++] = fmt[i++];
+            flags[nflags] = 0;
+
+            if (fmt[i] == '*') { width_star = 1; have_width = 1; i++; }
+            else if (fmt[i] >= '0' && fmt[i] <= '9') {
+                have_width = 1;
+                while (fmt[i] >= '0' && fmt[i] <= '9') {
+                    width = width * 10 + (fmt[i] - '0');
+                    i++;
+                }
+            }
+
+            if (fmt[i] == '.') {
+                i++;
+                have_prec = 1;
+                if (fmt[i] == '*') { prec_star = 1; i++; }
+                else while (fmt[i] >= '0' && fmt[i] <= '9') {
+                    prec = prec * 10 + (fmt[i] - '0');
+                    i++;
+                }
+            }
+
+            if (fmt[i] == 'h') { len = 1; i++; if (fmt[i] == 'h') { len = 2; i++; } }
+            else if (fmt[i] == 'l') { len = 3; i++; if (fmt[i] == 'l') { len = 4; i++; } }
+            else if (fmt[i] == 'q') { len = 4; i++; }
+            else if (fmt[i] == 'I' && fmt[i+1] == '6' && fmt[i+2] == '4') {
+                len = 4; i += 3;
+            }
+
+            spec = fmt[i];
+            if (!spec)
+                break;
+            i++;
+
+            *cp++ = '%';
+            if (nflags) { memcpy(cp, flags, (size_t)nflags); cp += nflags; }
+
+            if (width_star) {
+                int w = (int32_t)bridge_va_next32(&pos);
+                if (w < 0) { *cp++ = '-'; w = -w; }
+                cp += sprintf(cp, "%d", w);
+            } else if (have_width) {
+                cp += sprintf(cp, "%d", width);
+            }
+            if (have_prec) {
+                *cp++ = '.';
+                if (prec_star) {
+                    int p = (int32_t)bridge_va_next32(&pos);
+                    if (p < 0) p = 0;
+                    cp += sprintf(cp, "%d", p);
+                } else {
+                    cp += sprintf(cp, "%d", prec);
+                }
+            }
+            /* Single 'l' is a 32-bit long on the console; the host long is 32
+             * bits too, so 'l' is passed through for the d/i/u/o/x/X paths. */
+            if (len == 2) { *cp++ = 'h'; *cp++ = 'h'; }
+            else if (len == 1) { *cp++ = 'h'; }
+            else if (len == 4) { *cp++ = 'l'; *cp++ = 'l'; }
+
+            switch (spec) {
+            case 'd': case 'i': {
+                if (len == 4) {
+                    long long v = (long long)bridge_va_next64(&pos);
+                    *cp++ = 'd'; *cp = 0;
+                    snprintf(tmp, sizeof tmp, conv, v);
+                } else {
+                    int v = (int)(int32_t)bridge_va_next32(&pos);
+                    *cp++ = 'd'; *cp = 0;
+                    snprintf(tmp, sizeof tmp, conv, v);
+                }
+                break;
+            }
+            case 'u': {
+                if (len == 4) {
+                    unsigned long long v = bridge_va_next64(&pos);
+                    *cp++ = 'u'; *cp = 0;
+                    snprintf(tmp, sizeof tmp, conv, v);
+                } else {
+                    unsigned int v = bridge_va_next32(&pos);
+                    *cp++ = 'u'; *cp = 0;
+                    snprintf(tmp, sizeof tmp, conv, v);
+                }
+                break;
+            }
+            case 'o': case 'x': case 'X': {
+                if (len == 4) {
+                    unsigned long long v = bridge_va_next64(&pos);
+                    *cp++ = spec; *cp = 0;
+                    snprintf(tmp, sizeof tmp, conv, v);
+                } else {
+                    unsigned int v = bridge_va_next32(&pos);
+                    *cp++ = spec; *cp = 0;
+                    snprintf(tmp, sizeof tmp, conv, v);
+                }
+                break;
+            }
+            case 'c': {
+                int v = (int)bridge_va_next32(&pos);
+                *cp++ = 'c'; *cp = 0;
+                snprintf(tmp, sizeof tmp, conv, v);
+                break;
+            }
+            case 's': {
+                uint32_t sva = bridge_va_next32(&pos);
+                const char *gs = sva ? (const char *)XBOX_TO_NATIVE(sva)
+                                     : "(null)";
+                *cp++ = 's'; *cp = 0;
+                snprintf(tmp, sizeof tmp, conv, gs);
+                break;
+            }
+            case 'p': {
+                /* 32-bit pointer as padded lower-case hex, like the x86 CRT */
+                unsigned int v = bridge_va_next32(&pos);
+                const char *pfx = strchr(flags, '#') ? "%#08x" : "%08x";
+                snprintf(tmp, sizeof tmp, pfx, v);
+                break;
+            }
+            case 'n': {
+                uint32_t tva = bridge_va_next32(&pos);
+                if (tva)
+                    BRIDGE_MEM32(tva) = (uint32_t)used;   /* int written */
+                tlen = 0;
+                break;
+            }
+            case 'f': case 'e': case 'g': case 'E': case 'G': {
+                double v = (double)bridge_va_next64(&pos);
+                *cp++ = spec; *cp = 0;
+                snprintf(tmp, sizeof tmp, conv, v);
+                break;
+            }
+            default:
+                /* Unsupported conversion: keep '%' and the specifier */
+                out[used++] = '%';
+                out[used++] = spec;
+                continue;
+            }
+
+            tlen = (spec == 'n') ? 0 : strlen(tmp);
+            {
+                size_t k;
+                for (k = 0; k < tlen && used + 1 < cap; k++)
+                    out[used++] = tmp[k];
+            }
+        }
+    }
+
+    if (used + 1 >= cap)
+        used = cap - 1;
+    out[used] = 0;
+    return (int)used;
+}
+
+/* --- RtlSnprintf (ordinal 361, __cdecl, caller cleans) --- */
 static void bridge_RtlSnprintf(void)
 {
-    uint32_t buf_va = STACK_ARG(0);
-    uint32_t count  = STACK_ARG(1);
-    uint32_t fmt_va = STACK_ARG(2);
-    const char *src = (const char *)XBOX_TO_NATIVE(fmt_va);
-    char *dst = (char *)XBOX_TO_NATIVE(buf_va);
+    char     *dst  = (char *)XBOX_TO_NATIVE(STACK_ARG(0));
+    uint32_t  count = STACK_ARG(1);
+    const char *fmt = (const char *)XBOX_TO_NATIVE(STACK_ARG(2));
 
-    if (!dst || !src || count == 0) {
+    if (!dst || !fmt) {
         g_eax = 0;
         return;
     }
-    {
-        uint32_t i;
-        for (i = 0; i + 1 < count && src[i]; i++)
-            dst[i] = src[i];
-        dst[i] = 0;
-        g_eax = (int32_t)i;
-    }
+    /* Varargs start after buffer/count/format on the guest stack. */
+    g_eax = bridge_format_printf(dst, count, fmt, g_esp + 12);
 }
 
-/* --- RtlSprintf (ordinal 362, 3 args = 12 bytes, __cdecl) --- */
+/* --- RtlSprintf (ordinal 362, __cdecl, caller cleans) --- */
 static void bridge_RtlSprintf(void)
 {
-    uint32_t buf_va = STACK_ARG(0);
-    uint32_t count  = STACK_ARG(1);
-    uint32_t fmt_va = STACK_ARG(2);
-    const char *src = (const char *)XBOX_TO_NATIVE(fmt_va);
-    char *dst = (char *)XBOX_TO_NATIVE(buf_va);
+    char     *dst  = (char *)XBOX_TO_NATIVE(STACK_ARG(0));
+    const char *fmt = (const char *)XBOX_TO_NATIVE(STACK_ARG(1));
 
-    if (!dst || !src || count == 0) {
+    if (!dst || !fmt) {
         g_eax = 0;
         return;
     }
-    {
-        uint32_t i;
-        for (i = 0; i + 1 < count && src[i]; i++)
-            dst[i] = src[i];
-        dst[i] = 0;
-        g_eax = (int32_t)i;
-    }
+    /* Unbounded like the CRT's vsprintf; a wide cap prevents a wild write. */
+    g_eax = bridge_format_printf(dst, 65536, fmt, g_esp + 8);
 }
 
-/* --- RtlVsnprintf (ordinal 363, 4 args = 16 bytes)
- * int RtlVsnprintf(char* buffer, size_t count, const char* format,
- *                  va_list argptr);
- * The guest va_list is an x86-style pointer into the guest stack; it cannot be
- * handed to the x64 CRT's vsnprintf. Copy the format string (bounded) instead
- * -- exact for format strings with no argument specifiers. */
+/* --- RtlVsnprintf (ordinal 363, __cdecl, caller cleans) --- */
 static void bridge_RtlVsnprintf(void)
 {
-    uint32_t buf_va = STACK_ARG(0);
-    uint32_t count  = STACK_ARG(1);
-    uint32_t fmt_va = STACK_ARG(2);
-    const char *src = (const char *)XBOX_TO_NATIVE(fmt_va);
-    char *dst = (char *)XBOX_TO_NATIVE(buf_va);
+    char     *dst  = (char *)XBOX_TO_NATIVE(STACK_ARG(0));
+    uint32_t  count = STACK_ARG(1);
+    const char *fmt = (const char *)XBOX_TO_NATIVE(STACK_ARG(2));
+    uint32_t  list = STACK_ARG(3);   /* x86 va_list = guest pointer to args */
 
-    (void)STACK_ARG(3);
-
-    if (!dst || !src || count == 0) {
+    if (!dst || !fmt || !list) {
         g_eax = 0;
         return;
     }
-    {
-        uint32_t i;
-        for (i = 0; i + 1 < count && src[i]; i++)
-            dst[i] = src[i];
-        dst[i] = 0;
-        g_eax = (int32_t)i;
-    }
+    g_eax = bridge_format_printf(dst, count, fmt, list);
 }
 
-/* --- RtlVsprintf (ordinal 364, 4 args = 16 bytes) --- */
+/* --- RtlVsprintf (ordinal 364, __cdecl, caller cleans) --- */
 static void bridge_RtlVsprintf(void)
 {
-    uint32_t buf_va = STACK_ARG(0);
-    uint32_t count  = STACK_ARG(1);
-    uint32_t fmt_va = STACK_ARG(2);
-    const char *src = (const char *)XBOX_TO_NATIVE(fmt_va);
-    char *dst = (char *)XBOX_TO_NATIVE(buf_va);
+    char     *dst  = (char *)XBOX_TO_NATIVE(STACK_ARG(0));
+    const char *fmt = (const char *)XBOX_TO_NATIVE(STACK_ARG(1));
+    uint32_t  list = STACK_ARG(2);   /* x86 va_list = guest pointer to args */
 
-    (void)STACK_ARG(3);
-
-    if (!dst || !src || count == 0) {
+    if (!dst || !fmt || !list) {
         g_eax = 0;
         return;
     }
-    {
-        uint32_t i;
-        for (i = 0; i + 1 < count && src[i]; i++)
-            dst[i] = src[i];
-        dst[i] = 0;
-        g_eax = (int32_t)i;
-    }
+    g_eax = bridge_format_printf(dst, 65536, fmt, list);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -7862,10 +8054,10 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 282: return 16;  /* RtlExtendedLargeIntegerDivide (4) */
     case 283: return 16;  /* RtlExtendedMagicDivide (4) */
     case 303: return  4;  /* RtlRaiseStatus (1) */
-    case 361: return 12;  /* RtlSnprintf (3, __cdecl) */
-    case 362: return 12;  /* RtlSprintf (3, __cdecl) */
-    case 363: return 16;  /* RtlVsnprintf (4, __cdecl) */
-    case 364: return 16;  /* RtlVsprintf (4, __cdecl) */
+    case 361: return  0;  /* RtlSnprintf - __cdecl, caller cleans */
+    case 362: return  0;  /* RtlSprintf - __cdecl, caller cleans */
+    case 363: return  0;  /* RtlVsnprintf - __cdecl, caller cleans */
+    case 364: return  0;  /* RtlVsprintf - __cdecl, caller cleans */
 
     /* Port I/O */
     case 329: return 12;  /* READ_PORT_BUFFER_UCHAR (3) */
@@ -8331,7 +8523,6 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 116: return bridge_KeInsertHeadQueue;
     case 117: return bridge_KeInsertQueue;
     case 118: return bridge_KeInsertQueueApc;
-    case 119: return bridge_KeInsertQueueDpc;
     case 121: return bridge_KeIsExecutingDpc;
     case 122: return bridge_KeLeaveCriticalRegion;
     case 123: return bridge_KePulseEvent;
@@ -8342,7 +8533,6 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 134: return bridge_KeRemoveDeviceQueue;
     case 135: return bridge_KeRemoveEntryDeviceQueue;
     case 136: return bridge_KeRemoveQueue;
-    case 137: return bridge_KeRemoveQueueDpc;
     case 138: return bridge_KeResetEvent;
     case 140: return bridge_KeResumeThread;
     case 141: return bridge_KeRundownQueue;
@@ -8351,7 +8541,6 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 147: return bridge_KeSetPriorityProcess;
     case 148: return bridge_KeSetPriorityThread;
     case 152: return bridge_KeSuspendThread;
-    case 153: return bridge_KeSynchronizeExecution;
     case 155: return bridge_KeTestAlertThread;
     case 162: return bridge_KiBugCheckData;
     case 163: return bridge_KiUnlockDispatcherDatabase;
